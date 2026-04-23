@@ -1,0 +1,49 @@
+# name: test/sql/lookup_tables.test
+# description: lookup seed tables are populated at extension load
+
+require us_geocoder
+
+query I
+SELECT count(*) > 0 FROM tiger.direction_lookup;
+----
+true
+
+query I
+SELECT count(*) FROM tiger.state_lookup;
+----
+59
+
+query I
+SELECT count(*) > 0 FROM tiger.secondary_unit_lookup;
+----
+true
+
+query I
+SELECT count(*) > 100 FROM tiger.street_type_lookup;
+----
+true
+
+query I
+SELECT abbrev FROM tiger.state_lookup WHERE upper(name) = 'MASSACHUSETTS';
+----
+MA
+
+query I
+SELECT statefp FROM tiger.state_lookup WHERE abbrev = 'RI';
+----
+44
+
+query I
+SELECT abbrev FROM tiger.direction_lookup WHERE name = 'NORTHWEST';
+----
+NW
+
+query I
+SELECT abbrev FROM tiger.secondary_unit_lookup WHERE name = 'APARTMENT';
+----
+APT
+
+query I
+SELECT abbrev FROM tiger.street_type_lookup WHERE name = 'AVENUE';
+----
+Ave

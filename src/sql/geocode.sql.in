@@ -1,0 +1,53 @@
+-- Public geocode() table macro. Combines Stage A (address match) with a
+-- Stage B (location-only) fallback that runs only when Stage A is empty.
+--
+-- Returns 7 columns: addy, geom, rating, block_geoid, tract_geoid,
+-- blkgrp_geoid, containment_guaranteed.
+--
+-- Per D7: no rating=0 early-exit short-circuit — we compute all Stage A
+-- candidates vectorized, LIMIT at end; Stage B only considered when
+-- Stage A produces zero rows.
+--
+-- Per spec §14.3: require_containment='none' returns all candidates;
+-- 'block'/'tract'/'blkgrp' filter to containment_guaranteed=true (v0.1
+-- conservative; the three values are equivalent until dissolved polygons
+-- are materialized in a follow-up).
+--
+-- Raw VARCHAR input is not a separate overload (DuckDB can't dispatch by
+-- arg type at one arg count): users with raw strings call
+--   tiger.geocode(tiger.from_pagc('1731 New Hampshire Ave NW ...'))
+-- The from_pagc adapter only resolves if us_address_standardizer is loaded.
+
+CREATE OR REPLACE MACRO @TIGER@.geocode(
+    input_geocode_input,
+    max_results,
+    restrict_geom,
+    require_containment
+) AS TABLE (
+    WITH
+    stage_a AS (
+        SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
+        FROM @TIGER@.geocode_address_impl(input_geocode_input, max_results, restrict_geom, 2.0)
+    ),
+    stage_b AS (
+        SELECT addy, geom, rating,
+               NULL::VARCHAR AS block_geoid,
+               NULL::VARCHAR AS tract_geoid,
+               NULL::VARCHAR AS blkgrp_geoid,
+               false AS containment_guaranteed
+        FROM @TIGER@.geocode_location_impl(input_geocode_input, restrict_geom)
+        WHERE NOT EXISTS (SELECT 1 FROM stage_a)
+    ),
+    combined AS (
+        SELECT * FROM stage_a
+        UNION ALL
+        SELECT * FROM stage_b
+    )
+    SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
+    FROM combined
+    WHERE require_containment IS NULL
+       OR require_containment = 'none'
+       OR (require_containment IN ('block', 'tract', 'blkgrp') AND containment_guaranteed)
+    ORDER BY rating
+    LIMIT max_results
+);

@@ -1,0 +1,36 @@
+-- Canonicalization macros for geocode_input fields.
+-- Coerce free-form user input into TIGER's abbreviation vocabulary so
+-- rate_attributes scores accurately. See geocode_flow.md §14 for the contract.
+
+CREATE OR REPLACE MACRO @TIGER@.canon_street_type(t) AS (
+    COALESCE(
+        (SELECT abbrev FROM @TIGER@.street_type_lookup
+         WHERE upper(name) = upper(t)
+         LIMIT 1),
+        t
+    )
+);
+
+CREATE OR REPLACE MACRO @TIGER@.canon_dir(d) AS (
+    COALESCE(
+        (SELECT abbrev FROM @TIGER@.direction_lookup
+         WHERE upper(name) = upper(d)
+         LIMIT 1),
+        upper(d)
+    )
+);
+
+CREATE OR REPLACE MACRO @TIGER@.canon_state(s) AS (
+    (SELECT abbrev FROM @TIGER@.state_lookup
+     WHERE upper(s) IN (upper(abbrev), upper(name))
+     LIMIT 1)
+);
+
+CREATE OR REPLACE MACRO @TIGER@.canon_zip(z) AS (
+    CASE
+        WHEN z IS NULL THEN NULL
+        WHEN length(z) >= 5 AND regexp_matches(left(z, 5), '^\d{5}$') THEN left(z, 5)
+        WHEN regexp_matches(z, '^\d{1,4}$') THEN lpad(z, 5, '0')
+        ELSE NULL
+    END
+);

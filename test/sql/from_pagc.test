@@ -1,0 +1,116 @@
+# name: test/sql/from_pagc.test
+# description: geocode_input type + from_pagc repack logic
+#
+# In a real deployment, from_pagc is auto-registered at extension-load time
+# if us_address_standardizer (community ext) is also loaded. CI doesn't have
+# that ext available, so this test mocks standardize_address/parse_address
+# and then manually recreates the macro from the same repack rules as
+# src/sql/from_pagc.sql.in.
+
+require us_geocoder
+
+# geocode_input type is auto-registered regardless of standardizer presence.
+# Cast to the named struct type; verify the fields are preserved.
+query II
+SELECT a.address, a.zip FROM (SELECT CAST({
+    address: 1731, street_name: 'X', street_type: 'St', pre_dir: NULL,
+    post_dir: NULL, location: 'Y', state_abbrev: 'MA', zip: '02109'
+} AS tiger.geocode_input) AS a);
+----
+1731	02109
+
+# Mock the us_address_standardizer community ext's entry points.
+statement ok
+CREATE OR REPLACE MACRO standardize_address(raw) AS {
+    house_num: '1731',
+    name:      'New Hampshire',
+    suftype:   'AVE',
+    pretype:   NULL,
+    predir:    NULL,
+    sufdir:    'NW',
+    city:      'Washington',
+    state:     'DC',
+    postcode:  '20010'
+};
+
+statement ok
+CREATE OR REPLACE MACRO parse_address(raw) AS {
+    city: '',
+    state: '',
+    zip: ''
+};
+
+# Recreate from_pagc inline (mirrors src/sql/from_pagc.sql.in).
+statement ok
+CREATE OR REPLACE MACRO tiger.from_pagc(raw_text) AS (
+    SELECT STRUCT_PACK(
+        address      := TRY_CAST(regexp_extract(sa.r.house_num, '\d+') AS INTEGER),
+        street_name  := NULLIF(trim(sa.r.name), ''),
+        street_type  := tiger.canon_street_type(COALESCE(sa.r.suftype, sa.r.pretype)),
+        pre_dir      := tiger.canon_dir(sa.r.predir),
+        post_dir     := tiger.canon_dir(sa.r.sufdir),
+        location     := COALESCE(NULLIF(trim(sa.r.city), ''),
+                                 NULLIF(trim(pa.r.city), '')),
+        state_abbrev := tiger.canon_state(COALESCE(NULLIF(trim(sa.r.state), ''),
+                                                   NULLIF(trim(pa.r.state), ''))),
+        zip          := tiger.canon_zip(COALESCE(
+                           NULLIF(split_part(COALESCE(sa.r.postcode, ''), '-', 1), ''),
+                           NULLIF(pa.r.zip, '')))
+    )::tiger.geocode_input
+    FROM (SELECT standardize_address(raw_text) AS r) sa,
+         (SELECT parse_address(raw_text) AS r) pa
+);
+
+# Happy path: canonical PostGIS corpus entry
+query IIIIIIII
+SELECT a.address, a.street_name, a.street_type, a.pre_dir, a.post_dir, a.location, a.state_abbrev, a.zip
+FROM (SELECT tiger.from_pagc('1731 New Hampshire Ave NW, Washington DC 20010') AS a);
+----
+1731	New Hampshire	Ave	NULL	NW	Washington	DC	20010
+
+# COALESCE cascade: standardize returns empty city/state/zip,
+# parse fills them in. Load-bearing for PostGIS parity.
+statement ok
+CREATE OR REPLACE MACRO standardize_address(raw) AS {
+    house_num: '42',
+    name:      'Main',
+    suftype:   'ST',
+    pretype:   NULL,
+    predir:    NULL,
+    sufdir:    NULL,
+    city:      '',
+    state:     '',
+    postcode:  ''
+};
+
+statement ok
+CREATE OR REPLACE MACRO parse_address(raw) AS {
+    city:  'Providence',
+    state: 'RI',
+    zip:   '02903'
+};
+
+query III
+SELECT a.location, a.state_abbrev, a.zip
+FROM (SELECT tiger.from_pagc('42 Main St') AS a);
+----
+Providence	RI	02903
+
+# ZIP+4 is trimmed to 5 digits
+statement ok
+CREATE OR REPLACE MACRO standardize_address(raw) AS {
+    house_num: '1',
+    name:      'Test',
+    suftype:   'ST',
+    pretype:   NULL,
+    predir:    NULL,
+    sufdir:    NULL,
+    city:      'Anytown',
+    state:     'MA',
+    postcode:  '02109-1234'
+};
+
+query I
+SELECT (tiger.from_pagc('1 Test St, Anytown MA 02109-1234')).zip;
+----
+02109

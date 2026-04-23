@@ -1,0 +1,71 @@
+# name: test/sql/tiger_schema.test
+# description: TIGER parent tables are registered and empty at extension load
+
+require us_geocoder
+
+statement ok
+LOAD spatial;
+
+# All 13 parent tables exist
+query I
+SELECT count(*) FROM (VALUES
+    ('state'), ('county'), ('zcta5'),
+    ('place'), ('cousub'),
+    ('zip_state'), ('zip_state_loc'), ('zip_lookup_base'),
+    ('edges'), ('faces'), ('featnames'), ('addr'),
+    ('edge_containment')
+) AS t(n)
+WHERE t.n IN (SELECT table_name FROM information_schema.tables WHERE table_schema = 'tiger');
+----
+13
+
+# Each table starts empty
+query I
+SELECT count(*) FROM tiger.state;
+----
+0
+
+query I
+SELECT count(*) FROM tiger.edges;
+----
+0
+
+query I
+SELECT count(*) FROM tiger.featnames;
+----
+0
+
+# Column sanity-check on edges (the biggest table, most likely to regress)
+query I
+SELECT column_name
+FROM information_schema.columns
+WHERE table_schema = 'tiger' AND table_name = 'edges'
+  AND column_name IN ('statefp', 'tlid', 'tfidl', 'tfidr', 'tnidf', 'tnidt', 'mtfcc', 'fullname', 'the_geom', 'zipl', 'zipr')
+ORDER BY column_name;
+----
+fullname
+mtfcc
+statefp
+tfidl
+tfidr
+the_geom
+tlid
+tnidf
+tnidt
+zipl
+zipr
+
+# faces has the per-2020 block/tract codes needed for edge_containment GEOIDs
+query I
+SELECT count(*) FROM information_schema.columns
+WHERE table_schema = 'tiger' AND table_name = 'faces'
+  AND column_name IN ('tractce20', 'blockce20', 'blkgrpce20');
+----
+3
+
+# the_geom columns are GEOMETRY type: state, county, zcta5, place, cousub, edges, faces
+query I
+SELECT count(*) FROM information_schema.columns
+WHERE table_schema = 'tiger' AND column_name = 'the_geom' AND data_type = 'GEOMETRY';
+----
+7

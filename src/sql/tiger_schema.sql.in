@@ -1,0 +1,137 @@
+-- TIGER parent tables. All geometry columns are stored in EPSG:4269 (NAD83).
+-- Minimum columns per geocode_flow.md §14.2. Populated by the loader
+-- (Phase 5); these CREATE TABLE IF NOT EXISTS statements just stand up
+-- the schema so the macros in later phases compile.
+--
+-- Depends on spatial ext for the GEOMETRY column type. Registered
+-- best-effort by LoadInternal; if spatial isn't loaded, DDL fails and
+-- the tables are absent.
+
+-- Nation-level reference tables
+CREATE TABLE IF NOT EXISTS @TIGER@.state (
+    statefp   VARCHAR,
+    stusps    VARCHAR,
+    name      VARCHAR,
+    the_geom  GEOMETRY
+);
+
+CREATE TABLE IF NOT EXISTS @TIGER@.county (
+    statefp   VARCHAR,
+    countyfp  VARCHAR,
+    cntyidfp  VARCHAR,
+    name      VARCHAR,
+    the_geom  GEOMETRY
+);
+
+-- ZCTA polygons, clipped per-state at load time
+CREATE TABLE IF NOT EXISTS @TIGER@.zcta5 (
+    statefp   VARCHAR,
+    zcta5ce   VARCHAR,
+    the_geom  GEOMETRY
+);
+
+-- State-level reference tables
+CREATE TABLE IF NOT EXISTS @TIGER@.place (
+    statefp   VARCHAR,
+    placefp   VARCHAR,
+    plcidfp   VARCHAR,
+    name      VARCHAR,
+    the_geom  GEOMETRY
+);
+
+CREATE TABLE IF NOT EXISTS @TIGER@.cousub (
+    statefp   VARCHAR,
+    countyfp  VARCHAR,
+    cousubfp  VARCHAR,
+    cosbidfp  VARCHAR,
+    name      VARCHAR,
+    the_geom  GEOMETRY
+);
+
+-- Derived ZIP lookup tables built per-state after edges+faces load
+CREATE TABLE IF NOT EXISTS @TIGER@.zip_state (
+    zip     VARCHAR,
+    stusps  VARCHAR,
+    statefp VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS @TIGER@.zip_state_loc (
+    zip     VARCHAR,
+    stusps  VARCHAR,
+    statefp VARCHAR,
+    place   VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS @TIGER@.zip_lookup_base (
+    zip     VARCHAR,
+    state   VARCHAR,
+    county  VARCHAR,
+    city    VARCHAR,
+    statefp VARCHAR
+);
+
+-- County-level reference tables
+CREATE TABLE IF NOT EXISTS @TIGER@.edges (
+    statefp   VARCHAR,
+    countyfp  VARCHAR,
+    tlid      BIGINT,
+    tfidl     BIGINT,
+    tfidr     BIGINT,
+    tnidf     BIGINT,
+    tnidt     BIGINT,
+    mtfcc     VARCHAR,
+    fullname  VARCHAR,
+    the_geom  GEOMETRY,
+    zipl      VARCHAR,
+    zipr      VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS @TIGER@.faces (
+    statefp     VARCHAR,
+    countyfp    VARCHAR,
+    tfid        BIGINT,
+    placefp     VARCHAR,
+    cousubfp    VARCHAR,
+    tractce20   VARCHAR,
+    blockce20   VARCHAR,
+    blkgrpce20  VARCHAR,
+    the_geom    GEOMETRY
+);
+
+CREATE TABLE IF NOT EXISTS @TIGER@.featnames (
+    statefp     VARCHAR,
+    tlid        BIGINT,
+    name        VARCHAR,
+    fullname    VARCHAR,
+    predirabrv  VARCHAR,
+    pretypabrv  VARCHAR,
+    prequalabr  VARCHAR,
+    suftypabrv  VARCHAR,
+    sufdirabrv  VARCHAR,
+    mtfcc       VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS @TIGER@.addr (
+    statefp VARCHAR,
+    tlid    BIGINT,
+    fromhn  VARCHAR,
+    tohn    VARCHAR,
+    side    VARCHAR,
+    zip     VARCHAR,
+    plus4   VARCHAR
+);
+
+-- Per-edge-per-side block/tract/blkgrp containment precomputation (Phase 6).
+-- Built from edges ⨝ faces after each state loads; populated by the loader.
+CREATE TABLE IF NOT EXISTS @TIGER@.edge_containment (
+    statefp               VARCHAR,
+    tlid                  BIGINT,
+    guaranteed_l          BOOLEAN,
+    guaranteed_r          BOOLEAN,
+    block_geoid_l         VARCHAR,
+    tract_geoid_l         VARCHAR,
+    blkgrp_geoid_l        VARCHAR,
+    block_geoid_r         VARCHAR,
+    tract_geoid_r         VARCHAR,
+    blkgrp_geoid_r        VARCHAR
+);

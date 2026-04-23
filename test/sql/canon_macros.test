@@ -1,0 +1,94 @@
+# name: test/sql/canon_macros.test
+# description: canon_* macros canonicalize geocode_input fields
+
+require us_geocoder
+
+# canon_street_type
+query I
+SELECT tiger.canon_street_type('AVENUE');
+----
+Ave
+
+query I
+SELECT tiger.canon_street_type('Avenue');
+----
+Ave
+
+query I
+SELECT tiger.canon_street_type('Ave');
+----
+Ave
+
+query I
+SELECT tiger.canon_street_type('BLVD');
+----
+Blvd
+
+# Unknown types pass through
+query I
+SELECT tiger.canon_street_type('GIBBERISH');
+----
+GIBBERISH
+
+# canon_dir
+query I
+SELECT tiger.canon_dir('Northwest');
+----
+NW
+
+query I
+SELECT tiger.canon_dir('nw');
+----
+NW
+
+query I
+SELECT tiger.canon_dir('N');
+----
+N
+
+# canon_state
+query I
+SELECT tiger.canon_state('MA');
+----
+MA
+
+query I
+SELECT tiger.canon_state('Massachusetts');
+----
+MA
+
+query I
+SELECT tiger.canon_state('massachusetts');
+----
+MA
+
+query I
+SELECT tiger.canon_state('gibberish') IS NULL;
+----
+true
+
+# canon_zip
+query I
+SELECT tiger.canon_zip('02109');
+----
+02109
+
+query I
+SELECT tiger.canon_zip('2109');
+----
+02109
+
+query I
+SELECT tiger.canon_zip('02109-1234');
+----
+02109
+
+query I
+SELECT tiger.canon_zip('not-a-zip') IS NULL;
+----
+true
+
+query I
+SELECT tiger.canon_zip(NULL) IS NULL;
+----
+true

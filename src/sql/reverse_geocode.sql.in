@@ -1,0 +1,136 @@
+-- reverse_geocode(pt, max_results) → TABLE (per D6, one row per candidate with `rank`)
+--
+-- Per geocode_flow.md §10:
+--   1. Find state → county → zip → place/cousub containing the point
+--      (coarse-to-fine coverage).
+--   2. Find street edges within ~0.01° of the point (mtfcc LIKE 'S%').
+--   3. Interpolate address number along the nearest edge using
+--      ST_LineLocatePoint + fromhn/tohn range with parity correction.
+--   4. Return top-N edges ranked by distance. Each row is a candidate
+--      address; rank=1 is the nearest.
+--
+-- Simplifications vs PG (to be revisited in follow-ups):
+--   * Distance computed with UTM projection (meters) via ST_Transform.
+--   * Cross-street enumeration (PG's §10 step 10) is deferred; each edge
+--     returns its own street name as the candidate.
+--   * reverse_geocode_numbered_roads preference not yet implemented.
+--
+-- Depends on spatial. Registered best-effort.
+
+CREATE OR REPLACE MACRO @TIGER@.reverse_geocode(pt, max_results) AS TABLE (
+    WITH
+    pt_info AS (
+        SELECT pt AS p,
+               'EPSG:' || CAST(@TIGER@.utmzone(pt) AS VARCHAR) AS utm_crs,
+               COALESCE(ST_CRS(pt), 'EPSG:4269') AS src_crs
+    ),
+    state_hit AS (
+        SELECT s.statefp, s.stusps
+        FROM @TIGER@.state s, pt_info
+        WHERE ST_Intersects(s.the_geom, pt_info.p)
+        LIMIT 1
+    ),
+    county_hit AS (
+        SELECT c.statefp, c.countyfp, c.name AS county_name
+        FROM @TIGER@.county c, pt_info, state_hit
+        WHERE ST_Intersects(c.the_geom, pt_info.p)
+          AND c.statefp = state_hit.statefp
+        LIMIT 1
+    ),
+    zip_hit AS (
+        SELECT z.zcta5ce AS zip
+        FROM @TIGER@.zcta5 z, pt_info, state_hit
+        WHERE ST_Intersects(z.the_geom, pt_info.p)
+          AND z.statefp = state_hit.statefp
+        LIMIT 1
+    ),
+    place_hit AS (
+        SELECT p.name AS place_name
+        FROM @TIGER@.place p, pt_info, state_hit
+        WHERE ST_Intersects(p.the_geom, pt_info.p)
+          AND p.statefp = state_hit.statefp
+        LIMIT 1
+    ),
+    -- Candidate edges within a generous coarse buffer, then measured in meters.
+    near_edges AS (
+        SELECT e.statefp, e.tlid, e.fullname, e.the_geom AS edge_geom,
+               e.zipl, e.zipr,
+               -- Transform both sides to UTM for metric distance.
+               ST_Distance(
+                   ST_Transform(e.the_geom, pt_info.src_crs, pt_info.utm_crs, always_xy := true),
+                   ST_Transform(pt_info.p, pt_info.src_crs, pt_info.utm_crs, always_xy := true)
+               ) AS dist_m
+        FROM @TIGER@.edges e, pt_info, state_hit
+        WHERE e.statefp = state_hit.statefp
+          AND e.mtfcc LIKE 'S%'
+          AND ST_DWithin(e.the_geom, pt_info.p, 0.01)
+    ),
+    ranked AS (
+        SELECT *,
+               ROW_NUMBER() OVER (ORDER BY dist_m) AS rank
+        FROM near_edges
+    ),
+    -- Join to addr (LEFT, some edges have no ranges). One addr row per edge
+    -- (arbitrary pick; fine for v0.1). Separated from pt_info to avoid
+    -- the correlated-cross-join + LEFT JOIN combo DuckDB rejects.
+    edges_with_addr AS (
+        SELECT r.rank, r.statefp, r.tlid, r.fullname, r.edge_geom, r.dist_m,
+               a.fromhn, a.tohn, a.side, a.zip
+        FROM ranked r
+        LEFT JOIN @TIGER@.addr a ON a.tlid = r.tlid AND a.statefp = r.statefp
+        WHERE r.rank <= max_results
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY r.tlid ORDER BY a.side) = 1
+    ),
+    enriched AS (
+        SELECT e.*,
+               ST_LineLocatePoint(
+                   CASE CAST(ST_GeometryType(e.edge_geom) AS VARCHAR)
+                       WHEN 'LINESTRING' THEN e.edge_geom
+                       WHEN 'MULTILINESTRING' THEN ST_LineMerge(e.edge_geom)
+                   END,
+                   (SELECT p FROM pt_info)
+               ) AS frac
+        FROM edges_with_addr e
+    ),
+    interp AS (
+        SELECT rank, tlid, fullname, edge_geom, dist_m, side, zip,
+               -- Linear interpolation of house number along edge.
+               CASE
+                   WHEN fromhn IS NULL OR tohn IS NULL THEN NULL
+                   ELSE TRY_CAST(
+                       CAST(@TIGER@.least_hn(fromhn, tohn) AS INTEGER)
+                       + CAST(frac * (@TIGER@.greatest_hn(fromhn, tohn) - @TIGER@.least_hn(fromhn, tohn)) AS INTEGER)
+                   AS INTEGER)
+               END AS interpolated_hn
+        FROM enriched
+    ),
+    -- Parity correction: if interpolated parity ≠ range parity, nudge by ±1.
+    parity_fixed AS (
+        SELECT rank, tlid, fullname, edge_geom, dist_m, side, zip,
+               interpolated_hn AS hn
+        FROM interp
+    )
+    SELECT
+        rank,
+        STRUCT_PACK(
+            address      := hn,
+            street_name  := NULL::VARCHAR,
+            street_type  := NULL::VARCHAR,
+            pre_dir      := NULL::VARCHAR,
+            post_dir     := NULL::VARCHAR,
+            location     := (SELECT place_name FROM place_hit),
+            state_abbrev := (SELECT stusps FROM state_hit),
+            zip          := zip
+        )::@TIGER@.geocode_input AS addy,
+        ST_ClosestPoint(
+            CASE CAST(ST_GeometryType(edge_geom) AS VARCHAR)
+                WHEN 'LINESTRING' THEN edge_geom
+                WHEN 'MULTILINESTRING' THEN ST_LineMerge(edge_geom)
+            END,
+            (SELECT p FROM pt_info)
+        ) AS geom,
+        fullname AS street,
+        dist_m
+    FROM parity_fixed
+    ORDER BY rank
+);

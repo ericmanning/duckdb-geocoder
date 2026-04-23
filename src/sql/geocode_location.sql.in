@@ -1,0 +1,91 @@
+-- Stage B — location-only fallback. Depends on `spatial` (ST_Centroid,
+-- ST_Intersects) and `splink_udfs` (soundex). Registered best-effort.
+--
+-- Per geocode_flow.md §8, §11:
+--   * Returns rows with rating >= 100 (strict invariant, keeps Stage B
+--     always below any Stage A match).
+--   * First tier: zcta5 ⨝ zip_lookup_base on matching zip OR soundex(city).
+--     Emit ST_Centroid(zcta5.the_geom) as geom.
+--   * Second tier: place (filtered to state) on soundex(name).
+--   * Rating = 100 + levenshtein_ignore_case(candidate_place, input.location).
+--
+-- Vectorized: returns all candidates; caller ORDER BY rating LIMIT. No
+-- rating=100 short-circuit (per D7).
+--
+-- Implementation note: DuckDB macros don't correlate a struct parameter
+-- reliably into nested subqueries, so we unpack `inp` into a single-row
+-- CTE `p` and reference `p.field` throughout.
+
+CREATE OR REPLACE MACRO @TIGER@.geocode_location_impl(inp, restrict_geom_4269) AS TABLE (
+    WITH
+    p AS (
+        SELECT
+            inp['address']      AS address,
+            inp['street_name']  AS street_name,
+            inp['street_type']  AS street_type,
+            inp['pre_dir']      AS pre_dir,
+            inp['post_dir']     AS post_dir,
+            inp['location']     AS location,
+            inp['state_abbrev'] AS state_abbrev,
+            inp['zip']          AS zip
+    ),
+    in_state AS (
+        SELECT sl.statefp AS statefp
+        FROM @TIGER@.state_lookup sl, p
+        WHERE p.state_abbrev IS NOT NULL
+          AND sl.abbrev = p.state_abbrev
+        LIMIT 1
+    ),
+    -- Tier 1: ZCTA polygon centroid, keyed by zip or city-soundex.
+    zcta_tier AS (
+        SELECT
+            STRUCT_PACK(
+                address      := NULL::INTEGER,
+                street_name  := NULL::VARCHAR,
+                street_type  := NULL::VARCHAR,
+                pre_dir      := NULL::VARCHAR,
+                post_dir     := NULL::VARCHAR,
+                location     := zlb.city,
+                state_abbrev := zlb.state,
+                zip          := zlb.zip
+            )::@TIGER@.geocode_input AS addy,
+            ST_Centroid(z.the_geom) AS geom,
+            100 + @TIGER@.levenshtein_ignore_case(zlb.city, p.location) AS rating
+        FROM @TIGER@.zcta5 z
+        JOIN @TIGER@.zip_lookup_base zlb
+             ON z.zcta5ce = zlb.zip AND z.statefp = zlb.statefp
+        CROSS JOIN p
+        WHERE (
+                (p.zip IS NOT NULL AND zlb.zip = p.zip)
+             OR (p.location IS NOT NULL
+                 AND (SELECT statefp FROM in_state) = zlb.statefp
+                 AND soundex(zlb.city) = soundex(p.location))
+              )
+          AND (restrict_geom_4269 IS NULL OR ST_Intersects(z.the_geom, restrict_geom_4269))
+    ),
+    -- Tier 2: place polygon centroid, keyed by name-soundex within state.
+    place_tier AS (
+        SELECT
+            STRUCT_PACK(
+                address      := NULL::INTEGER,
+                street_name  := NULL::VARCHAR,
+                street_type  := NULL::VARCHAR,
+                pre_dir      := NULL::VARCHAR,
+                post_dir     := NULL::VARCHAR,
+                location     := pl.name,
+                state_abbrev := p.state_abbrev,
+                zip          := NULL::VARCHAR
+            )::@TIGER@.geocode_input AS addy,
+            ST_Centroid(pl.the_geom) AS geom,
+            100 + @TIGER@.levenshtein_ignore_case(pl.name, p.location) AS rating
+        FROM @TIGER@.place pl
+        CROSS JOIN p
+        WHERE p.location IS NOT NULL
+          AND pl.statefp = (SELECT statefp FROM in_state)
+          AND soundex(pl.name) = soundex(p.location)
+          AND (restrict_geom_4269 IS NULL OR ST_Intersects(pl.the_geom, restrict_geom_4269))
+    )
+    SELECT addy, geom, rating FROM zcta_tier
+    UNION ALL
+    SELECT addy, geom, rating FROM place_tier
+);

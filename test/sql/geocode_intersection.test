@@ -1,0 +1,82 @@
+# name: test/sql/geocode_intersection.test
+# description: geocode_intersection — finds intersection via shared TIGER node IDs
+
+require us_geocoder
+
+statement ok
+LOAD spatial;
+
+statement ok
+LOAD splink_udfs;
+
+# Two streets meeting at node 3001 = (-71.405, 41.826).
+# Meeting St runs east from the shared corner; Benefit St runs north.
+
+statement ok
+INSERT INTO tiger.state (statefp, stusps, name, the_geom) VALUES
+    ('44', 'RI', 'Rhode Island',
+     ST_GeomFromText('POLYGON((-71.9 41.1, -71.0 41.1, -71.0 42.1, -71.9 42.1, -71.9 41.1))'));
+
+statement ok
+INSERT INTO tiger.zip_lookup_base (zip, state, county, city, statefp) VALUES
+    ('02903', 'RI', 'Providence', 'Providence', '44');
+
+statement ok
+INSERT INTO tiger.featnames (statefp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc) VALUES
+    ('44', 1001, 'Meeting', 'Meeting St', NULL, NULL, NULL, 'St', NULL, 'S1400'),
+    ('44', 1002, 'Benefit', 'Benefit St', NULL, NULL, NULL, 'St', NULL, 'S1400');
+
+statement ok
+INSERT INTO tiger.edges (statefp, countyfp, tlid, tfidl, tfidr, tnidf, tnidt, mtfcc, fullname, the_geom, zipl, zipr) VALUES
+    -- Meeting St runs from shared node 3001 east to 3002
+    ('44', '007', 1001, 2001, 2002, 3001, 3002, 'S1400', 'Meeting St',
+     ST_GeomFromText('LINESTRING(-71.405 41.826, -71.403 41.826)'), '02903', '02903'),
+    -- Benefit St runs from shared node 3001 north to 3003
+    ('44', '007', 1002, 2003, 2004, 3001, 3003, 'S1400', 'Benefit St',
+     ST_GeomFromText('LINESTRING(-71.405 41.826, -71.405 41.828)'), '02903', '02903');
+
+statement ok
+INSERT INTO tiger.addr (statefp, tlid, fromhn, tohn, side, zip, plus4) VALUES
+    ('44', 1001, '100', '198', 'L', '02903', NULL),
+    ('44', 1001, '101', '199', 'R', '02903', NULL),
+    ('44', 1002, '200', '298', 'L', '02903', NULL),
+    ('44', 1002, '201', '299', 'R', '02903', NULL);
+
+# Exact name match at intersection → low rating, geom at shared node.
+query II
+SELECT (addy).street_name, ST_AsText(geom)
+FROM tiger.geocode_intersection('Meeting', 'Benefit', 'RI', 'Providence', '02903', 5)
+ORDER BY rating
+LIMIT 1;
+----
+Meeting	POINT (-71.405 41.826)
+
+# Returned house number is from the shared end of Meeting St (fromhn=100 or 101).
+query I
+SELECT (addy).address IN (100, 101)
+FROM tiger.geocode_intersection('Meeting', 'Benefit', 'RI', 'Providence', '02903', 5)
+ORDER BY rating
+LIMIT 1;
+----
+true
+
+# Rating is finite-low for an exact match (double-counted name+fullname per PG).
+query I
+SELECT MIN(rating) <= 10
+FROM tiger.geocode_intersection('Meeting', 'Benefit', 'RI', 'Providence', '02903', 5);
+----
+true
+
+# Nonexistent streets → 0 rows.
+query I
+SELECT count(*)
+FROM tiger.geocode_intersection('Nonesuch', 'Nonesuch', 'RI', 'Providence', '02903', 5);
+----
+0
+
+# Partial match (one street exists, the other doesn't) → 0 rows since pair-join finds nothing.
+query I
+SELECT count(*)
+FROM tiger.geocode_intersection('Meeting', 'Nonesuch', 'RI', 'Providence', '02903', 5);
+----
+0

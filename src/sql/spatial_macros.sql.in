@@ -1,0 +1,99 @@
+-- Spatial scoring primitives. Require the `spatial` core extension to be
+-- loaded at macro-registration time. us_geocoder's LoadInternal attempts
+-- registration best-effort; if spatial isn't loaded, these macros are
+-- absent and the user sees a "function not found" error on call.
+
+-- utmzone(pt) → INTEGER EPSG code for the appropriate UTM zone.
+-- Assumes `pt` is in EPSG:4269 (the SRID we store TIGER data in).
+-- Output: 32601-32660 for northern hemisphere, 32701-32760 for southern.
+CREATE OR REPLACE MACRO @TIGER@.utmzone(pt) AS (
+    (SELECT CAST(FLOOR((ST_X(g) + 180) / 6) + 1 AS INTEGER)
+            + CASE WHEN ST_Y(g) > 0 THEN 32600 ELSE 32700 END
+     FROM (SELECT ST_Transform(pt, 'EPSG:4269', 'EPSG:4326', always_xy := true) AS g))
+);
+
+-- interpolate_from_address(given_address, in_addr1, in_addr2, in_road, in_side, in_offset_m)
+--
+-- Full port of PG src/geocode/interpolate_from_address.sql.
+--  1. Parses address endpoints (non-numeric → 0).
+--  2. Computes `part` = (given - min) / (max - min), clamped to [0,1]
+--     with 0.5 fallback if range is zero. Inverts if a1 > a2.
+--  3. Projects the road to UTM (so offset distances are in meters).
+--  4. Interpolates the center point along the UTM line.
+--  5. If `in_side` ∈ {'L','R'} and `in_offset_m` > 0, translates the
+--     center point perpendicular to the street in UTM by in_offset_m.
+--     Perp direction = az ± π/2 (minus for left, plus for right).
+--     This is the clean reformulation of PG's quadrant-based sign flips.
+--  6. Projects back to the road's native SRID (assumed 4269 if SRID is 0).
+--
+-- Accepts LINESTRING or MULTILINESTRING input (latter via ST_LineMerge).
+CREATE OR REPLACE MACRO @TIGER@.interpolate_from_address(
+    given_address, in_addr1, in_addr2, in_road, in_side, in_offset_m
+) AS (
+    (WITH
+    parsed AS (
+        SELECT
+            CASE WHEN regexp_matches(trim(in_addr1), '^[0-9]+$') THEN CAST(trim(in_addr1) AS INTEGER) ELSE 0 END AS a1,
+            CASE WHEN regexp_matches(trim(in_addr2), '^[0-9]+$') THEN CAST(trim(in_addr2) AS INTEGER) ELSE 0 END AS a2,
+            CASE CAST(ST_GeometryType(in_road) AS VARCHAR)
+                WHEN 'LINESTRING' THEN in_road
+                WHEN 'MULTILINESTRING' THEN ST_LineMerge(in_road)
+                ELSE NULL
+            END AS line,
+            -- ST_CRS returns NULL when the geometry has no CRS set
+            -- (common when read from plain ST_GeomFromText); D10 says
+            -- assume 4269 in that case.
+            COALESCE(ST_CRS(in_road), 'EPSG:4269') AS src_crs
+    ),
+    frac AS (
+        SELECT line, src_crs, a1, a2,
+               CASE WHEN a1 > a2 THEN 1.0 - part_raw ELSE part_raw END AS part
+        FROM (
+            SELECT line, src_crs, a1, a2,
+                   CASE
+                       WHEN GREATEST(a1, a2) = LEAST(a1, a2) THEN 0.5
+                       ELSE LEAST(1.0, GREATEST(0.0,
+                            CAST(given_address - LEAST(a1, a2) AS DOUBLE)
+                            / CAST(GREATEST(a1, a2) - LEAST(a1, a2) AS DOUBLE)
+                       ))
+                   END AS part_raw
+            FROM parsed
+            WHERE line IS NOT NULL
+        )
+    ),
+    -- Fast path: no side/offset → interpolate in the native SRID,
+    -- skip UTM round-trip (which introduces ~1e-6 float noise).
+    fast_center AS (
+        SELECT ST_LineInterpolatePoint(line, part) AS pt
+        FROM frac
+        WHERE in_side IS NULL OR in_side = '' OR in_offset_m IS NULL OR in_offset_m <= 0
+    ),
+    -- Slow path: offset requested → go through UTM so translation is in meters.
+    slow_utm AS (
+        SELECT
+            'EPSG:' || CAST(@TIGER@.utmzone(ST_StartPoint(line)) AS VARCHAR) AS utm_crs,
+            ST_Transform(line, src_crs,
+                         'EPSG:' || CAST(@TIGER@.utmzone(ST_StartPoint(line)) AS VARCHAR),
+                         always_xy := true) AS line_utm,
+            src_crs, part
+        FROM frac
+        WHERE in_side IS NOT NULL AND in_side != '' AND in_offset_m IS NOT NULL AND in_offset_m > 0
+    ),
+    slow_offset AS (
+        SELECT
+            ST_Transform(
+                ST_Translate(
+                    ST_LineInterpolatePoint(line_utm, part),
+                    in_offset_m * sin(ST_Azimuth(ST_StartPoint(line_utm), ST_EndPoint(line_utm))
+                                      + CASE WHEN upper(in_side) = 'L' THEN -pi()/2 ELSE pi()/2 END),
+                    in_offset_m * cos(ST_Azimuth(ST_StartPoint(line_utm), ST_EndPoint(line_utm))
+                                      + CASE WHEN upper(in_side) = 'L' THEN -pi()/2 ELSE pi()/2 END)
+                ),
+                utm_crs, src_crs, always_xy := true
+            ) AS pt
+        FROM slow_utm
+    )
+    SELECT pt FROM fast_center
+    UNION ALL
+    SELECT pt FROM slow_offset)
+);

@@ -1,0 +1,132 @@
+-- Stateless scoring primitives. All are scalar macros over core DuckDB
+-- string/numeric built-ins; no spatial or community-extension dependencies.
+-- Ported from postgis_tiger_geocoder src/geocode/other_helper_functions.sql,
+-- src/geocode/rate_attributes.sql, and src/utility/*.
+
+-- coalesce(x, '') — used to keep levenshtein from NULL-poisoning.
+CREATE OR REPLACE MACRO @TIGER@.cull_null(s) AS (
+    COALESCE(s, '')
+);
+
+-- levenshtein(lower(cull_null(a)), lower(cull_null(b))) — wraps the core builtin.
+CREATE OR REPLACE MACRO @TIGER@.levenshtein_ignore_case(a, b) AS (
+    levenshtein(lower(@TIGER@.cull_null(a)), lower(@TIGER@.cull_null(b)))
+);
+
+-- Numeric min/max over house-number strings; non-numeric coerced to 0.
+CREATE OR REPLACE MACRO @TIGER@.least_hn(fromhn, tohn) AS (
+    LEAST(
+        CASE WHEN regexp_matches(trim(fromhn), '^[0-9]+$') THEN CAST(trim(fromhn) AS INTEGER) ELSE 0 END,
+        CASE WHEN regexp_matches(trim(tohn),   '^[0-9]+$') THEN CAST(trim(tohn)   AS INTEGER) ELSE 0 END
+    )
+);
+
+CREATE OR REPLACE MACRO @TIGER@.greatest_hn(fromhn, tohn) AS (
+    GREATEST(
+        CASE WHEN regexp_matches(trim(fromhn), '^[0-9]+$') THEN CAST(trim(fromhn) AS INTEGER) ELSE 0 END,
+        CASE WHEN regexp_matches(trim(tohn),   '^[0-9]+$') THEN CAST(trim(tohn)   AS INTEGER) ELSE 0 END
+    )
+);
+
+-- Absolute numeric difference on the first five characters of two zips.
+CREATE OR REPLACE MACRO @TIGER@.diff_zip(zip1, zip2) AS (
+    abs(
+        CASE WHEN regexp_matches(trim(left(zip1, 5)), '^[0-9]+$')
+             THEN CAST(trim(left(zip1, 5)) AS INTEGER) ELSE 0 END
+        - CASE WHEN regexp_matches(trim(left(zip2, 5)), '^[0-9]+$')
+             THEN CAST(trim(left(zip2, 5)) AS INTEGER) ELSE 0 END
+    )
+);
+
+-- Returns a VARCHAR[] of zip codes in a numeric neighborhood around `zip`.
+-- e.g. zip_range('02109', -1, 1) -> ['02108', '02109', '02110']
+CREATE OR REPLACE MACRO @TIGER@.zip_range(zip, range_start, range_end) AS (
+    (SELECT list(lpad(CAST(
+        (CASE WHEN regexp_matches(trim(left(zip, 5)), '^[0-9]+$')
+              THEN CAST(trim(left(zip, 5)) AS INTEGER) ELSE 0 END + i)
+        AS VARCHAR), 5, '0'))
+     FROM generate_series(range_start, range_end) AS _(i))
+);
+
+-- Canonicalize whitespace around `-` so "I-635" and "I- 635" compare equally.
+CREATE OR REPLACE MACRO @TIGER@.normalize_street_name(input_street) AS (
+    trim(regexp_replace(
+             regexp_replace(lower(input_street), '\s*-\s*', '-', 'g'),
+             '\s+', ' ', 'g'))
+);
+
+-- True iff both streets are short (<10 chars), both start with digits/slashes,
+-- and their numeric prefixes are equal. Handles "23TH" vs "23RD", etc.
+CREATE OR REPLACE MACRO @TIGER@.numeric_streets_equal(input_street, output_street) AS (
+    COALESCE(
+        length(input_street) < 10 AND length(output_street) < 10
+        AND regexp_matches(input_street,  '^[0-9/\s]+')
+        AND regexp_matches(output_street, '^[0-9/\s]+')
+        AND trim(regexp_extract(input_street,  '^[0-9/\s]+')) =
+            trim(regexp_extract(output_street, '^[0-9/\s]+')),
+        false
+    )
+);
+
+-- rate_attributes: two overloads (9-arg and 11-arg), declared in the
+-- single-statement form DuckDB requires for overloading.
+-- Direction weight 2, name weight 10, type weight 5.
+-- Prequalabr discount 0.75. Numeric-streets short-circuit (PostGIS parity).
+-- 9-arg form returns NULL if either streetName is NULL.
+-- 11-arg form adds location Levenshtein, returns NULL if either location
+-- is NULL.
+CREATE OR REPLACE MACRO @TIGER@.rate_attributes
+    (dirpA, dirpB,
+     streetNameA, streetNameB,
+     streetTypeA, streetTypeB,
+     dirsA, dirsB,
+     prequalabr) AS (
+        CASE
+            WHEN streetNameA IS NULL OR streetNameB IS NULL THEN NULL
+            ELSE
+                @TIGER@.levenshtein_ignore_case(@TIGER@.cull_null(dirpA), @TIGER@.cull_null(dirpB)) * 2
+                + CASE
+                    WHEN @TIGER@.numeric_streets_equal(streetNameA, streetNameB) THEN
+                        CASE
+                            WHEN (regexp_matches(streetNameB, '[a-zA-Z]{2,10}')
+                                  AND NOT regexp_matches(streetNameA, '[a-zA-Z]{2,10}'))
+                              OR (regexp_matches(streetNameA, '[a-zA-Z]{2,10}')
+                                  AND NOT regexp_matches(streetNameB, '[a-zA-Z]{2,10}'))
+                            THEN @TIGER@.levenshtein_ignore_case(streetNameA, streetNameB) * 10
+                            ELSE 0
+                        END
+                    WHEN prequalabr IS NOT NULL THEN
+                        CAST(
+                            @TIGER@.levenshtein_ignore_case(
+                                trim(trim(lower(streetNameA), lower(prequalabr))),
+                                trim(trim(lower(streetNameB), lower(prequalabr)))
+                            ) * 10 * 0.75
+                            + @TIGER@.levenshtein_ignore_case(
+                                trim(streetNameA),
+                                prequalabr || ' ' || streetNameB) * 10 * 0.25
+                        AS INTEGER)
+                    ELSE
+                        @TIGER@.levenshtein_ignore_case(streetNameA, streetNameB) * 10
+                  END
+                + @TIGER@.levenshtein_ignore_case(@TIGER@.cull_null(streetTypeA), @TIGER@.cull_null(streetTypeB)) * 5
+                + @TIGER@.levenshtein_ignore_case(@TIGER@.cull_null(dirsA), @TIGER@.cull_null(dirsB)) * 2
+        END
+    ),
+    (dirpA, dirpB,
+     streetNameA, streetNameB,
+     streetTypeA, streetTypeB,
+     dirsA, dirsB,
+     locationA, locationB,
+     prequalabr) AS (
+        CASE
+            WHEN locationA IS NULL OR locationB IS NULL THEN NULL
+            ELSE
+                @TIGER@.levenshtein_ignore_case(locationA, locationB)
+                + @TIGER@.rate_attributes(
+                    dirpA, dirpB,
+                    streetNameA, streetNameB,
+                    streetTypeA, streetTypeB,
+                    dirsA, dirsB,
+                    prequalabr)
+        END
+    );

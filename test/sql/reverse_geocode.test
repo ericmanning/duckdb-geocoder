@@ -1,0 +1,81 @@
+# name: test/sql/reverse_geocode.test
+# description: reverse_geocode — point → ranked nearby street candidates
+
+require us_geocoder
+
+statement ok
+LOAD spatial;
+
+statement ok
+LOAD splink_udfs;
+
+statement ok
+INSERT INTO tiger.state (statefp, stusps, name, the_geom) VALUES
+    ('44', 'RI', 'Rhode Island',
+     ST_GeomFromText('POLYGON((-71.9 41.1, -71.0 41.1, -71.0 42.1, -71.9 42.1, -71.9 41.1))'));
+
+statement ok
+INSERT INTO tiger.county (statefp, countyfp, cntyidfp, name, the_geom) VALUES
+    ('44', '007', '44007', 'Providence',
+     ST_GeomFromText('POLYGON((-71.5 41.7, -71.3 41.7, -71.3 41.9, -71.5 41.9, -71.5 41.7))'));
+
+statement ok
+INSERT INTO tiger.place (statefp, placefp, plcidfp, name, the_geom) VALUES
+    ('44', '59000', '4459000', 'Providence',
+     ST_GeomFromText('POLYGON((-71.45 41.80, -71.38 41.80, -71.38 41.85, -71.45 41.85, -71.45 41.80))'));
+
+statement ok
+INSERT INTO tiger.zcta5 (statefp, zcta5ce, the_geom) VALUES
+    ('44', '02903',
+     ST_GeomFromText('POLYGON((-71.42 41.81, -71.40 41.81, -71.40 41.83, -71.42 41.83, -71.42 41.81))'));
+
+statement ok
+INSERT INTO tiger.edges (statefp, countyfp, tlid, tfidl, tfidr, tnidf, tnidt, mtfcc, fullname, the_geom, zipl, zipr) VALUES
+    ('44', '007', 1001, 2001, 2002, 3001, 3002, 'S1400', 'Meeting St',
+     ST_GeomFromText('LINESTRING(-71.405 41.826, -71.403 41.826)'), '02903', '02903');
+
+statement ok
+INSERT INTO tiger.addr (statefp, tlid, fromhn, tohn, side, zip, plus4) VALUES
+    ('44', 1001, '100', '198', 'L', '02903', NULL);
+
+# Point near the midpoint of Meeting St.
+query III
+SELECT rank, street, (addy).location
+FROM tiger.reverse_geocode(ST_Point(-71.404, 41.826), 5)
+ORDER BY rank;
+----
+1	Meeting St	Providence
+
+# Distance is small (meters).
+query I
+SELECT dist_m < 10
+FROM tiger.reverse_geocode(ST_Point(-71.404, 41.826), 5)
+ORDER BY rank
+LIMIT 1;
+----
+true
+
+# Interpolated house number in range [100, 198].
+query I
+SELECT (addy).address BETWEEN 100 AND 198
+FROM tiger.reverse_geocode(ST_Point(-71.404, 41.826), 5)
+ORDER BY rank
+LIMIT 1;
+----
+true
+
+# ZIP pulled from the adjacent ZCTA.
+query I
+SELECT (addy).zip
+FROM tiger.reverse_geocode(ST_Point(-71.404, 41.826), 5)
+ORDER BY rank
+LIMIT 1;
+----
+02903
+
+# Far-away point → 0 rows (no edges within 0.01°).
+query I
+SELECT count(*)
+FROM tiger.reverse_geocode(ST_Point(-71.0, 41.5), 5);
+----
+0

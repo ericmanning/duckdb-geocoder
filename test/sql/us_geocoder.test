@@ -1,0 +1,14 @@
+# name: test/sql/us_geocoder.test
+# description: us_geocoder smoke test — extension loads and exposes a version
+
+statement error
+SELECT us_geocoder_version();
+----
+Catalog Error: Scalar Function with name us_geocoder_version does not exist!
+
+require us_geocoder
+
+query I
+SELECT length(us_geocoder_version()) > 0;
+----
+true

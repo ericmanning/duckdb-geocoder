@@ -30,3 +30,29 @@
 *.exe
 *.out
 *.app
+
+# DuckDB extension build outputs
+/build/
+/.cache/
+/cmake-build-*/
+/testext
+duckdb_unittest_tempdir/
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Python (scripts/)
+__pycache__/
+*.pyc
+
+# R
+.Rhistory
+
+# vcpkg artifacts
+/vcpkg_installed/

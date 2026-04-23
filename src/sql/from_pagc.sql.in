@@ -1,0 +1,27 @@
+-- from_pagc: raw VARCHAR → geocode_input.
+-- Depends on the `us_address_standardizer` community extension for
+-- standardize_address() and parse_address(). Registration is attempted at
+-- LoadInternal but swallowed if those aren't resolvable; users who need
+-- from_pagc must LOAD us_address_standardizer, then LOAD us_geocoder again.
+--
+-- The COALESCE cascade on location/state_abbrev/zip is load-bearing
+-- for PostGIS parity — standardize_address sometimes leaves those empty
+-- on addresses where parse_address's blunter regex picks them up.
+CREATE OR REPLACE MACRO @TIGER@.from_pagc(raw_text) AS (
+    SELECT STRUCT_PACK(
+        address      := TRY_CAST(regexp_extract(sa.r.house_num, '\d+') AS INTEGER),
+        street_name  := NULLIF(trim(sa.r.name), ''),
+        street_type  := @TIGER@.canon_street_type(COALESCE(sa.r.suftype, sa.r.pretype)),
+        pre_dir      := @TIGER@.canon_dir(sa.r.predir),
+        post_dir     := @TIGER@.canon_dir(sa.r.sufdir),
+        location     := COALESCE(NULLIF(trim(sa.r.city), ''),
+                                 NULLIF(trim(pa.r.city), '')),
+        state_abbrev := @TIGER@.canon_state(COALESCE(NULLIF(trim(sa.r.state), ''),
+                                                     NULLIF(trim(pa.r.state), ''))),
+        zip          := @TIGER@.canon_zip(COALESCE(
+                           NULLIF(split_part(COALESCE(sa.r.postcode, ''), '-', 1), ''),
+                           NULLIF(pa.r.zip, '')))
+    )::@TIGER@.geocode_input
+    FROM (SELECT standardize_address(raw_text) AS r) sa,
+         (SELECT parse_address(raw_text) AS r) pa
+);

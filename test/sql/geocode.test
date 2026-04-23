@@ -1,0 +1,130 @@
+# name: test/sql/geocode.test
+# description: public geocode() wrapper — combines Stage A + B + containment filter
+
+require us_geocoder
+
+statement ok
+LOAD spatial;
+
+statement ok
+LOAD splink_udfs;
+
+# Reuse the Meeting St / Providence fixture.
+statement ok
+INSERT INTO tiger.state (statefp, stusps, name, the_geom) VALUES
+    ('44', 'RI', 'Rhode Island',
+     ST_GeomFromText('POLYGON((-71.9 41.1, -71.0 41.1, -71.0 42.1, -71.9 42.1, -71.9 41.1))'));
+
+statement ok
+INSERT INTO tiger.county (statefp, countyfp, cntyidfp, name, the_geom) VALUES
+    ('44', '007', '44007', 'Providence',
+     ST_GeomFromText('POLYGON((-71.5 41.7, -71.3 41.7, -71.3 41.9, -71.5 41.9, -71.5 41.7))'));
+
+statement ok
+INSERT INTO tiger.place (statefp, placefp, plcidfp, name, the_geom) VALUES
+    ('44', '59000', '4459000', 'Providence',
+     ST_GeomFromText('POLYGON((-71.45 41.80, -71.38 41.80, -71.38 41.85, -71.45 41.85, -71.45 41.80))'));
+
+statement ok
+INSERT INTO tiger.zcta5 (statefp, zcta5ce, the_geom) VALUES
+    ('44', '02903',
+     ST_GeomFromText('POLYGON((-71.42 41.81, -71.40 41.81, -71.40 41.83, -71.42 41.83, -71.42 41.81))'));
+
+statement ok
+INSERT INTO tiger.zip_lookup_base (zip, state, county, city, statefp) VALUES
+    ('02903', 'RI', 'Providence', 'Providence', '44');
+
+statement ok
+INSERT INTO tiger.featnames (statefp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc) VALUES
+    ('44', 1001, 'Meeting', 'Meeting St', NULL, NULL, NULL, 'St', NULL, 'S1400');
+
+statement ok
+INSERT INTO tiger.edges (statefp, countyfp, tlid, tfidl, tfidr, tnidf, tnidt, mtfcc, fullname, the_geom, zipl, zipr) VALUES
+    ('44', '007', 1001, 2001, 2002, 3001, 3002, 'S1400', 'Meeting St',
+     ST_GeomFromText('LINESTRING(-71.405 41.826, -71.403 41.826)'), '02903', '02903');
+
+statement ok
+INSERT INTO tiger.faces (statefp, countyfp, tfid, placefp, cousubfp, tractce20, blockce20, blkgrpce20, the_geom) VALUES
+    ('44', '007', 2001, '59000', NULL, '000400', '1001', '1',
+     ST_GeomFromText('POLYGON((-71.406 41.827, -71.402 41.827, -71.402 41.826, -71.406 41.826, -71.406 41.827))')),
+    ('44', '007', 2002, '59000', NULL, '000400', '1002', '1',
+     ST_GeomFromText('POLYGON((-71.406 41.826, -71.402 41.826, -71.402 41.825, -71.406 41.825, -71.406 41.826))'));
+
+statement ok
+INSERT INTO tiger.addr (statefp, tlid, fromhn, tohn, side, zip, plus4) VALUES
+    ('44', 1001, '100', '198', 'L', '02903', NULL),
+    ('44', 1001, '101', '199', 'R', '02903', NULL);
+
+# Exact match: Stage A returns rating 0.
+query II
+SELECT rating, (addy).street_name
+FROM tiger.geocode(
+    CAST({address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input),
+    5, NULL, 'none'
+);
+----
+0	Meeting
+
+# Geom is offset to the left side (north of east-going line); rating 0.
+query I
+SELECT ST_Y(geom) > 41.826
+FROM tiger.geocode(
+    CAST({address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input),
+    5, NULL, 'none'
+) LIMIT 1;
+----
+true
+
+# No street name → Stage A returns nothing → Stage B (location fallback) fires.
+# Expect rating >= 100 and location = Providence.
+query II
+SELECT rating >= 100, (addy).location
+FROM tiger.geocode(
+    CAST({address: NULL, street_name: NULL, street_type: NULL, pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input),
+    5, NULL, 'none'
+) LIMIT 1;
+----
+true	Providence
+
+# Stage B is skipped when Stage A has any candidate: both a valid street name
+# AND a valid location → only Stage A rows returned (no rating-100 rows).
+query I
+SELECT MAX(rating)
+FROM tiger.geocode(
+    CAST({address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input),
+    5, NULL, 'none'
+);
+----
+0
+
+# require_containment='block' filters out all rows (edge_containment is empty).
+query I
+SELECT count(*)
+FROM tiger.geocode(
+    CAST({address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input),
+    5, NULL, 'block'
+);
+----
+0
+
+# max_results is respected.
+query I
+SELECT count(*) <= 1
+FROM tiger.geocode(
+    CAST({address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input),
+    1, NULL, 'none'
+);
+----
+true

@@ -1,0 +1,115 @@
+# name: test/sql/geocode_address.test
+# description: Stage A vectorized address-match macro against hand-crafted fixtures
+
+require us_geocoder
+
+statement ok
+LOAD spatial;
+
+statement ok
+LOAD splink_udfs;
+
+# Fixture: one edge on Meeting St in Providence RI (statefp=44).
+# 100-block, addresses 100–199 on the right side (odd parity), 101-199 on left.
+
+statement ok
+INSERT INTO tiger.state (statefp, stusps, name, the_geom) VALUES
+    ('44', 'RI', 'Rhode Island',
+     ST_GeomFromText('POLYGON((-71.9 41.1, -71.0 41.1, -71.0 42.1, -71.9 42.1, -71.9 41.1))'));
+
+statement ok
+INSERT INTO tiger.county (statefp, countyfp, cntyidfp, name, the_geom) VALUES
+    ('44', '007', '44007', 'Providence',
+     ST_GeomFromText('POLYGON((-71.5 41.7, -71.3 41.7, -71.3 41.9, -71.5 41.9, -71.5 41.7))'));
+
+statement ok
+INSERT INTO tiger.place (statefp, placefp, plcidfp, name, the_geom) VALUES
+    ('44', '59000', '4459000', 'Providence',
+     ST_GeomFromText('POLYGON((-71.45 41.80, -71.38 41.80, -71.38 41.85, -71.45 41.85, -71.45 41.80))'));
+
+statement ok
+INSERT INTO tiger.featnames (statefp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc) VALUES
+    ('44', 1001, 'Meeting', 'Meeting St', NULL, NULL, NULL, 'St', NULL, 'S1400');
+
+statement ok
+INSERT INTO tiger.edges (statefp, countyfp, tlid, tfidl, tfidr, tnidf, tnidt, mtfcc, fullname, the_geom, zipl, zipr) VALUES
+    ('44', '007', 1001, 2001, 2002, 3001, 3002, 'S1400', 'Meeting St',
+     ST_GeomFromText('LINESTRING(-71.405 41.826, -71.403 41.826)'), '02903', '02903');
+
+statement ok
+INSERT INTO tiger.faces (statefp, countyfp, tfid, placefp, cousubfp, tractce20, blockce20, blkgrpce20, the_geom) VALUES
+    ('44', '007', 2001, '59000', NULL, '000400', '1001', '1',
+     ST_GeomFromText('POLYGON((-71.406 41.827, -71.402 41.827, -71.402 41.826, -71.406 41.826, -71.406 41.827))')),
+    ('44', '007', 2002, '59000', NULL, '000400', '1002', '1',
+     ST_GeomFromText('POLYGON((-71.406 41.826, -71.402 41.826, -71.402 41.825, -71.406 41.825, -71.406 41.826))'));
+
+statement ok
+INSERT INTO tiger.addr (statefp, tlid, fromhn, tohn, side, zip, plus4) VALUES
+    ('44', 1001, '100', '198', 'L', '02903', NULL),
+    ('44', 1001, '101', '199', 'R', '02903', NULL);
+
+# Exact match: "150 Meeting St, Providence RI 02903"
+# Expected rating near 0 (street/type/location all exact, address in range, right parity).
+query I
+SELECT MIN(rating) <= 5
+FROM tiger.geocode_address_impl(
+    CAST({
+        address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+        post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'
+    } AS tiger.geocode_input),
+    5, NULL, 2.0
+);
+----
+true
+
+# Returns at most max_results rows.
+query I
+SELECT count(*) <= 5
+FROM tiger.geocode_address_impl(
+    CAST({
+        address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+        post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'
+    } AS tiger.geocode_input),
+    5, NULL, 2.0
+);
+----
+true
+
+# Location populated from adjacent place polygon.
+query I
+SELECT (addy).location
+FROM tiger.geocode_address_impl(
+    CAST({
+        address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+        post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'
+    } AS tiger.geocode_input),
+    5, NULL, 2.0
+) LIMIT 1;
+----
+Providence
+
+# Returns a point geometry.
+query I
+SELECT ST_GeometryType(geom) = 'POINT'
+FROM tiger.geocode_address_impl(
+    CAST({
+        address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+        post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'
+    } AS tiger.geocode_input),
+    5, NULL, 2.0
+) LIMIT 1;
+----
+true
+
+# Nonexistent street → 0 rows.
+query I
+SELECT count(*)
+FROM tiger.geocode_address_impl(
+    CAST({
+        address: 150, street_name: 'Nonesuch', street_type: 'St', pre_dir: NULL,
+        post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'
+    } AS tiger.geocode_input),
+    5, NULL, 2.0
+);
+----
+0

@@ -1,0 +1,12 @@
+-- The 8-field public input contract for geocode().
+-- See geocode_flow.md §14 for the full format contract.
+CREATE TYPE @TIGER@.geocode_input AS STRUCT(
+    address      INTEGER,
+    street_name  VARCHAR,
+    street_type  VARCHAR,
+    pre_dir      VARCHAR,
+    post_dir     VARCHAR,
+    location     VARCHAR,
+    state_abbrev VARCHAR,
+    zip          VARCHAR
+);

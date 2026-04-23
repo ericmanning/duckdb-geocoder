@@ -1,0 +1,141 @@
+-- geocode_intersection(road1, road2, state, city, zip, max_results) → TABLE
+--
+-- Per geocode_flow.md §9: takes plain varchars (no from_pagc adapter);
+-- finds edges for both roads then joins on shared TIGER node ID
+-- (tnidf/tnidt) to identify intersecting pairs. Output point is the
+-- endpoint of road1 at the shared node.
+--
+-- Rating = levenshtein(place, city) + levenshtein(e1.name, road1)
+--        + levenshtein(e1.fullname, road1_full) + levenshtein(e2.name, road2)
+-- Lower is better. Exact matches → rating 0.
+--
+-- Depends on spatial (ST_StartPoint, ST_EndPoint). Registered best-effort.
+
+CREATE OR REPLACE MACRO @TIGER@.geocode_intersection(
+    road1, road2, in_state, in_city, in_zip, max_results
+) AS TABLE (
+    WITH
+    in_state_fp AS (
+        SELECT sl.statefp AS statefp
+        FROM @TIGER@.state_lookup sl
+        WHERE in_state IS NOT NULL AND sl.abbrev = in_state
+        LIMIT 1
+    ),
+    -- Zip candidate set: explicit ±2 window if given, else any ZIP for the city.
+    zip_window AS (
+        SELECT CASE
+            WHEN in_zip IS NOT NULL THEN @TIGER@.zip_range(in_zip, -2, 2)
+            WHEN in_city IS NOT NULL THEN
+                (SELECT list(zlb.zip) FROM @TIGER@.zip_lookup_base zlb
+                 WHERE lower(zlb.city) LIKE lower(in_city) || '%'
+                   AND zlb.statefp = (SELECT statefp FROM in_state_fp))
+            ELSE NULL
+        END AS zw
+    ),
+    a1 AS (
+        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.pretypabrv,
+               f.prequalabr, f.suftypabrv, f.sufdirabrv, ad.side, ad.fromhn, ad.tohn
+        FROM @TIGER@.featnames f
+        JOIN @TIGER@.addr ad ON ad.tlid = f.tlid AND ad.statefp = f.statefp
+        WHERE f.statefp = (SELECT statefp FROM in_state_fp)
+          AND f.mtfcc LIKE 'S%'
+          AND (
+                lower(f.name) = lower(road1)
+             OR (length(road1) > 5 AND lower(f.fullname) LIKE lower(road1) || '%')
+             OR @TIGER@.normalize_street_name(f.fullname) = @TIGER@.normalize_street_name(road1)
+              )
+          AND ((SELECT zw FROM zip_window) IS NULL
+               OR ad.zip IN (SELECT UNNEST((SELECT zw FROM zip_window))))
+    ),
+    a2 AS (
+        SELECT f.tlid, f.statefp, f.name, f.fullname, ad.side
+        FROM @TIGER@.featnames f
+        JOIN @TIGER@.addr ad ON ad.tlid = f.tlid AND ad.statefp = f.statefp
+        WHERE f.statefp = (SELECT statefp FROM in_state_fp)
+          AND f.mtfcc LIKE 'S%'
+          AND (
+                lower(f.name) = lower(road2)
+             OR (length(road2) > 5 AND lower(f.fullname) LIKE lower(road2) || '%')
+             OR @TIGER@.normalize_street_name(f.fullname) = @TIGER@.normalize_street_name(road2)
+              )
+    ),
+    e1 AS (
+        SELECT a1.*, e.tnidf, e.tnidt, e.the_geom, e.tfidl, e.tfidr
+        FROM a1 JOIN @TIGER@.edges e ON e.tlid = a1.tlid AND e.statefp = a1.statefp
+    ),
+    e2 AS (
+        SELECT a2.*, e.tnidf AS e2_tnidf, e.tnidt AS e2_tnidt, e.tlid AS e2_tlid
+        FROM a2 JOIN @TIGER@.edges e ON e.tlid = a2.tlid AND e.statefp = a2.statefp
+    ),
+    -- Cross-join and find shared TIGER node ids (not spatial intersection).
+    pairs AS (
+        SELECT e1.*,
+               e2.name AS r2_name, e2.fullname AS r2_fullname,
+               CASE
+                   WHEN e1.tnidf IN (e2.e2_tnidf, e2.e2_tnidt) THEN 'from'
+                   WHEN e1.tnidt IN (e2.e2_tnidf, e2.e2_tnidt) THEN 'to'
+                   ELSE NULL
+               END AS shared_end
+        FROM e1, e2
+        WHERE e1.tnidf IN (e2.e2_tnidf, e2.e2_tnidt)
+           OR e1.tnidt IN (e2.e2_tnidf, e2.e2_tnidt)
+    ),
+    scored AS (
+        SELECT
+            -- Output point = e1's shared endpoint.
+            CASE shared_end
+                WHEN 'from' THEN ST_StartPoint(
+                    CASE CAST(ST_GeometryType(the_geom) AS VARCHAR)
+                        WHEN 'LINESTRING' THEN the_geom
+                        WHEN 'MULTILINESTRING' THEN ST_LineMerge(the_geom)
+                    END)
+                WHEN 'to'   THEN ST_EndPoint(
+                    CASE CAST(ST_GeometryType(the_geom) AS VARCHAR)
+                        WHEN 'LINESTRING' THEN the_geom
+                        WHEN 'MULTILINESTRING' THEN ST_LineMerge(the_geom)
+                    END)
+            END AS geom,
+            -- House number at the shared end.
+            CASE shared_end
+                WHEN 'from' THEN fromhn
+                WHEN 'to'   THEN tohn
+            END AS hn,
+            pairs.name AS r1_name, pairs.fullname AS r1_fullname,
+            pairs.predirabrv, pairs.pretypabrv, pairs.prequalabr,
+            pairs.suftypabrv, pairs.sufdirabrv, pairs.side,
+            pairs.tlid,
+            @TIGER@.levenshtein_ignore_case(pairs.fullname, road1)
+                + @TIGER@.levenshtein_ignore_case(pairs.name, road1)
+                + @TIGER@.levenshtein_ignore_case(r2_name, road2)
+                + CASE WHEN in_city IS NULL THEN 0
+                       ELSE @TIGER@.levenshtein_ignore_case(
+                            (SELECT zlb.city FROM @TIGER@.zip_lookup_base zlb
+                             WHERE zlb.statefp = pairs.statefp
+                             LIMIT 1),
+                            in_city)
+                  END AS rating
+        FROM pairs
+    ),
+    deduped AS (
+        SELECT *,
+               ROW_NUMBER() OVER (PARTITION BY tlid, side ORDER BY rating) AS dedup_rn,
+               ROW_NUMBER() OVER (ORDER BY rating) AS rating_rn
+        FROM scored
+    )
+    SELECT
+        STRUCT_PACK(
+            address      := TRY_CAST(hn AS INTEGER),
+            street_name  := r1_name,
+            street_type  := COALESCE(suftypabrv, pretypabrv),
+            pre_dir      := predirabrv,
+            post_dir     := sufdirabrv,
+            location     := in_city,
+            state_abbrev := in_state,
+            zip          := in_zip
+        )::@TIGER@.geocode_input AS addy,
+        geom,
+        rating
+    FROM deduped
+    WHERE dedup_rn = 1 AND rating_rn <= max_results
+    ORDER BY rating
+);

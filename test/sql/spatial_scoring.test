@@ -1,0 +1,67 @@
+# name: test/sql/spatial_scoring.test
+# description: spatial scoring primitives (utmzone, interpolate_from_address)
+
+require us_geocoder
+
+statement ok
+LOAD spatial;
+
+# utmzone — Washington DC (~77W, 38N) → UTM zone 18N = EPSG 32618
+query I
+SELECT tiger.utmzone(ST_Point(-77.04, 38.91));
+----
+32618
+
+# Providence RI (~71W, 41.8N) → UTM zone 19N = EPSG 32619
+query I
+SELECT tiger.utmzone(ST_Point(-71.41, 41.82));
+----
+32619
+
+# Southern hemisphere — e.g. Buenos Aires (~58W, 34S) → UTM zone 21S = EPSG 32721
+query I
+SELECT tiger.utmzone(ST_Point(-58.45, -34.60));
+----
+32721
+
+# interpolate_from_address — midpoint of a horizontal line, address midway through the range
+# Float arithmetic on (-77.05 + -77.03)/2 may give -77.0399999... instead of -77.04.
+query I
+SELECT abs(ST_X(tiger.interpolate_from_address(
+    150,
+    '100', '200',
+    ST_GeomFromText('LINESTRING(-77.05 38.90, -77.03 38.90)'),
+    NULL, 0
+)) - (-77.04)) < 1e-10;
+----
+true
+
+# interpolate_from_address — reversed range (addr1 > addr2), address at low end
+# PG semantics: if var_addr1 > var_addr2 then part := 1 - part
+query I
+SELECT abs(ST_X(tiger.interpolate_from_address(
+    100,
+    '200', '100',
+    ST_GeomFromText('LINESTRING(-77.05 38.90, -77.03 38.90)'),
+    NULL, 0
+)) - (-77.03)) < 1e-10;
+----
+true
+
+# Out-of-range address clamps to fallback fraction (PG uses 0.5)
+# Given 500 against [100,200] → clamp; should land somewhere on the line.
+query I
+SELECT ST_AsText(tiger.interpolate_from_address(
+    500,
+    '100', '200',
+    ST_GeomFromText('LINESTRING(-77.05 38.90, -77.03 38.90)'),
+    NULL, 0
+)) LIKE 'POINT (%';
+----
+true
+
+# NULL road → NULL point
+query I
+SELECT tiger.interpolate_from_address(150, '100', '200', NULL, NULL, 0) IS NULL;
+----
+true

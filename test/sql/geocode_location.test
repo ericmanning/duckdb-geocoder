@@ -1,0 +1,90 @@
+# name: test/sql/geocode_location.test
+# description: Stage B (location-only) fallback macro against hand-crafted fixtures
+
+require us_geocoder
+
+statement ok
+LOAD spatial;
+
+statement ok
+LOAD splink_udfs;
+
+# Insert a minimal fixture: one zcta5, matching zip_lookup_base, one place.
+statement ok
+INSERT INTO tiger.zcta5 (statefp, zcta5ce, the_geom) VALUES
+    ('44', '02903', ST_GeomFromText('POLYGON((-71.42 41.81, -71.40 41.81, -71.40 41.83, -71.42 41.83, -71.42 41.81))'));
+
+statement ok
+INSERT INTO tiger.zip_lookup_base (zip, state, county, city, statefp) VALUES
+    ('02903', 'RI', 'Providence', 'Providence', '44');
+
+statement ok
+INSERT INTO tiger.place (statefp, placefp, plcidfp, name, the_geom) VALUES
+    ('44', '59000', '4459000', 'Providence', ST_GeomFromText('POLYGON((-71.42 41.81, -71.40 41.81, -71.40 41.83, -71.42 41.83, -71.42 41.81))'));
+
+# Zip-only input → zcta_tier matches via zip = '02903'; place_tier needs
+# location NOT NULL, so no match there. One row, rating = 100 +
+# levenshtein_ignore_case('Providence', NULL→'') = 110.
+query II
+SELECT COUNT(*), MIN(rating) >= 100
+FROM tiger.geocode_location_impl(
+    CAST({
+        address: NULL, street_name: NULL, street_type: NULL, pre_dir: NULL,
+        post_dir: NULL, location: NULL, state_abbrev: 'RI', zip: '02903'
+    } AS tiger.geocode_input),
+    NULL
+);
+----
+1	true
+
+# Location + zip match → rating = 100 exactly (levenshtein 0)
+query I
+SELECT MIN(rating)
+FROM tiger.geocode_location_impl(
+    CAST({
+        address: NULL, street_name: NULL, street_type: NULL, pre_dir: NULL,
+        post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'
+    } AS tiger.geocode_input),
+    NULL
+);
+----
+100
+
+# Soundex-fuzzy city match → rating > 100
+query I
+SELECT MIN(rating) > 100
+FROM tiger.geocode_location_impl(
+    CAST({
+        address: NULL, street_name: NULL, street_type: NULL, pre_dir: NULL,
+        post_dir: NULL, location: 'Providance', state_abbrev: 'RI', zip: NULL
+    } AS tiger.geocode_input),
+    NULL
+);
+----
+true
+
+# No match → 0 rows
+query I
+SELECT COUNT(*)
+FROM tiger.geocode_location_impl(
+    CAST({
+        address: NULL, street_name: NULL, street_type: NULL, pre_dir: NULL,
+        post_dir: NULL, location: 'Nonesuch', state_abbrev: 'RI', zip: '99999'
+    } AS tiger.geocode_input),
+    NULL
+);
+----
+0
+
+# ZCTA tier output includes a point geometry (centroid)
+query I
+SELECT ST_GeometryType(geom) = 'POINT'
+FROM tiger.geocode_location_impl(
+    CAST({
+        address: NULL, street_name: NULL, street_type: NULL, pre_dir: NULL,
+        post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'
+    } AS tiger.geocode_input),
+    NULL
+) LIMIT 1;
+----
+true

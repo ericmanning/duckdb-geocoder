@@ -1,0 +1,164 @@
+# name: test/sql/scoring.test
+# description: scalar scoring primitives (non-spatial)
+
+require us_geocoder
+
+# cull_null
+query I
+SELECT tiger.cull_null(NULL);
+----
+(empty)
+
+query I
+SELECT tiger.cull_null('x');
+----
+x
+
+# levenshtein_ignore_case — case-insensitive, NULL-safe
+query I
+SELECT tiger.levenshtein_ignore_case('Main', 'main');
+----
+0
+
+query I
+SELECT tiger.levenshtein_ignore_case('Main', 'Maim');
+----
+1
+
+query I
+SELECT tiger.levenshtein_ignore_case(NULL, 'x');
+----
+1
+
+# least_hn / greatest_hn — non-numeric coerced to 0
+query II
+SELECT tiger.least_hn('10', '20'), tiger.greatest_hn('10', '20');
+----
+10	20
+
+query II
+SELECT tiger.least_hn('abc', '20'), tiger.greatest_hn('abc', '20');
+----
+0	20
+
+query II
+SELECT tiger.least_hn('50', '10'), tiger.greatest_hn('50', '10');
+----
+10	50
+
+# diff_zip — first-5-digit numeric difference
+query I
+SELECT tiger.diff_zip('02109', '02110');
+----
+1
+
+query I
+SELECT tiger.diff_zip('02109', '02109');
+----
+0
+
+query I
+SELECT tiger.diff_zip('02109-1234', '02110-9999');
+----
+1
+
+# zip_range
+query I
+SELECT tiger.zip_range('02109', -1, 1);
+----
+[02108, 02109, 02110]
+
+query I
+SELECT tiger.zip_range('00001', -2, 2);
+----
+[000-1, 00000, 00001, 00002, 00003]
+
+# normalize_street_name — collapses whitespace around hyphens
+query I
+SELECT tiger.normalize_street_name('I-635');
+----
+i-635
+
+query I
+SELECT tiger.normalize_street_name('I- 635');
+----
+i-635
+
+query I
+SELECT tiger.normalize_street_name('I  -  635');
+----
+i-635
+
+query I
+SELECT tiger.normalize_street_name('  Main   St  ');
+----
+main st
+
+# numeric_streets_equal
+query I
+SELECT tiger.numeric_streets_equal('23rd', '23TH');
+----
+true
+
+query I
+SELECT tiger.numeric_streets_equal('23rd', '24th');
+----
+false
+
+query I
+SELECT tiger.numeric_streets_equal('Main', 'Main');
+----
+false
+
+# rate_attributes (9-arg): direction 2, name 10, type 5
+# Perfect match = 0
+query I
+SELECT tiger.rate_attributes('NW', 'NW', 'Main', 'Main', 'St', 'St', NULL, NULL, NULL);
+----
+0
+
+# Single-char name typo = 10
+query I
+SELECT tiger.rate_attributes(NULL, NULL, 'Main', 'Maim', 'St', 'St', NULL, NULL, NULL);
+----
+10
+
+# Single-char type typo = 5
+query I
+SELECT tiger.rate_attributes(NULL, NULL, 'Main', 'Main', 'St', 'Sx', NULL, NULL, NULL);
+----
+5
+
+# Single-char pre-dir typo = 2
+query I
+SELECT tiger.rate_attributes('NW', 'NE', 'Main', 'Main', 'St', 'St', NULL, NULL, NULL);
+----
+2
+
+# NULL streetName → NULL result (PostGIS parity)
+query I
+SELECT tiger.rate_attributes(NULL, NULL, NULL, 'Main', NULL, NULL, NULL, NULL, NULL) IS NULL;
+----
+true
+
+# Numeric streets "23rd" vs "23TH" short-circuit: no name penalty
+query I
+SELECT tiger.rate_attributes(NULL, NULL, '23rd', '23TH', 'St', 'St', NULL, NULL, NULL);
+----
+0
+
+# rate_attributes (11-arg): adds location Levenshtein on top of the 9-arg.
+query I
+SELECT tiger.rate_attributes('NW', 'NW', 'Main', 'Main', 'St', 'St', NULL, NULL, 'Providence', 'Providence', NULL);
+----
+0
+
+query I
+SELECT tiger.rate_attributes('NW', 'NW', 'Main', 'Main', 'St', 'St', NULL, NULL, 'Providence', 'Provdence', NULL);
+----
+1
+
+query I
+SELECT tiger.rate_attributes('NW', 'NW', 'Main', 'Main', 'St', 'St', NULL, NULL, 'Providence', NULL, NULL) IS NULL;
+----
+true
