@@ -100,6 +100,49 @@ WHERE e.statefp = '@STATEFP@'
       WHERE zip = z.zip AND statefp = '@STATEFP@' AND place = pl.name
   );
 
+-- @SECTION:derived_edge_containment@
+-- Per-edge-per-side containment precomputation (geocode_flow.md §14.3).
+-- The guaranteed_* flags are the v0.1 single-midpoint approximation:
+-- project to UTM, interpolate at 0.5, offset 10m perpendicular via
+-- interpolate_from_address, then check ST_Within the adjacent face.
+-- This matches the default offset used by geocode_address Stage A.
+-- Conservative: an edge that's actually fully inside the face but whose
+-- midpoint offset lands near a face boundary may read as false.
+-- GEOIDs are populated regardless of the guarantee; they come directly
+-- from faces (statefp || countyfp || tractce20 || blockce20 etc.).
+INSERT INTO @TIGER@.edge_containment
+    (statefp, tlid, guaranteed_l, guaranteed_r,
+     block_geoid_l, tract_geoid_l, blkgrp_geoid_l,
+     block_geoid_r, tract_geoid_r, blkgrp_geoid_r)
+SELECT
+    e.statefp, e.tlid,
+    CASE WHEN f_l.the_geom IS NULL THEN false
+         ELSE ST_Within(
+                  @TIGER@.interpolate_from_address(1, '1', '1', e.the_geom, 'L', 10),
+                  f_l.the_geom)
+    END AS guaranteed_l,
+    CASE WHEN f_r.the_geom IS NULL THEN false
+         ELSE ST_Within(
+                  @TIGER@.interpolate_from_address(1, '1', '1', e.the_geom, 'R', 10),
+                  f_r.the_geom)
+    END AS guaranteed_r,
+    CASE WHEN f_l.tractce20 IS NULL OR f_l.blockce20 IS NULL THEN NULL
+         ELSE e.statefp || f_l.countyfp || f_l.tractce20 || f_l.blockce20 END AS block_geoid_l,
+    CASE WHEN f_l.tractce20 IS NULL THEN NULL
+         ELSE e.statefp || f_l.countyfp || f_l.tractce20 END AS tract_geoid_l,
+    CASE WHEN f_l.tractce20 IS NULL OR f_l.blkgrpce20 IS NULL THEN NULL
+         ELSE e.statefp || f_l.countyfp || f_l.tractce20 || f_l.blkgrpce20 END AS blkgrp_geoid_l,
+    CASE WHEN f_r.tractce20 IS NULL OR f_r.blockce20 IS NULL THEN NULL
+         ELSE e.statefp || f_r.countyfp || f_r.tractce20 || f_r.blockce20 END AS block_geoid_r,
+    CASE WHEN f_r.tractce20 IS NULL THEN NULL
+         ELSE e.statefp || f_r.countyfp || f_r.tractce20 END AS tract_geoid_r,
+    CASE WHEN f_r.tractce20 IS NULL OR f_r.blkgrpce20 IS NULL THEN NULL
+         ELSE e.statefp || f_r.countyfp || f_r.tractce20 || f_r.blkgrpce20 END AS blkgrp_geoid_r
+FROM @TIGER@.edges e
+LEFT JOIN @TIGER@.faces f_l ON f_l.statefp = e.statefp AND f_l.tfid = e.tfidl
+LEFT JOIN @TIGER@.faces f_r ON f_r.statefp = e.statefp AND f_r.tfid = e.tfidr
+WHERE e.statefp = '@STATEFP@';
+
 -- @SECTION:derived_zip_lookup_base@
 INSERT INTO @TIGER@.zip_lookup_base (zip, state, county, city, statefp)
 SELECT DISTINCT z.zip, st.stusps, c.name, pl.name, '@STATEFP@'

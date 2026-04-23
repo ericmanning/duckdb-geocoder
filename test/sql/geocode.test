@@ -117,6 +117,29 @@ FROM tiger.geocode(
 ----
 0
 
+# Populate edge_containment with a guaranteed row: require_containment='block'
+# now returns the candidate with block_geoid / tract_geoid / blkgrp_geoid set.
+statement ok
+INSERT INTO tiger.edge_containment
+    (statefp, tlid, guaranteed_l, guaranteed_r,
+     block_geoid_l, tract_geoid_l, blkgrp_geoid_l,
+     block_geoid_r, tract_geoid_r, blkgrp_geoid_r)
+VALUES
+    ('44', 1001, true, true,
+     '440070004001001', '44007000400', '440070004001',
+     '440070004001002', '44007000400', '440070004001');
+
+query IIII
+SELECT rating, block_geoid, tract_geoid, blkgrp_geoid
+FROM tiger.geocode(
+    CAST({address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input),
+    5, NULL, 'block'
+);
+----
+0	440070004001001	44007000400	440070004001
+
 # max_results is respected.
 query I
 SELECT count(*) <= 1

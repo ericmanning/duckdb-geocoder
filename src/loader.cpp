@@ -389,8 +389,15 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, std:
 		}
 	}
 
-	// Build per-state derived tables (zip_state, zip_state_loc, zip_lookup_base).
-	const char *derived[] = {"derived_zip_state", "derived_zip_state_loc", "derived_zip_lookup_base"};
+	// Build per-state derived tables. edge_containment is expensive
+	// (ST_Within on ~150K rows) so it runs last; the zip_* tables are
+	// pure INSERT…SELECT and finish in milliseconds.
+	const char *derived[] = {
+	    "derived_zip_state",
+	    "derived_zip_state_loc",
+	    "derived_zip_lookup_base",
+	    "derived_edge_containment",
+	};
 	for (const auto *name : derived) {
 		auto section = ExtractSection(tmpl, name);
 		auto rendered = RenderTemplate(section, {{"@TIGER@", schema}, {"@STATEFP@", fips}});
