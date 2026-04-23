@@ -108,7 +108,18 @@ CREATE TABLE IF NOT EXISTS @TIGER@.featnames (
     prequalabr  VARCHAR,
     suftypabrv  VARCHAR,
     sufdirabrv  VARCHAR,
-    mtfcc       VARCHAR
+    mtfcc       VARCHAR,
+    -- Precomputed case-insensitive / normalized / phonetic keys for
+    -- equi-joins in the geocoder's name-match filter (geocode_address
+    -- Stage A). Without these the filter becomes a full scan with
+    -- lower() / normalize_street_name() / soundex() applied per row,
+    -- which is the dominant cost on a full-state batch.
+    -- name_soundex is populated iff splink_udfs is loaded at load time;
+    -- if absent, the soundex match branch is effectively disabled (the
+    -- macro falls back to other branches: exact, normalized, LIKE, numeric).
+    name_lower    VARCHAR,
+    fullname_norm VARCHAR,
+    name_soundex  VARCHAR
 );
 
 CREATE TABLE IF NOT EXISTS @TIGER@.addr (

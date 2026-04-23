@@ -1,0 +1,131 @@
+-- Per-table INSERT templates for the TIGER loader. Sections are delimited
+-- by lines of the form "-- @SECTION:name@" and parsed by
+-- src/loader.cpp::GetLoaderTemplate(). Placeholders substituted per-call:
+--   @TIGER@      → target schema
+--   @VSIPATH@    → '/vsizip/<source>/<zip>/<shp>' (HTTP or local filesystem)
+--   @STATEFP@    → 2-digit state FIPS (county-level tables only)
+--   @COUNTYFP@   → 3-digit county FIPS (county-level tables only)
+
+-- @SECTION:nation_state@
+INSERT INTO @TIGER@.state (statefp, stusps, name, the_geom)
+SELECT STATEFP, STUSPS, NAME, geom
+FROM ST_Read('@VSIPATH@')
+WHERE STATEFP NOT IN (SELECT statefp FROM @TIGER@.state WHERE statefp IS NOT NULL);
+
+-- @SECTION:nation_county@
+INSERT INTO @TIGER@.county (statefp, countyfp, cntyidfp, name, the_geom)
+SELECT STATEFP, COUNTYFP, GEOID, NAME, geom
+FROM ST_Read('@VSIPATH@')
+WHERE GEOID NOT IN (SELECT cntyidfp FROM @TIGER@.county WHERE cntyidfp IS NOT NULL);
+
+-- @SECTION:nation_zcta5@
+-- 2020 ZCTA shapefile uses ZCTA5CE20 column name.
+-- statefp left NULL in v0.1 (per-state clipping is a Phase 6 follow-up).
+INSERT INTO @TIGER@.zcta5 (statefp, zcta5ce, the_geom)
+SELECT NULL, ZCTA5CE20, geom
+FROM ST_Read('@VSIPATH@')
+WHERE ZCTA5CE20 NOT IN (SELECT zcta5ce FROM @TIGER@.zcta5 WHERE zcta5ce IS NOT NULL);
+
+-- @SECTION:state_place@
+INSERT INTO @TIGER@.place (statefp, placefp, plcidfp, name, the_geom)
+SELECT STATEFP, PLACEFP, GEOID, NAME, geom
+FROM ST_Read('@VSIPATH@');
+
+-- @SECTION:state_cousub@
+INSERT INTO @TIGER@.cousub (statefp, countyfp, cousubfp, cosbidfp, name, the_geom)
+SELECT STATEFP, COUNTYFP, COUSUBFP, GEOID, NAME, geom
+FROM ST_Read('@VSIPATH@');
+
+-- @SECTION:county_edges@
+INSERT INTO @TIGER@.edges (statefp, countyfp, tlid, tfidl, tfidr, tnidf, tnidt, mtfcc, fullname, the_geom, zipl, zipr)
+SELECT '@STATEFP@', '@COUNTYFP@', TLID, TFIDL, TFIDR, TNIDF, TNIDT, MTFCC, FULLNAME, geom,
+       NULLIF(ZIPL, ''), NULLIF(ZIPR, '')
+FROM ST_Read('@VSIPATH@');
+
+-- @SECTION:county_faces@
+INSERT INTO @TIGER@.faces (statefp, countyfp, tfid, placefp, cousubfp, tractce20, blockce20, blkgrpce20, the_geom)
+SELECT '@STATEFP@', '@COUNTYFP@', TFID,
+       NULLIF(PLACEFP, ''), NULLIF(COUSUBFP, ''),
+       NULLIF(TRACTCE20, ''), NULLIF(BLOCKCE20, ''), NULLIF(BLKGRPCE20, ''),
+       geom
+FROM ST_Read('@VSIPATH@');
+
+-- @SECTION:county_featnames@
+-- name_lower, fullname_norm, and name_soundex are precomputed equi-join
+-- keys used by geocode_address_impl (name match), cutting the Stage A
+-- filter from ~15s to ~50ms on a full-state batch. name_soundex is
+-- computed via splink_udfs.soundex() and requires that extension to be
+-- loaded at load time (us_geocoder's LoadInternal auto-loads it).
+INSERT INTO @TIGER@.featnames (statefp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc, name_lower, fullname_norm, name_soundex)
+SELECT '@STATEFP@', TLID, NAME, FULLNAME,
+       NULLIF(PREDIRABRV, ''), NULLIF(PRETYPABRV, ''), NULLIF(PREQUALABR, ''),
+       NULLIF(SUFTYPABRV, ''), NULLIF(SUFDIRABRV, ''), MTFCC,
+       lower(NAME),
+       @TIGER@.normalize_street_name(FULLNAME),
+       soundex(NAME)
+FROM ST_Read('@VSIPATH@');
+
+-- @SECTION:county_addr@
+INSERT INTO @TIGER@.addr (statefp, tlid, fromhn, tohn, side, zip, plus4)
+SELECT '@STATEFP@', TLID, FROMHN, TOHN, SIDE, NULLIF(ZIP, ''), NULLIF(PLUS4, '')
+FROM ST_Read('@VSIPATH@');
+
+-- @SECTION:derived_zip_state@
+-- per-state zip → (stusps, statefp) from edges' zipl/zipr
+INSERT INTO @TIGER@.zip_state (zip, stusps, statefp)
+SELECT DISTINCT z.zip, st.stusps, '@STATEFP@'
+FROM (
+    SELECT zipl AS zip FROM @TIGER@.edges WHERE statefp = '@STATEFP@' AND zipl IS NOT NULL
+    UNION
+    SELECT zipr AS zip FROM @TIGER@.edges WHERE statefp = '@STATEFP@' AND zipr IS NOT NULL
+) z
+JOIN @TIGER@.state st ON st.statefp = '@STATEFP@'
+WHERE NOT EXISTS (
+    SELECT 1 FROM @TIGER@.zip_state WHERE zip = z.zip AND statefp = '@STATEFP@'
+);
+
+-- @SECTION:derived_zip_state_loc@
+INSERT INTO @TIGER@.zip_state_loc (zip, stusps, statefp, place)
+SELECT DISTINCT z.zip, st.stusps, '@STATEFP@', pl.name
+FROM @TIGER@.edges e
+JOIN @TIGER@.faces fc ON fc.statefp = e.statefp
+     AND (fc.tfid = e.tfidl OR fc.tfid = e.tfidr)
+JOIN @TIGER@.place pl ON pl.statefp = fc.statefp AND pl.placefp = fc.placefp
+JOIN @TIGER@.state st ON st.statefp = '@STATEFP@'
+CROSS JOIN LATERAL (VALUES (e.zipl), (e.zipr)) AS z(zip)
+WHERE e.statefp = '@STATEFP@'
+  AND z.zip IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM @TIGER@.zip_state_loc
+      WHERE zip = z.zip AND statefp = '@STATEFP@' AND place = pl.name
+  );
+
+-- @SECTION:derived_zip_lookup_base@
+INSERT INTO @TIGER@.zip_lookup_base (zip, state, county, city, statefp)
+SELECT DISTINCT z.zip, st.stusps, c.name, pl.name, '@STATEFP@'
+FROM @TIGER@.edges e
+JOIN @TIGER@.faces fc ON fc.statefp = e.statefp
+     AND (fc.tfid = e.tfidl OR fc.tfid = e.tfidr)
+LEFT JOIN @TIGER@.place pl ON pl.statefp = fc.statefp AND pl.placefp = fc.placefp
+JOIN @TIGER@.county c ON c.statefp = e.statefp AND c.countyfp = fc.countyfp
+JOIN @TIGER@.state st ON st.statefp = '@STATEFP@'
+CROSS JOIN LATERAL (VALUES (e.zipl), (e.zipr)) AS z(zip)
+WHERE e.statefp = '@STATEFP@'
+  AND z.zip IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1 FROM @TIGER@.zip_lookup_base
+      WHERE zip = z.zip AND statefp = '@STATEFP@'
+        AND city IS NOT DISTINCT FROM pl.name
+        AND county = c.name
+  );
+
+-- @SECTION:unload_state@
+DELETE FROM @TIGER@.edges            WHERE statefp = '@STATEFP@';
+DELETE FROM @TIGER@.faces            WHERE statefp = '@STATEFP@';
+DELETE FROM @TIGER@.featnames        WHERE statefp = '@STATEFP@';
+DELETE FROM @TIGER@.addr             WHERE statefp = '@STATEFP@';
+DELETE FROM @TIGER@.place            WHERE statefp = '@STATEFP@';
+DELETE FROM @TIGER@.cousub           WHERE statefp = '@STATEFP@';
+DELETE FROM @TIGER@.zip_state        WHERE statefp = '@STATEFP@';
+DELETE FROM @TIGER@.zip_state_loc    WHERE statefp = '@STATEFP@';
+DELETE FROM @TIGER@.zip_lookup_base  WHERE statefp = '@STATEFP@';

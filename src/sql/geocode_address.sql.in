@@ -20,12 +20,25 @@
 --   * DuckDB can't correlate a struct macro parameter reliably into nested
 --     subqueries, so we unpack `inp` into a CTE `p` using bracket notation
 --     (inp['field']) and reference p.field throughout.
---   * block/tract/blkgrp GEOIDs are sourced from edge_containment (Phase 6);
---     when that table is empty, all three GEOID columns are NULL and
+--   * Candidate filtering is pushed down in two stages:
+--     (i) `name_match_tlids` pre-filters featnames to just matching tlids
+--         (by exact name, soundex, prefix, numeric-street, or normalized
+--         fullname). Cuts ~126K featnames to ~tens in the common case.
+--     (ii) `candidates` does the full join only over those tlids, with the
+--          faces-side join split into L/R UNION ALL branches (DuckDB can't
+--          hash-join on (A AND L) OR (B AND R) efficiently — it degenerates
+--          to a cartesian product).
+--   * block/tract/blkgrp GEOIDs come from edge_containment (Phase 6); when
+--     that table is empty all three GEOID columns are NULL and
 --     containment_guaranteed is false.
 
 CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_geom_4269, zip_penalty) AS TABLE (
     WITH
+    -- Unpack the struct parameter and compute per-call derived values
+    -- (statefp, zip window) as columns on the same 1-row relation so they
+    -- work under CROSS JOIN LATERAL in batch mode. Using separate CTEs with
+    -- `(SELECT ... FROM cte)` scalar subqueries makes DuckDB decorrelate,
+    -- which breaks when the outer batch has >1 row.
     p AS (
         SELECT
             inp['address']      AS address,
@@ -35,102 +48,175 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
             inp['post_dir']     AS post_dir,
             inp['location']     AS location,
             inp['state_abbrev'] AS state_abbrev,
-            inp['zip']          AS zip
+            inp['zip']          AS zip,
+            COALESCE(
+                (SELECT sl.statefp FROM @TIGER@.state_lookup sl
+                 WHERE inp['state_abbrev'] IS NOT NULL AND sl.abbrev = inp['state_abbrev']
+                 LIMIT 1),
+                (SELECT zlb.statefp FROM @TIGER@.zip_lookup_base zlb
+                 WHERE inp['zip'] IS NOT NULL AND zlb.zip = inp['zip']
+                 LIMIT 1)
+            ) AS statefp,
+            CASE WHEN inp['zip'] IS NULL THEN NULL::VARCHAR[]
+                 ELSE @TIGER@.zip_range(inp['zip'], -2, 2)
+            END AS window_zips,
+            -- Precomputed match keys so the UNION ALL branches below
+            -- hash-join directly instead of the planner failing to hoist
+            -- soundex()/lower()/normalize_street_name() into the join key.
+            lower(inp['street_name'])       AS street_name_lower,
+            soundex(inp['street_name'])     AS street_name_soundex,
+            @TIGER@.normalize_street_name(
+                COALESCE(inp['street_name'], '') || ' ' || COALESCE(inp['street_type'], '')
+            )                               AS fullname_norm_input
     ),
-    in_state AS (
-        SELECT COALESCE(
-            (SELECT sl.statefp FROM @TIGER@.state_lookup sl, p
-             WHERE p.state_abbrev IS NOT NULL AND sl.abbrev = p.state_abbrev
-             LIMIT 1),
-            (SELECT zlb.statefp FROM @TIGER@.zip_lookup_base zlb, p
-             WHERE p.zip IS NOT NULL AND zlb.zip = p.zip
-             LIMIT 1)
-        ) AS statefp
+    -- Pre-filter featnames to matching tlids. Each branch is an equi-join
+    -- (or a prefix range) that DuckDB can hash/sort-merge cheaply, instead
+    -- of an OR-predicate that degenerates to a cartesian product. UNION ALL
+    -- is fine — downstream `ranked` dedups by (name, type, side, ...).
+    name_match_tlids AS (
+        -- Exact name (case-insensitive) — equijoin on precomputed keys.
+        SELECT f.tlid, f.statefp,
+               f.name, f.fullname, f.predirabrv, f.suftypabrv, f.pretypabrv,
+               f.sufdirabrv, f.prequalabr,
+               p.window_zips, p.street_name AS p_street_name,
+               p.street_type AS p_street_type, p.zip AS p_zip,
+               p.pre_dir AS p_pre_dir, p.post_dir AS p_post_dir,
+               p.location AS p_location, p.address AS p_address
+        FROM @TIGER@.featnames f JOIN p
+             ON f.statefp = p.statefp
+            AND f.name_lower = p.street_name_lower
+        WHERE p.street_name IS NOT NULL
+
+        UNION ALL
+        -- Normalized fullname match — equijoin on precomputed keys.
+        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
+               f.pretypabrv, f.sufdirabrv, f.prequalabr,
+               p.window_zips, p.street_name, p.street_type, p.zip,
+               p.pre_dir, p.post_dir, p.location, p.address
+        FROM @TIGER@.featnames f JOIN p
+             ON f.statefp = p.statefp
+            AND f.fullname_norm = p.fullname_norm_input
+        WHERE p.street_name IS NOT NULL
+
+        UNION ALL
+        -- Prefix match for long names (no equi-hash; sequential within state).
+        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
+               f.pretypabrv, f.sufdirabrv, f.prequalabr,
+               p.window_zips, p.street_name, p.street_type, p.zip,
+               p.pre_dir, p.post_dir, p.location, p.address
+        FROM @TIGER@.featnames f, p
+        WHERE f.statefp = p.statefp
+          AND p.street_name IS NOT NULL
+          AND length(p.street_name) > 5
+          AND f.name_lower LIKE p.street_name_lower || '%'
+
+        UNION ALL
+        -- Soundex fallback — equijoin on precomputed name_soundex.
+        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
+               f.pretypabrv, f.sufdirabrv, f.prequalabr,
+               p.window_zips, p.street_name, p.street_type, p.zip,
+               p.pre_dir, p.post_dir, p.location, p.address
+        FROM @TIGER@.featnames f JOIN p
+             ON f.statefp = p.statefp
+            AND f.name_soundex = p.street_name_soundex
+        WHERE p.street_name IS NOT NULL
+
+        UNION ALL
+        -- Numeric-street equivalence (15th ≡ 15rd) — expression-based.
+        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
+               f.pretypabrv, f.sufdirabrv, f.prequalabr,
+               p.window_zips, p.street_name, p.street_type, p.zip,
+               p.pre_dir, p.post_dir, p.location, p.address
+        FROM @TIGER@.featnames f, p
+        WHERE f.statefp = p.statefp
+          AND p.street_name IS NOT NULL
+          AND @TIGER@.numeric_streets_equal(f.name, p.street_name)
     ),
-    zip_window AS (
-        SELECT CASE
-            WHEN p.zip IS NULL THEN NULL::VARCHAR[]
-            ELSE @TIGER@.zip_range(p.zip, -2, 2)
-        END AS window_zips
-        FROM p
+    -- Materialize the base join (featnames filter + addr + edges). These are
+    -- cheap once name_match_tlids has narrowed featnames. p_* columns carry
+    -- per-input parameters (address, location, etc.) forward without
+    -- re-joining to `p` inside an inner subquery, which would decorrelate
+    -- under LATERAL batch calls.
+    fae AS (
+        SELECT
+            f.name, f.fullname, f.predirabrv, f.suftypabrv, f.pretypabrv,
+            f.sufdirabrv, f.prequalabr,
+            a.fromhn, a.tohn, a.side, a.zip AS a_zip,
+            e.tlid AS e_tlid, e.statefp AS e_statefp, e.countyfp AS e_countyfp,
+            e.tfidl, e.tfidr, e.mtfcc AS e_mtfcc, e.the_geom AS edge_geom,
+            f.p_address, f.p_location, f.p_pre_dir, f.p_post_dir,
+            f.p_street_name, f.p_street_type, f.p_zip, f.window_zips
+        FROM name_match_tlids f
+        JOIN @TIGER@.addr  a ON a.tlid = f.tlid AND a.statefp = f.statefp
+        JOIN @TIGER@.edges e ON e.tlid = f.tlid AND e.statefp = f.statefp
+        WHERE e.mtfcc LIKE 'S%'
+          AND (restrict_geom_4269 IS NULL OR ST_Intersects(e.the_geom, restrict_geom_4269))
+          AND (f.p_zip IS NULL
+               OR a.zip IN (SELECT UNNEST(f.window_zips)))
+    ),
+    -- Split the faces join by side so DuckDB can use hash joins on each branch.
+    fae_faces AS (
+        SELECT fae.*, fc.tfid AS fc_tfid, fc.placefp, fc.cousubfp
+        FROM fae JOIN @TIGER@.faces fc
+             ON fc.statefp = fae.e_statefp AND fc.tfid = fae.tfidl
+        WHERE fae.side = 'L'
+        UNION ALL
+        SELECT fae.*, fc.tfid AS fc_tfid, fc.placefp, fc.cousubfp
+        FROM fae JOIN @TIGER@.faces fc
+             ON fc.statefp = fae.e_statefp AND fc.tfid = fae.tfidr
+        WHERE fae.side = 'R'
     ),
     candidates AS (
         SELECT
-            f.name             AS f_name,
-            f.fullname         AS f_fullname,
-            f.predirabrv       AS f_predir,
-            f.suftypabrv       AS f_suftype,
-            f.pretypabrv       AS f_pretype,
-            f.sufdirabrv       AS f_sufdir,
-            f.prequalabr       AS f_prequalabr,
-            a.fromhn           AS a_fromhn,
-            a.tohn             AS a_tohn,
-            a.side             AS a_side,
-            a.zip              AS a_zip,
-            e.the_geom         AS edge_geom,
-            e.tlid             AS e_tlid,
-            fc.statefp         AS fc_statefp,
-            pl.name            AS place_name,
-            cs.name            AS cousub_name,
-            ct.name            AS county_name,
-            st.stusps          AS state_abbrev,
-            p.address          AS p_address,
-            p.location         AS p_location,
-            -- Rating expression (PostGIS parity within documented drift).
+            ff.name             AS f_name,
+            ff.fullname         AS f_fullname,
+            ff.predirabrv       AS f_predir,
+            ff.suftypabrv       AS f_suftype,
+            ff.pretypabrv       AS f_pretype,
+            ff.sufdirabrv       AS f_sufdir,
+            ff.prequalabr       AS f_prequalabr,
+            ff.fromhn           AS a_fromhn,
+            ff.tohn             AS a_tohn,
+            ff.side             AS a_side,
+            ff.a_zip            AS a_zip,
+            ff.edge_geom        AS edge_geom,
+            ff.e_tlid           AS e_tlid,
+            ff.e_statefp        AS fc_statefp,
+            pl.name             AS place_name,
+            cs.name             AS cousub_name,
+            ct.name             AS county_name,
+            st.stusps           AS state_abbrev,
+            ff.p_address        AS p_address,
+            ff.p_location       AS p_location,
             @TIGER@.rate_attributes(
-                p.pre_dir, f.predirabrv,
-                p.street_name, f.name,
-                p.street_type, COALESCE(f.suftypabrv, f.pretypabrv),
-                p.post_dir, f.sufdirabrv,
-                f.prequalabr
+                ff.p_pre_dir, ff.predirabrv,
+                ff.p_street_name, ff.name,
+                ff.p_street_type, COALESCE(ff.suftypabrv, ff.pretypabrv),
+                ff.p_post_dir, ff.sufdirabrv,
+                ff.prequalabr
             )
-            -- House-number penalty.
             + CASE
-                WHEN p.address IS NULL OR a.fromhn IS NULL THEN 20
-                WHEN p.address BETWEEN @TIGER@.least_hn(a.fromhn, a.tohn) AND @TIGER@.greatest_hn(a.fromhn, a.tohn)
-                     AND (p.address % 2) = (@TIGER@.greatest_hn(a.fromhn, a.tohn) % 2) THEN 0
-                WHEN p.address BETWEEN @TIGER@.least_hn(a.fromhn, a.tohn) AND @TIGER@.greatest_hn(a.fromhn, a.tohn) THEN 2
+                WHEN ff.p_address IS NULL OR ff.fromhn IS NULL THEN 20
+                WHEN ff.p_address BETWEEN @TIGER@.least_hn(ff.fromhn, ff.tohn) AND @TIGER@.greatest_hn(ff.fromhn, ff.tohn)
+                     AND (ff.p_address % 2) = (@TIGER@.greatest_hn(ff.fromhn, ff.tohn) % 2) THEN 0
+                WHEN ff.p_address BETWEEN @TIGER@.least_hn(ff.fromhn, ff.tohn) AND @TIGER@.greatest_hn(ff.fromhn, ff.tohn) THEN 2
                 ELSE 5
               END
-            -- ZIP penalty: min(diff * zip_penalty, 20 * zip_penalty).
             + CASE
-                WHEN p.zip IS NULL OR a.zip IS NULL THEN 0
-                ELSE LEAST(@TIGER@.diff_zip(p.zip, a.zip) * zip_penalty, 20 * zip_penalty)::INTEGER
+                WHEN ff.p_zip IS NULL OR ff.a_zip IS NULL THEN 0
+                ELSE LEAST(@TIGER@.diff_zip(ff.p_zip, ff.a_zip) * zip_penalty, 20 * zip_penalty)::INTEGER
               END
-            -- Location Levenshtein, inlined (PG geocode_address pattern).
             + CASE
-                WHEN p.location IS NULL THEN 5
-                WHEN pl.name IS NOT NULL THEN @TIGER@.levenshtein_ignore_case(p.location, pl.name)
-                WHEN cs.name IS NOT NULL THEN @TIGER@.levenshtein_ignore_case(p.location, cs.name)
+                WHEN ff.p_location IS NULL THEN 5
+                WHEN pl.name IS NOT NULL THEN @TIGER@.levenshtein_ignore_case(ff.p_location, pl.name)
+                WHEN cs.name IS NOT NULL THEN @TIGER@.levenshtein_ignore_case(ff.p_location, cs.name)
                 ELSE 5
               END AS rating
-        FROM @TIGER@.featnames f
-        JOIN @TIGER@.addr  a  ON a.tlid = f.tlid AND a.statefp = f.statefp
-        JOIN @TIGER@.edges e  ON e.tlid = f.tlid AND e.statefp = f.statefp
-        JOIN @TIGER@.faces fc ON fc.statefp = e.statefp AND
-             ((e.tfidl = fc.tfid AND a.side = 'L') OR (e.tfidr = fc.tfid AND a.side = 'R'))
-        LEFT JOIN @TIGER@.place  pl ON pl.statefp = fc.statefp AND pl.placefp  = fc.placefp
-        LEFT JOIN @TIGER@.cousub cs ON cs.statefp = fc.statefp AND cs.cousubfp = fc.cousubfp
-        LEFT JOIN @TIGER@.county ct ON ct.statefp = e.statefp  AND ct.countyfp = e.countyfp
-        JOIN @TIGER@.state st ON st.statefp = e.statefp
-        CROSS JOIN p
-        WHERE f.statefp = (SELECT statefp FROM in_state)
-          AND e.mtfcc LIKE 'S%'
-          AND p.street_name IS NOT NULL
-          AND (
-                lower(f.name) = lower(p.street_name)
-             OR (length(p.street_name) > 5 AND lower(f.fullname) LIKE lower(p.street_name) || '%')
-             OR soundex(f.name) = soundex(p.street_name)
-             OR @TIGER@.numeric_streets_equal(f.name, p.street_name)
-             OR @TIGER@.normalize_street_name(f.fullname) =
-                @TIGER@.normalize_street_name(
-                    COALESCE(p.street_name, '') || ' ' || COALESCE(p.street_type, ''))
-              )
-          AND (
-                p.zip IS NULL
-             OR a.zip IN (SELECT UNNEST((SELECT window_zips FROM zip_window)))
-              )
-          AND (restrict_geom_4269 IS NULL OR ST_Intersects(e.the_geom, restrict_geom_4269))
+        FROM fae_faces ff
+        LEFT JOIN @TIGER@.place  pl ON pl.statefp = ff.e_statefp AND pl.placefp  = ff.placefp
+        LEFT JOIN @TIGER@.cousub cs ON cs.statefp = ff.e_statefp AND cs.cousubfp = ff.cousubfp
+        LEFT JOIN @TIGER@.county ct ON ct.statefp = ff.e_statefp AND ct.countyfp = ff.e_countyfp
+        JOIN      @TIGER@.state  st ON st.statefp = ff.e_statefp
     ),
     ranked AS (
         SELECT

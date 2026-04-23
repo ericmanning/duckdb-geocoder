@@ -27,6 +27,7 @@ file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_address.sql.in GEOCODE_ADD
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode.sql.in GEOCODE_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_intersection.sql.in GEOCODE_INTERSECTION_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/reverse_geocode.sql.in REVERSE_GEOCODE_SQL)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/loader_templates.sql.in LOADER_TEMPLATES_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_input_type.sql.in GEOCODE_INPUT_TYPE_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/from_pagc.sql.in FROM_PAGC_SQL)
 
@@ -94,6 +95,12 @@ ${REVERSE_GEOCODE_SQL}
 )USGSQLBLK\");
   return data;
 }
+inline const std::string &LoaderTemplatesSql() {
+  static const std::string data(R\"USGSQLBLK(
+${LOADER_TEMPLATES_SQL}
+)USGSQLBLK\");
+  return data;
+}
 inline const std::string &GeocodeInputTypeSql() {
   static const std::string data(R\"USGSQLBLK(
 ${GEOCODE_INPUT_TYPE_SQL}
@@ -122,11 +129,14 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_intersection.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/reverse_geocode.sql.in
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/loader_templates.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_input_type.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/from_pagc.sql.in)
 # -------------------------------------------------------------------------
 
-set(EXTENSION_SOURCES src/us_geocoder_extension.cpp)
+set(EXTENSION_SOURCES
+    src/us_geocoder_extension.cpp
+    src/loader.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})

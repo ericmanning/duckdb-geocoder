@@ -28,8 +28,8 @@ INSERT INTO tiger.place (statefp, placefp, plcidfp, name, the_geom) VALUES
      ST_GeomFromText('POLYGON((-71.45 41.80, -71.38 41.80, -71.38 41.85, -71.45 41.85, -71.45 41.80))'));
 
 statement ok
-INSERT INTO tiger.featnames (statefp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc) VALUES
-    ('44', 1001, 'Meeting', 'Meeting St', NULL, NULL, NULL, 'St', NULL, 'S1400');
+INSERT INTO tiger.featnames (statefp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc, name_lower, fullname_norm, name_soundex) VALUES
+    ('44', 1001, 'Meeting', 'Meeting St', NULL, NULL, NULL, 'St', NULL, 'S1400', 'meeting', 'meeting st', soundex('Meeting'));
 
 statement ok
 INSERT INTO tiger.edges (statefp, countyfp, tlid, tfidl, tfidr, tnidf, tnidt, mtfcc, fullname, the_geom, zipl, zipr) VALUES

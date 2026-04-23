@@ -3,6 +3,7 @@
 #include "us_geocoder_extension.hpp"
 #include "us_geocoder_embed.hpp"
 #include "us_geocoder_embedded_sql.hpp"
+#include "us_geocoder_loader.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -97,6 +98,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	conn.BeginTransaction();
 	TryRegisterOptional(conn, us_geocoder::FromPagcSql(), kDefaultTigerSchema);
 	conn.Commit();
+
+	// Register the C++ loader table functions (load_tiger_nation, load_tiger_state).
+	// These don't need spatial at load time; ST_Read only fires at invocation.
+	us_geocoder::RegisterLoaderFunctions(loader, kDefaultTigerSchema);
 }
 
 void UsGeocoderExtension::Load(ExtensionLoader &loader) {

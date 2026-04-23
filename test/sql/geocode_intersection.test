@@ -22,9 +22,9 @@ INSERT INTO tiger.zip_lookup_base (zip, state, county, city, statefp) VALUES
     ('02903', 'RI', 'Providence', 'Providence', '44');
 
 statement ok
-INSERT INTO tiger.featnames (statefp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc) VALUES
-    ('44', 1001, 'Meeting', 'Meeting St', NULL, NULL, NULL, 'St', NULL, 'S1400'),
-    ('44', 1002, 'Benefit', 'Benefit St', NULL, NULL, NULL, 'St', NULL, 'S1400');
+INSERT INTO tiger.featnames (statefp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc, name_lower, fullname_norm, name_soundex) VALUES
+    ('44', 1001, 'Meeting', 'Meeting St', NULL, NULL, NULL, 'St', NULL, 'S1400', 'meeting', 'meeting st', soundex('Meeting')),
+    ('44', 1002, 'Benefit', 'Benefit St', NULL, NULL, NULL, 'St', NULL, 'S1400', 'benefit', 'benefit st', soundex('Benefit'));
 
 statement ok
 INSERT INTO tiger.edges (statefp, countyfp, tlid, tfidl, tfidr, tnidf, tnidt, mtfcc, fullname, the_geom, zipl, zipr) VALUES
