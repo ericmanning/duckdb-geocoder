@@ -36,39 +36,52 @@ INSERT INTO @TIGER@.cousub (statefp, countyfp, cousubfp, cosbidfp, name, the_geo
 SELECT STATEFP, COUNTYFP, COUSUBFP, GEOID, NAME, geom
 FROM ST_Read('@VSIPATH@');
 
--- @SECTION:county_edges@
+-- County-level sections split into two parts:
+--   *_insert : the INSERT prefix (target table + column list)
+--   *_branch : a single SELECT over ST_Read; C++ concatenates one branch
+--              per county with UNION ALL, letting DuckDB parallelize the
+--              /vsicurl/ fetches instead of issuing N serial HTTP calls.
+
+-- @SECTION:county_edges_insert@
 INSERT INTO @TIGER@.edges (statefp, countyfp, tlid, tfidl, tfidr, tnidf, tnidt, mtfcc, fullname, the_geom, zipl, zipr)
+
+-- @SECTION:county_edges_branch@
 SELECT '@STATEFP@', '@COUNTYFP@', TLID, TFIDL, TFIDR, TNIDF, TNIDT, MTFCC, FULLNAME, geom,
        NULLIF(ZIPL, ''), NULLIF(ZIPR, '')
-FROM ST_Read('@VSIPATH@');
+FROM ST_Read('@VSIPATH@')
 
--- @SECTION:county_faces@
+-- @SECTION:county_faces_insert@
 INSERT INTO @TIGER@.faces (statefp, countyfp, tfid, placefp, cousubfp, tractce20, blockce20, blkgrpce20, the_geom)
+
+-- @SECTION:county_faces_branch@
 SELECT '@STATEFP@', '@COUNTYFP@', TFID,
        NULLIF(PLACEFP, ''), NULLIF(COUSUBFP, ''),
        NULLIF(TRACTCE20, ''), NULLIF(BLOCKCE20, ''), NULLIF(BLKGRPCE20, ''),
        geom
-FROM ST_Read('@VSIPATH@');
+FROM ST_Read('@VSIPATH@')
 
--- @SECTION:county_featnames@
+-- @SECTION:county_featnames_insert@
 -- name_lower, fullname_norm, and name_soundex are precomputed equi-join
 -- keys used by geocode_address_impl (name match), cutting the Stage A
--- filter from ~15s to ~50ms on a full-state batch. name_soundex is
--- computed via splink_udfs.soundex() and requires that extension to be
--- loaded at load time (us_geocoder's LoadInternal auto-loads it).
+-- filter from ~15s to ~50ms on a full-state batch. name_soundex needs
+-- splink_udfs loaded (LoadInternal auto-loads it).
 INSERT INTO @TIGER@.featnames (statefp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc, name_lower, fullname_norm, name_soundex)
+
+-- @SECTION:county_featnames_branch@
 SELECT '@STATEFP@', TLID, NAME, FULLNAME,
        NULLIF(PREDIRABRV, ''), NULLIF(PRETYPABRV, ''), NULLIF(PREQUALABR, ''),
        NULLIF(SUFTYPABRV, ''), NULLIF(SUFDIRABRV, ''), MTFCC,
        lower(NAME),
        @TIGER@.normalize_street_name(FULLNAME),
        soundex(NAME)
-FROM ST_Read('@VSIPATH@');
+FROM ST_Read('@VSIPATH@')
 
--- @SECTION:county_addr@
+-- @SECTION:county_addr_insert@
 INSERT INTO @TIGER@.addr (statefp, tlid, fromhn, tohn, side, zip, plus4)
+
+-- @SECTION:county_addr_branch@
 SELECT '@STATEFP@', TLID, FROMHN, TOHN, SIDE, NULLIF(ZIP, ''), NULLIF(PLUS4, '')
-FROM ST_Read('@VSIPATH@');
+FROM ST_Read('@VSIPATH@')
 
 -- @SECTION:derived_zip_state@
 -- per-state zip → (stusps, statefp) from edges' zipl/zipr

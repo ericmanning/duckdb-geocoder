@@ -365,27 +365,44 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, std:
 		                  bind.state_abbrev, fips);
 	}
 
-	// County-level files. For each county, load edges, faces, featnames, addr.
-	struct CountyStep { const char *section; const char *subdir; const char *zip_base; const char *ext; };
-	const CountyStep county_level[] = {
-	    {"county_edges",     "EDGES",     "tl_YEAR_FIPSCOUNTY_edges",     "shp"},
-	    {"county_faces",     "FACES",     "tl_YEAR_FIPSCOUNTY_faces",     "shp"},
-	    {"county_featnames", "FEATNAMES", "tl_YEAR_FIPSCOUNTY_featnames", "dbf"},  // DBF-only
-	    {"county_addr",      "ADDR",      "tl_YEAR_FIPSCOUNTY_addr",      "dbf"},  // DBF-only
+	// County-level files. Per (county, table-type): load one shapefile/DBF
+	// via ST_Read. Templates are split into insert-prefix + branch sections
+	// so a future genuinely-parallel loader can UNION ALL across counties;
+	// for now DuckDB UNION ALL + GDAL /vsicurl/ don't parallelize HTTPS
+	// fetches (measured: 8m16s batched vs ~5m serial on NJ via Census),
+	// so we issue one INSERT per (county, table-type). Users who need
+	// faster HTTP loads should pre-download in parallel via curl/xargs
+	// and point at the local directory (see docs/api.md).
+	struct CountyTable { const char *label; const char *subdir; const char *zip_base;
+	                     const char *ext; const char *insert_section; const char *branch_section; };
+	const CountyTable county_level[] = {
+	    {"county_edges",     "EDGES",     "tl_YEAR_FIPSCOUNTY_edges",     "shp",
+	     "county_edges_insert",     "county_edges_branch"},
+	    {"county_faces",     "FACES",     "tl_YEAR_FIPSCOUNTY_faces",     "shp",
+	     "county_faces_insert",     "county_faces_branch"},
+	    {"county_featnames", "FEATNAMES", "tl_YEAR_FIPSCOUNTY_featnames", "dbf",
+	     "county_featnames_insert", "county_featnames_branch"},
+	    {"county_addr",      "ADDR",      "tl_YEAR_FIPSCOUNTY_addr",      "dbf",
+	     "county_addr_insert",      "county_addr_branch"},
 	};
 	for (const auto &cfp : countyfps) {
-		for (const auto &s : county_level) {
-			std::string zip_base = s.zip_base;
+		for (const auto &t : county_level) {
+			std::string zip_base = t.zip_base;
 			auto pos = zip_base.find("YEAR");
 			if (pos != std::string::npos) zip_base.replace(pos, 4, year);
 			pos = zip_base.find("FIPSCOUNTY");
 			if (pos != std::string::npos) zip_base.replace(pos, 10, fips + cfp);
-			auto vsi = BuildVsiPath(bind.source, s.subdir, zip_base, s.ext);
-			auto section = ExtractSection(tmpl, s.section);
-			auto rendered = RenderTemplate(section, {{"@TIGER@", schema}, {"@VSIPATH@", vsi},
-			                                         {"@STATEFP@", fips}, {"@COUNTYFP@", cfp}});
-			int64_t rows = ExecuteInsert(conn, rendered, std::string(s.section) + ":" + cfp);
-			out.push_back({std::string(s.section) + ":" + cfp, rows});
+			auto vsi = BuildVsiPath(bind.source, t.subdir, zip_base, t.ext);
+			auto insert_prefix = RenderTemplate(ExtractSection(tmpl, t.insert_section),
+			                                     {{"@TIGER@", schema}});
+			auto branch = RenderTemplate(ExtractSection(tmpl, t.branch_section),
+			                              {{"@TIGER@", schema},
+			                               {"@VSIPATH@", vsi},
+			                               {"@STATEFP@", fips},
+			                               {"@COUNTYFP@", cfp}});
+			std::string sql = insert_prefix + branch + ";";
+			int64_t rows = ExecuteInsert(conn, sql, std::string(t.label) + ":" + cfp);
+			out.push_back({std::string(t.label) + ":" + cfp, rows});
 		}
 	}
 

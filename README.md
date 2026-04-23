@@ -101,8 +101,33 @@ Benchmarked on TIGER 2025 Rhode Island (136K edges, 126K featnames, 105K addr) o
 | single geocode (warm) | 130–200 ms |
 | batch of 100 addresses | 20 ms/addr |
 | batch of 1,000 addresses | 17 ms/addr (~60/sec/thread) |
-| full state load (local source) | ~25 s |
-| full state load (Census HTTP) | ~45 s |
+| full state load (local source, RI) | ~25 s |
+| full state load (Census HTTP, RI) | ~45 s |
+| full state load (Census HTTP, NJ) | ~5–8 min |
+
+### Faster HTTP loads
+
+The Census CDN path issues one HTTPS fetch per `(county, table-type)` via GDAL's `/vsicurl/`, which doesn't parallelize well for large states. For NJ / NY / CA etc., pre-download in parallel via `curl` + `xargs` and load from local:
+
+```sh
+mkdir -p /tmp/tiger_nj
+python3 -c "
+counties = [f'{i:03d}' for i in range(1, 42, 2)]  # NJ odd-numbered county FIPS
+print('\n'.join(
+    f'https://www2.census.gov/geo/tiger/TIGER2025/{sub}/tl_2025_34{c}_{tbl}.zip'
+    for c in counties
+    for sub, tbl in [('EDGES','edges'),('FACES','faces'),('FEATNAMES','featnames'),('ADDR','addr')]
+) + '\nhttps://www2.census.gov/geo/tiger/TIGER2025/PLACE/tl_2025_34_place.zip'
+    + '\nhttps://www2.census.gov/geo/tiger/TIGER2025/COUSUB/tl_2025_34_cousub.zip')
+" | xargs -n 1 -P 8 -I {} curl -sS -o /tmp/tiger_nj/\$(basename {}) {}
+```
+
+Then:
+```sql
+CALL load_tiger_state('NJ', '/tmp/tiger_nj');  -- ~2 min total
+```
+
+A genuinely-parallel HTTP mode inside the loader is a v0.2 target. Attempts with `UNION ALL`-of-`ST_Read` batching didn't parallelize in practice (DuckDB 1.5 + duckdb-spatial), so v0.1 ships the serial fetch plus this workaround.
 
 ## License
 
