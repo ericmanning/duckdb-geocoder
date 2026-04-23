@@ -1,0 +1,219 @@
+# API reference
+
+All functions live in the `tiger` schema of whatever database `LOAD us_geocoder` was first invoked against. For v0.1, the schema name is fixed at `tiger`; cross-catalog / portable-DB attach patterns are on the roadmap (see [README § Runtime dependencies](../README.md) and the spec's `reference_db`/`reference_schema` section).
+
+## Loaders
+
+### `load_tiger_nation([source VARCHAR], year INT DEFAULT 2025) → TABLE(step VARCHAR, rows_loaded BIGINT)`
+
+Loads three nation-wide TIGER tables into the `tiger` schema: `state` (56 rows), `county` (~3,200), `zcta5` (~33,800). Must run **before** any `load_tiger_state` call — the state loader enumerates counties from the `tiger.county` table populated here.
+
+- `source` — optional URL or local filesystem path. When omitted (or empty), defaults to `https://www2.census.gov/geo/tiger/TIGER<year>` and auto-loads the `httpfs` extension.
+- `year` — TIGER vintage; default `2025`.
+
+Emits one summary row per loaded file. Idempotent: re-running skips rows that already exist (checked by FIPS / GEOID).
+
+Examples:
+```sql
+CALL load_tiger_nation(year := 2025);                     -- from Census CDN
+CALL load_tiger_nation('/data/tiger_2025', year := 2025); -- from local dir
+```
+
+### `load_tiger_state(state_abbrev VARCHAR, [source VARCHAR], year INT DEFAULT 2025) → TABLE(step VARCHAR, rows_loaded BIGINT)`
+
+Loads a single state's TIGER data: state-level `place` and `cousub`, county-level `edges`, `faces`, `featnames`, `addr` (for every county in the state), and the derived `zip_state`, `zip_state_loc`, `zip_lookup_base`, `edge_containment` tables.
+
+- `state_abbrev` — 2-letter postal code, case-insensitive (`'RI'`, `'ri'`, `'Ri'` all work).
+- `source` / `year` — same as `load_tiger_nation`.
+
+Idempotent via **DELETE-first**: re-running wipes all rows for that state before reinserting.
+
+```sql
+CALL load_tiger_state('RI');                                 -- from Census, year default 2025
+CALL load_tiger_state('RI', '/data/tiger_2025', year := 2025);
+```
+
+### Local source layouts
+
+Local sources expect a **flat** layout — all zips in one directory:
+```
+/data/tiger_2025/
+  tl_2025_us_state.zip
+  tl_2025_us_county.zip
+  tl_2025_us_zcta520.zip
+  tl_2025_44_place.zip
+  tl_2025_44_cousub.zip
+  tl_2025_44001_edges.zip
+  tl_2025_44001_faces.zip
+  tl_2025_44001_featnames.zip
+  tl_2025_44001_addr.zip
+  … (and 4 more per county)
+```
+
+If you mirrored the Census tree (nested `STATE/`, `EDGES/`, etc.), either flatten or make one call per subdir. HTTP sources always follow the Census nested layout automatically.
+
+---
+
+## Input type
+
+### `tiger.geocode_input`
+
+```sql
+CREATE TYPE tiger.geocode_input AS STRUCT(
+    address      INTEGER,
+    street_name  VARCHAR,
+    street_type  VARCHAR,
+    pre_dir      VARCHAR,
+    post_dir     VARCHAR,
+    location     VARCHAR,
+    state_abbrev VARCHAR,
+    zip          VARCHAR
+);
+```
+
+The 8-field public contract for every geocoder entry point. Users produce these from any parser (PAGC, warehouse columns, forms, …) and hand them to `geocode()`.
+
+| field | format | strict? | notes |
+|---|---|---|---|
+| `address` | INTEGER house number | NULL allowed | parity check + interpolation; NULL → +20 rating penalty |
+| `street_name` | free-form, any case; **no** street type or direction | NULL → Stage A returns empty | `Benefit`, `I-95`, `15th` |
+| `street_type` | TIGER title-case abbrev | soft penalty | `Ave`, `St`, `Blvd`, `Hwy` |
+| `pre_dir` | uppercase 2-letter | soft penalty | `N`, `NW`, `SE` |
+| `post_dir` | same as `pre_dir` | soft penalty | |
+| `location` | free-form city name | NULL → +5 | |
+| `state_abbrev` | **UPPERCASE** 2-letter | **strict** | `MA`, `DC`; lowercase or full name fails the state prune |
+| `zip` | **5-char** with leading zeros | **strict** | `'02109'`, not `2109`; wrong → silent miss on MA/NJ/CT/RI |
+
+The `canon_*` macros coerce arbitrary parser output into this contract — see [Helpers](#helpers).
+
+---
+
+## Core geocoding
+
+### `tiger.geocode(input geocode_input, max_results INT, restrict_geom GEOMETRY, require_containment VARCHAR) → TABLE`
+
+The main geocoder. Returns up to `max_results` candidate matches, ordered by `rating` ascending (0 = best).
+
+**Parameters:**
+- `input` — a `tiger.geocode_input` struct (see above).
+- `max_results` — integer cap on returned rows; typical values 1–10.
+- `restrict_geom` — optional `GEOMETRY`. If non-NULL, only edges intersecting this polygon are considered. Auto-transformed to EPSG:4269 if the input SRID is different (SRID 0 treated as 4269).
+- `require_containment` — `'none'` | `'block'` | `'tract'` | `'blkgrp'`.
+  - `'none'` — return all candidates; `containment_guaranteed` is informational.
+  - `'block'`/`'tract'`/`'blkgrp'` — filter to `containment_guaranteed = true`. In v0.1 these three are equivalent (conservative single-face check); looser tract/blkgrp dissolve-polygon checks are a v0.2 follow-up.
+
+**Returns:**
+| column | type | meaning |
+|---|---|---|
+| `addy` | `tiger.geocode_input` | canonicalized matched address (name/type/dir from TIGER; location resolved via place → cousub → county; zip from `addr.zip`) |
+| `geom` | `GEOMETRY` | interpolated point, EPSG:4269, 10m offset to the matched side of the street |
+| `rating` | `INTEGER` | quality score, lower is better (see [Rating scale](#rating-scale)) |
+| `block_geoid` | `VARCHAR(15)` | 2020 census block GEOID of the matched side (always populated when `edge_containment` is built) |
+| `tract_geoid` | `VARCHAR(11)` | census tract GEOID |
+| `blkgrp_geoid` | `VARCHAR(12)` | block group GEOID |
+| `containment_guaranteed` | `BOOLEAN` | `true` iff the 10m-offset midpoint provably lies inside `block_geoid`'s face (see [Containment](#containment)) |
+
+Batch geocoding via `CROSS JOIN LATERAL`:
+```sql
+SELECT a.id, g.rating, ST_AsText(g.geom)
+FROM my_addresses a, LATERAL tiger.geocode(a.input, 1, NULL, 'none') g;
+```
+
+### `tiger.geocode_intersection(road1 VARCHAR, road2 VARCHAR, state VARCHAR, city VARCHAR, zip VARCHAR, max_results INT) → TABLE`
+
+Finds intersections of two streets. Joins candidate edges on shared TIGER node IDs (`tnidf`/`tnidt`) — not `ST_Intersects` — which means intersecting edges are found in O(joins) rather than O(spatial).
+
+```sql
+SELECT rating, ST_AsText(geom)
+FROM tiger.geocode_intersection('Benefit', 'Meeting', 'RI', 'Providence', '02903', 3);
+```
+
+Returns `(addy, geom, rating)`. Output geom is the shared endpoint of the first road's edge.
+
+### `tiger.reverse_geocode(pt GEOMETRY, max_results INT) → TABLE`
+
+Given a point, returns the nearest street candidates.
+
+```sql
+SELECT rank, street, (addy).address, (addy).location, dist_m
+FROM tiger.reverse_geocode(ST_Point(-71.40882, 41.82993), 5)
+ORDER BY rank;
+```
+
+Returns one row per candidate edge with a `rank` column (1 = nearest), distance in meters, interpolated house number, and the geocode_input struct populated from state/place/zip containing the point. Per geocode_flow.md D6, this is one-row-per-candidate rather than PG's parallel-array output.
+
+---
+
+## Helpers
+
+### Canonicalization macros
+
+For coercing arbitrary parser output into the `geocode_input` contract:
+
+| macro | output |
+|---|---|
+| `canon_street_type(t)` | TIGER title-case abbrev: `'AVENUE'` / `'Avenue'` / `'ave'` → `'Ave'` |
+| `canon_dir(d)` | uppercase 2-letter: `'Northwest'` / `'nw'` → `'NW'` |
+| `canon_state(s)` | 2-letter uppercase abbrev: `'Massachusetts'` → `'MA'`; unknown → `NULL` |
+| `canon_zip(z)` | 5-char, leading-zero preserved: `'2109'` → `'02109'`; `'02109-1234'` → `'02109'` |
+
+### `from_pagc(raw_text VARCHAR) → geocode_input`
+
+Adapter that repacks [`us_address_standardizer`](https://duckdb.org/community_extensions/extensions/us_address_standardizer)'s `standardize_address()` + `parse_address()` output into a `geocode_input`, applying the `canon_*` functions and the PostGIS-parity COALESCE cascade for `location`/`state_abbrev`/`zip`.
+
+Registered only if `us_address_standardizer` was loaded at extension-load time. If absent, calls to `from_pagc()` return "function does not exist" — load the standardizer then reload the extension:
+```sql
+LOAD us_address_standardizer;
+LOAD us_geocoder;
+SELECT * FROM tiger.geocode(tiger.from_pagc('1731 New Hampshire Ave NW, Washington DC 20010'));
+```
+
+---
+
+## Rating scale
+
+The rating is an ordered penalty — **lower is better**, 0 is a perfect match.
+
+| range | source | meaning |
+|---|---|---|
+| **0** | Stage A | exact house number, street, type, direction, ZIP, place |
+| 1–29 | Stage A | strong match; typos or minor mismatches |
+| 30–89 | Stage A | acceptable |
+| 90–99 | Stage A | marginal; emitted but deprioritized |
+| ≥ 100 | Stage B | location-only fallback (no street-level confidence) |
+
+Per-component penalty weights (see `rate_attributes` in [src/sql/scoring_macros.sql.in](../src/sql/scoring_macros.sql.in)):
+
+- Direction mismatch: `levenshtein * 2`
+- Street name: `levenshtein * 10` (with a `0.75` discount when a `prequalabr` like `Old` is dropped; zero when both names are numerically equivalent via `numeric_streets_equal`)
+- Street type: `levenshtein * 5`
+- House number: `0` (in range + right parity), `2` (in range wrong parity), `5` (out of range), `20` (no range at all)
+- ZIP: `min(diff_zip * zip_penalty, 20 * zip_penalty)` — `zip_penalty` defaults to 2.0
+- Location (city): raw levenshtein against the resolved place/cousub/county name
+
+These ratios are derived straight from PostGIS's `rate_attributes`; consumers that sort by `rating` or threshold at specific values will see the same relative ordering.
+
+---
+
+## Containment
+
+The `block_geoid`, `tract_geoid`, `blkgrp_geoid` columns are always populated from the adjacent face of the matched edge side. `containment_guaranteed` is a conservative check:
+
+- `true` — the 10m-offset midpoint of the matched edge is provably inside the GEOID's face polygon. Use when downstream linkage (demographics, policy) requires high confidence.
+- `false` — the check failed. The GEOID is still the best-guess assignment; for the majority of addresses it's correct, but the offset point may land near a face boundary.
+
+The guarantee is only valid at the default 10m offset and the default 0.5 interpolation fraction. v0.1 limitations (all conservative, producing false negatives only):
+
+- **L1** offset-sensitive — a per-call custom offset invalidates the flag.
+- **L2** intra-block faces — an edge whose offset strip crosses from one face into a neighboring face in the same block reads false even though the block-level truth holds.
+- **L3** endpoint caps — the midpoint check passes near intersections even when the buffer would otherwise leak into a neighboring face.
+
+`require_containment='tract'` and `'blkgrp'` currently resolve to the same face-level check as `'block'`; looser (but still sound) checks via dissolved-polygon pre-aggregation are a v0.2 follow-up.
+
+---
+
+## Schema
+
+All tables in the `tiger` schema. See [src/sql/tiger_schema.sql.in](../src/sql/tiger_schema.sql.in) for the full DDL. Geometry is stored in EPSG:4269 (NAD83). User-supplied geometry passed to `geocode`/`reverse_geocode` is auto-transformed to 4269; SRID 0 is treated as "assume 4269".
+
+The reference tables (`featnames`, `edges`, `faces`, `addr`, `state`, `county`, `place`, `cousub`, `zcta5`) carry the minimum columns the geocoder reads, plus a handful of loader-precomputed acceleration columns on `featnames` (`name_lower`, `fullname_norm`, `name_soundex`). The derived tables (`zip_state`, `zip_state_loc`, `zip_lookup_base`, `edge_containment`) are built per-state at load time.
