@@ -7,6 +7,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/main/extension_helper.hpp"
 
 #include <sstream>
 #include <utility>
@@ -113,11 +114,27 @@ static std::string ZeroPad(const std::string &s, size_t width) {
 // the same base name. Most TIGER tables ship a full shapefile (.shp);
 // featnames and addr are DBF-only (no geometry). GDAL can read both via
 // ST_Read() — pass the correct inner extension.
-static std::string BuildVsiPath(const std::string &source, const std::string &zip_base,
+//
+// Source handling:
+//   * http:// or https:// URL → /vsizip//vsicurl/<url>/<SUBDIR>/<zip>/<inner>
+//     Census organizes TIGER by table-type subdirectory (STATE/, EDGES/,
+//     etc.), so HTTP paths always include the subdir. The double slash
+//     after /vsizip/ is required; it tells GDAL the next token is another
+//     VSI handler (vsicurl), not a local path.
+//   * Local filesystem path → /vsizip/<path>/<zip>/<inner>
+//     Local mode defaults to flat layout (all zips in one directory).
+//     Users who mirrored the Census tree can pass `.../TIGER2025/STATE`
+//     etc. as the source for each call, or flatten their local mirror.
+static std::string BuildVsiPath(const std::string &source, const std::string &subdir,
+                                const std::string &zip_base,
                                 const std::string &inner_ext = "shp") {
+	const bool is_http = source.rfind("http://", 0) == 0 || source.rfind("https://", 0) == 0;
 	std::string src = source;
 	if (!src.empty() && src.back() != '/') {
 		src += '/';
+	}
+	if (is_http) {
+		return "/vsizip//vsicurl/" + src + subdir + "/" + zip_base + ".zip/" + zip_base + "." + inner_ext;
 	}
 	return "/vsizip/" + src + zip_base + ".zip/" + zip_base + "." + inner_ext;
 }
@@ -162,6 +179,11 @@ static std::string LookupStateFips(Connection &conn, const std::string &schema, 
 // load_tiger_nation(source VARCHAR, year INTEGER DEFAULT 2025)
 // =====================================================================
 
+// Census default source URL for a given year.
+static std::string CensusUrl(int year) {
+	return "https://www2.census.gov/geo/tiger/TIGER" + std::to_string(year);
+}
+
 static unique_ptr<FunctionData> LoadTigerNationBind(ClientContext &context, TableFunctionBindInput &input,
                                                      vector<LogicalType> &return_types,
                                                      vector<string> &names) {
@@ -170,23 +192,32 @@ static unique_ptr<FunctionData> LoadTigerNationBind(ClientContext &context, Tabl
 	return_types.emplace_back(LogicalType::BIGINT);
 	names.emplace_back("rows_loaded");
 
-	// Positional args: source (required), year (optional, default 2025).
-	// Named args: year := 2025
-	if (input.inputs.empty() || input.inputs[0].IsNull()) {
-		throw BinderException("load_tiger_nation: source path is required");
+	auto bind_data = make_uniq<LoaderBindData>("tiger"); // schema fixed in v0.1
+	auto year_it = input.named_parameters.find("year");
+	if (year_it != input.named_parameters.end() && !year_it->second.IsNull()) {
+		bind_data->year = year_it->second.GetValue<int32_t>();
 	}
 
-	auto bind_data = make_uniq<LoaderBindData>("tiger"); // schema fixed in v0.1
-	bind_data->source = StringValue::Get(input.inputs[0]);
-	auto it = input.named_parameters.find("year");
-	if (it != input.named_parameters.end() && !it->second.IsNull()) {
-		bind_data->year = it->second.GetValue<int32_t>();
+	// Positional arg: source (optional, defaults to Census URL).
+	if (input.inputs.empty() || input.inputs[0].IsNull() || StringValue::Get(input.inputs[0]).empty()) {
+		bind_data->source = CensusUrl(bind_data->year);
+	} else {
+		bind_data->source = StringValue::Get(input.inputs[0]);
 	}
 
 	return std::move(bind_data);
 }
 
+// If source is an HTTP URL, make sure httpfs is loaded so GDAL's vsicurl
+// can reach it. Auto-load is a no-op if httpfs is already resident.
+static void EnsureHttpfsIfRemote(DatabaseInstance &db, const std::string &source) {
+	if (source.rfind("http://", 0) == 0 || source.rfind("https://", 0) == 0) {
+		ExtensionHelper::TryAutoLoadExtension(db, "httpfs");
+	}
+}
+
 static void DoLoadNation(ClientContext &context, const LoaderBindData &bind, std::vector<LoaderResult> &out) {
+	EnsureHttpfsIfRemote(*context.db, bind.source);
 	Connection conn(*context.db);
 	const auto &schema = bind.tiger_schema;
 	const std::string year = std::to_string(bind.year);
@@ -194,22 +225,22 @@ static void DoLoadNation(ClientContext &context, const LoaderBindData &bind, std
 
 	struct NationStep {
 		const char *section;
-		const char *zip_base_fmt; // "tl_<year>_us_state" etc.
+		const char *subdir;       // Census URL subdir (e.g. "STATE")
+		const char *zip_base_fmt; // e.g. "tl_<year>_us_state"
 	};
 	const NationStep steps[] = {
-	    {"nation_state", "tl_YEAR_us_state"},
-	    {"nation_county", "tl_YEAR_us_county"},
-	    {"nation_zcta5", "tl_YEAR_us_zcta520"},
+	    {"nation_state",  "STATE",    "tl_YEAR_us_state"},
+	    {"nation_county", "COUNTY",   "tl_YEAR_us_county"},
+	    {"nation_zcta5",  "ZCTA520",  "tl_YEAR_us_zcta520"},
 	};
 
 	for (const auto &step : steps) {
 		std::string zip_base = step.zip_base_fmt;
-		// Replace "YEAR" token with the year string.
 		auto pos = zip_base.find("YEAR");
 		if (pos != std::string::npos) {
 			zip_base.replace(pos, 4, year);
 		}
-		auto vsi = BuildVsiPath(bind.source, zip_base);
+		auto vsi = BuildVsiPath(bind.source, step.subdir, zip_base);
 		auto section = ExtractSection(tmpl, step.section);
 		auto rendered = RenderTemplate(section, {{"@TIGER@", schema}, {"@VSIPATH@", vsi}});
 		int64_t rows = ExecuteInsert(conn, rendered, step.section);
@@ -248,17 +279,22 @@ static unique_ptr<FunctionData> LoadTigerStateBind(ClientContext &context, Table
 	return_types.emplace_back(LogicalType::BIGINT);
 	names.emplace_back("rows_loaded");
 
-	if (input.inputs.size() < 2 || input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
-		throw BinderException("load_tiger_state: (state_abbrev, source) are required");
+	if (input.inputs.empty() || input.inputs[0].IsNull()) {
+		throw BinderException("load_tiger_state: state_abbrev is required");
 	}
 
 	auto bind_data = make_uniq<LoaderBindData>("tiger");
 	bind_data->is_state_loader = true;
 	bind_data->state_abbrev = StringValue::Get(input.inputs[0]);
-	bind_data->source = StringValue::Get(input.inputs[1]);
 	auto it = input.named_parameters.find("year");
 	if (it != input.named_parameters.end() && !it->second.IsNull()) {
 		bind_data->year = it->second.GetValue<int32_t>();
+	}
+	// Positional source optional, defaults to Census URL.
+	if (input.inputs.size() < 2 || input.inputs[1].IsNull() || StringValue::Get(input.inputs[1]).empty()) {
+		bind_data->source = CensusUrl(bind_data->year);
+	} else {
+		bind_data->source = StringValue::Get(input.inputs[1]);
 	}
 
 	// Resolve state_fips now (fail fast if abbrev is invalid).
@@ -269,6 +305,7 @@ static unique_ptr<FunctionData> LoadTigerStateBind(ClientContext &context, Table
 }
 
 static void DoLoadState(ClientContext &context, const LoaderBindData &bind, std::vector<LoaderResult> &out) {
+	EnsureHttpfsIfRemote(*context.db, bind.source);
 	Connection conn(*context.db);
 	const auto &schema = bind.tiger_schema;
 	const std::string &fips = bind.state_fips;
@@ -287,21 +324,22 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, std:
 	}
 
 	// State-level files: place, cousub.
-	const std::pair<const char *, const char *> state_level[] = {
-	    {"state_place", "tl_YEAR_FIPS_place"},
-	    {"state_cousub", "tl_YEAR_FIPS_cousub"},
+	struct StateLevelStep { const char *section; const char *subdir; const char *zip_base; };
+	const StateLevelStep state_level[] = {
+	    {"state_place",  "PLACE",  "tl_YEAR_FIPS_place"},
+	    {"state_cousub", "COUSUB", "tl_YEAR_FIPS_cousub"},
 	};
 	for (const auto &s : state_level) {
-		std::string zip_base = s.second;
+		std::string zip_base = s.zip_base;
 		auto pos = zip_base.find("YEAR");
 		if (pos != std::string::npos) zip_base.replace(pos, 4, year);
 		pos = zip_base.find("FIPS");
 		if (pos != std::string::npos) zip_base.replace(pos, 4, fips);
-		auto vsi = BuildVsiPath(bind.source, zip_base);
-		auto section = ExtractSection(tmpl, s.first);
+		auto vsi = BuildVsiPath(bind.source, s.subdir, zip_base);
+		auto section = ExtractSection(tmpl, s.section);
 		auto rendered = RenderTemplate(section, {{"@TIGER@", schema}, {"@VSIPATH@", vsi}});
-		int64_t rows = ExecuteInsert(conn, rendered, s.first);
-		out.push_back({s.first, rows});
+		int64_t rows = ExecuteInsert(conn, rendered, s.section);
+		out.push_back({s.section, rows});
 	}
 
 	// Enumerate counties for this state from tiger.county (must be loaded first).
@@ -328,13 +366,12 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, std:
 	}
 
 	// County-level files. For each county, load edges, faces, featnames, addr.
-	// (section, zip_base, inner_ext).
-	struct CountyStep { const char *section; const char *zip_base; const char *ext; };
+	struct CountyStep { const char *section; const char *subdir; const char *zip_base; const char *ext; };
 	const CountyStep county_level[] = {
-	    {"county_edges",     "tl_YEAR_FIPSCOUNTY_edges",     "shp"},
-	    {"county_faces",     "tl_YEAR_FIPSCOUNTY_faces",     "shp"},
-	    {"county_featnames", "tl_YEAR_FIPSCOUNTY_featnames", "dbf"},  // DBF-only
-	    {"county_addr",      "tl_YEAR_FIPSCOUNTY_addr",      "dbf"},  // DBF-only
+	    {"county_edges",     "EDGES",     "tl_YEAR_FIPSCOUNTY_edges",     "shp"},
+	    {"county_faces",     "FACES",     "tl_YEAR_FIPSCOUNTY_faces",     "shp"},
+	    {"county_featnames", "FEATNAMES", "tl_YEAR_FIPSCOUNTY_featnames", "dbf"},  // DBF-only
+	    {"county_addr",      "ADDR",      "tl_YEAR_FIPSCOUNTY_addr",      "dbf"},  // DBF-only
 	};
 	for (const auto &cfp : countyfps) {
 		for (const auto &s : county_level) {
@@ -343,7 +380,7 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, std:
 			if (pos != std::string::npos) zip_base.replace(pos, 4, year);
 			pos = zip_base.find("FIPSCOUNTY");
 			if (pos != std::string::npos) zip_base.replace(pos, 10, fips + cfp);
-			auto vsi = BuildVsiPath(bind.source, zip_base, s.ext);
+			auto vsi = BuildVsiPath(bind.source, s.subdir, zip_base, s.ext);
 			auto section = ExtractSection(tmpl, s.section);
 			auto rendered = RenderTemplate(section, {{"@TIGER@", schema}, {"@VSIPATH@", vsi},
 			                                         {"@STATEFP@", fips}, {"@COUNTYFP@", cfp}});
@@ -386,17 +423,28 @@ static void LoadTigerStateExecute(ClientContext &context, TableFunctionInput &da
 // =====================================================================
 
 void RegisterLoaderFunctions(ExtensionLoader &loader, const std::string &) {
-	// load_tiger_nation(source VARCHAR, year := 2025)
-	TableFunction nation_fn("load_tiger_nation", {LogicalType::VARCHAR}, LoadTigerNationExecute,
-	                        LoadTigerNationBind, LoaderGlobalState::Init);
-	nation_fn.named_parameters["year"] = LogicalType::INTEGER;
-	loader.RegisterFunction(nation_fn);
+	// load_tiger_nation([source VARCHAR], year := 2025)
+	// Source defaults to the Census TIGER URL for the given year.
+	TableFunction nation_fn0("load_tiger_nation", {}, LoadTigerNationExecute,
+	                         LoadTigerNationBind, LoaderGlobalState::Init);
+	nation_fn0.named_parameters["year"] = LogicalType::INTEGER;
+	loader.RegisterFunction(nation_fn0);
 
-	// load_tiger_state(state_abbrev VARCHAR, source VARCHAR, year := 2025)
-	TableFunction state_fn("load_tiger_state", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LoadTigerStateExecute,
-	                       LoadTigerStateBind, LoaderGlobalState::Init);
-	state_fn.named_parameters["year"] = LogicalType::INTEGER;
-	loader.RegisterFunction(state_fn);
+	TableFunction nation_fn1("load_tiger_nation", {LogicalType::VARCHAR}, LoadTigerNationExecute,
+	                         LoadTigerNationBind, LoaderGlobalState::Init);
+	nation_fn1.named_parameters["year"] = LogicalType::INTEGER;
+	loader.RegisterFunction(nation_fn1);
+
+	// load_tiger_state(state_abbrev VARCHAR [, source VARCHAR], year := 2025)
+	TableFunction state_fn1("load_tiger_state", {LogicalType::VARCHAR}, LoadTigerStateExecute,
+	                        LoadTigerStateBind, LoaderGlobalState::Init);
+	state_fn1.named_parameters["year"] = LogicalType::INTEGER;
+	loader.RegisterFunction(state_fn1);
+
+	TableFunction state_fn2("load_tiger_state", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LoadTigerStateExecute,
+	                        LoadTigerStateBind, LoaderGlobalState::Init);
+	state_fn2.named_parameters["year"] = LogicalType::INTEGER;
+	loader.RegisterFunction(state_fn2);
 }
 
 } // namespace us_geocoder
