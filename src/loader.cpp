@@ -87,8 +87,6 @@ struct LoaderBindData : public FunctionData {
 	// separately when you actually need the GEOIDs.
 	bool build_containment = true;
 
-	bool is_state_loader = false;
-
 public:
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<LoaderBindData>(func_schema);
@@ -99,7 +97,6 @@ public:
 		copy->year = year;
 		copy->states = states;
 		copy->build_containment = build_containment;
-		copy->is_state_loader = is_state_loader;
 		return std::move(copy);
 	}
 
@@ -107,7 +104,7 @@ public:
 		auto &other = other_p.Cast<LoaderBindData>();
 		return func_schema == other.func_schema && data_location == other.data_location &&
 		       source == other.source && year == other.year &&
-		       is_state_loader == other.is_state_loader && states.size() == other.states.size();
+		       states.size() == other.states.size();
 	}
 };
 
@@ -120,6 +117,14 @@ struct LoaderGlobalState : public GlobalTableFunctionState {
 		return make_uniq<LoaderGlobalState>();
 	}
 };
+
+// Drain `gstate.results` into `output` a vector-size chunk at a time.
+// Shared by every loader execute function; DuckDB re-invokes the execute
+// callback until SetCardinality(0).
+template <typename State>
+static void EmitLoaderResults(State &gstate, DataChunk &output) {
+	EmitLoaderResults(gstate, output);
+}
 
 // =====================================================================
 // Helpers
@@ -361,14 +366,7 @@ static void LoadTigerNationExecute(ClientContext &context, TableFunctionInput &d
 		DoLoadNation(context, bind, gstate.results);
 	}
 
-	idx_t emitted = 0;
-	while (gstate.row_idx < gstate.results.size() && emitted < STANDARD_VECTOR_SIZE) {
-		const auto &r = gstate.results[gstate.row_idx++];
-		output.SetValue(0, emitted, Value(r.step));
-		output.SetValue(1, emitted, Value::BIGINT(r.rows));
-		++emitted;
-	}
-	output.SetCardinality(emitted);
+	EmitLoaderResults(gstate, output);
 }
 
 // =====================================================================
@@ -436,7 +434,6 @@ static unique_ptr<FunctionData> LoadTigerStateBind(ClientContext &context, Table
 		throw BinderException("load_tiger_state: state_abbrev is required");
 	}
 	auto bind_data = make_uniq<LoaderBindData>("tiger");
-	bind_data->is_state_loader = true;
 	auto abbrevs = AbbrevsFromValue(input.inputs[0], "load_tiger_state");
 	ApplyYearSourceTarget(*bind_data, input, /*source_input_index=*/1);
 	Connection conn(*context.db);
@@ -456,7 +453,6 @@ static unique_ptr<FunctionData> LoadTigerStatesBind(ClientContext &context, Tabl
 		throw BinderException("load_tiger_states: states (VARCHAR[]) is required");
 	}
 	auto bind_data = make_uniq<LoaderBindData>("tiger");
-	bind_data->is_state_loader = true;
 	auto abbrevs = AbbrevsFromValue(input.inputs[0], "load_tiger_states");
 	ApplyYearSourceTarget(*bind_data, input, /*source_input_index=*/1);
 	Connection conn(*context.db);
@@ -473,7 +469,6 @@ static unique_ptr<FunctionData> LoadTigerAllStatesBind(ClientContext &context, T
 	names.emplace_back("rows_loaded");
 
 	auto bind_data = make_uniq<LoaderBindData>("tiger");
-	bind_data->is_state_loader = true;
 	ApplyYearSourceTarget(*bind_data, input, /*source_input_index=*/0);
 
 	// Enumerate 50 states + DC from the local state_lookup. The Census FIPS
@@ -651,14 +646,7 @@ static void LoadTigerStateExecute(ClientContext &context, TableFunctionInput &da
 		}
 	}
 
-	idx_t emitted = 0;
-	while (gstate.row_idx < gstate.results.size() && emitted < STANDARD_VECTOR_SIZE) {
-		const auto &r = gstate.results[gstate.row_idx++];
-		output.SetValue(0, emitted, Value(r.step));
-		output.SetValue(1, emitted, Value::BIGINT(r.rows));
-		++emitted;
-	}
-	output.SetCardinality(emitted);
+	EmitLoaderResults(gstate, output);
 }
 
 // =====================================================================
@@ -751,14 +739,7 @@ static void InstallSchemaExecute(ClientContext &context, TableFunctionInput &dat
 		gstate.results.push_back({"installed:" + qualified, (int64_t)kDataTableCount});
 	}
 
-	idx_t emitted = 0;
-	while (gstate.row_idx < gstate.results.size() && emitted < STANDARD_VECTOR_SIZE) {
-		const auto &r = gstate.results[gstate.row_idx++];
-		output.SetValue(0, emitted, Value(r.step));
-		output.SetValue(1, emitted, Value::BIGINT(r.rows));
-		++emitted;
-	}
-	output.SetCardinality(emitted);
+	EmitLoaderResults(gstate, output);
 }
 
 // =====================================================================
@@ -895,7 +876,6 @@ static unique_ptr<FunctionData> BuildContainmentBind(ClientContext &context,
 		throw BinderException("build_edge_containment: states (VARCHAR or VARCHAR[]) is required");
 	}
 	auto bind_data = make_uniq<LoaderBindData>("tiger");
-	bind_data->is_state_loader = true; // reuse the state-resolution flow
 	auto abbrevs = AbbrevsFromValue(input.inputs[0], "build_edge_containment");
 	ApplyTargetParams(*bind_data, input);
 	Connection conn(*context.db);
@@ -934,14 +914,7 @@ static void BuildContainmentExecute(ClientContext &context, TableFunctionInput &
 		}
 	}
 
-	idx_t emitted = 0;
-	while (gstate.row_idx < gstate.results.size() && emitted < STANDARD_VECTOR_SIZE) {
-		const auto &r = gstate.results[gstate.row_idx++];
-		output.SetValue(0, emitted, Value(r.step));
-		output.SetValue(1, emitted, Value::BIGINT(r.rows));
-		++emitted;
-	}
-	output.SetCardinality(emitted);
+	EmitLoaderResults(gstate, output);
 }
 
 // =====================================================================

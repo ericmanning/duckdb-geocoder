@@ -2,22 +2,16 @@
 # Test D — does UNION-ALL batching help vs serial-INSERT when writing K
 # shapefiles into a shared target table?
 #
-# Hypothesis 6: commit-2 saw ~5% outer-parallelism benefit because K workers'
-# shared writes serialized behind DuckDB's write lock. If we move the work
-# inside one query (UNION ALL of K ST_Read branches feeding one INSERT),
-# DuckDB's own scheduler can parallelize the parse phase and do a single
-# batched write — potentially much faster.
+# Hypothesis 6: multi-Connection INSERTs into a shared target serialize
+# behind DuckDB's write lock. If we move the work inside one query
+# (UNION ALL of K ST_Read branches feeding one INSERT), DuckDB's own
+# scheduler can parallelize the parse phase and do a single batched write.
 #
 # We compare three in-process shapes (all local files, no /vsicurl/):
 #   baseline:  K serial INSERTs into tiger.edges (one per county)
 #   union:     one INSERT ... UNION ALL of K ST_Read branches
 #   scratch:   K CTAS into distinct scratch tables, then one merge INSERT
 #              (explicitly avoids shared-target write contention)
-#
-# Prior anecdote: in April 2026 we observed UNION ALL INSERT over /vsicurl/
-# being *slower* than serial — but that was network-dominated. Local files
-# remove the network confound; this test shows whether DuckDB-internal
-# parallelism wins when the bytes are already on disk.
 
 set -eu -o pipefail
 cd "$(dirname "$0")/../.."

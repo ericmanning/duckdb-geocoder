@@ -1,6 +1,6 @@
 # Loader-perf hypothesis tests
 
-Four tests that isolate *why* our April 2026 attempts at parallel download (commit 1 attempt, ~15s saved) and parallel ingest (commit 2 attempt, ~5% saved) didn't move the needle. Each tests a single hypothesis from the loader-perf roadmap, independent of the loader internals.
+Four tests that isolate why application-layer parallelism (parallel downloads, parallel ingest) hasn't helped the TIGER loader. Each tests a single hypothesis — HTTP Range partial fetches, DuckDB internal INSERT parallelism, GDAL global driver lock, or MVCC write contention — independent of the loader internals.
 
 Defaults use Rhode Island (5 counties, ~130 MB of zips) for fast iteration. Override via env vars: `BENCH_STATE=NJ BENCH_FIPS=34 ./run_all.sh`.
 
@@ -37,4 +37,4 @@ cd <repo-root>
 
 ## After running
 
-If a test result changes our model (e.g. scratch-table speedup is huge while shared-target isn't), update [`.claude/projects/-Users-ericmm-Documents-GitHub-duckdb-geocoder/memory/project_loader_perf_roadmap.md`](../../.claude/) and [`CLAUDE.md`](../../CLAUDE.md) with the new evidence so future attempts don't repeat the same mistakes.
+If a test result changes our model (e.g. scratch-table speedup is huge while shared-target isn't), update the loader-perf roadmap and [`CLAUDE.md`](../../CLAUDE.md) with the new evidence so future attempts don't repeat the same mistakes.

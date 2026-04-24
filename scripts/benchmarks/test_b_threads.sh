@@ -14,8 +14,7 @@
 #                                      multi-threaded the INSERT; outer
 #                                      threading won't help.
 #   ratio ≈ 1× (t1 ≈ tN)            →  DuckDB wasn't parallelizing this INSERT;
-#                                      outer K-way threading SHOULD have worked.
-#                                      Revisit why commit-2 didn't.
+#                                      outer K-way threading should in principle work.
 #   ratio ∈ [1×, 3×]                →  partial parallelism; some win possible
 #                                      from outer threading but not K×.
 
@@ -46,11 +45,9 @@ INSERT INTO bench_edges
 SELECT '$BENCH_FIPS', '$COUNTY', TLID, TFIDL, TFIDR, TNIDF, TNIDT, MTFCC, FULLNAME, geom,
        NULLIF(ZIPL, ''), NULLIF(ZIPR, '')
 FROM ST_Read('$VSIPATH');"
-    # /usr/bin/time -p: consistent cross-shell output, reports to stderr.
-    local timing_file; timing_file="$(mktemp)"
-    /usr/bin/time -p "$DUCKDB_BIN" "$db" -c "$sql" >/dev/null 2>"$timing_file" || true
-    local t; t="$(awk '/^real/ {print $2}' "$timing_file")"
-    rm -f "$db" "$db.wal" "$timing_file"
+    local t
+    t="$(time_command_secs "$DUCKDB_BIN" "$db" -c "$sql")"
+    rm -f "$db" "$db.wal"
     echo "${t:-0}"
 }
 
