@@ -65,7 +65,11 @@ Benchmarked on NJ (21 counties, 86 zips, ~800K edges) in April 2026. Details in 
 - 4 separate CLI **processes** reading 4 distinct local shapefiles only got 1.10× speedup, and in-process UNION-ALL only got 1.35×. GDAL doesn't have an obvious in-process driver lock (processes would have worked); but *something* OS-level is capping concurrency on small workloads (possibly disk I/O queue + CLI startup cost).
 - Scratch-table CTAS was *slower* than shared-target UNION-ALL INSERT, not faster — so MVCC write contention isn't the bottleneck either.
 
-**Bottom line:** at the RI workload size (0.5s per file), every obvious explanation for why parallelism doesn't help is wrong. The most likely remaining culprit is that the parse phase is neither compute- nor network- nor I/O-bound in a way we can exploit from SQL/app code — something in GDAL's shapefile read path simply doesn't scale with concurrency at this scale. **Re-run `scripts/benchmarks/run_all.sh` with `BENCH_STATE=NJ` before investing more engineering** — bigger files might tell a different story.
+**Follow-up at NJ scale** (`BENCH_STATE=NJ BENCH_FIPS=34`, 21 counties, ~835 MB zips): the RI-scale caveat was right. NJ reveals a real signal RI hid — parallel `SELECT … FROM ST_Read(…) UNION ALL …` with threads=4 gets **~2× speedup**. But the same UNION-ALL shape wrapped in `INSERT INTO … SELECT …` stays at 1.06× (no speedup).
+
+**Parse parallelizes; write serializes.** That's the actual story. Row-group allocation / WAL / something in the INSERT-write path doesn't scale with concurrency, and it cancels the parse-phase gain. Upshot for engineering: the parallel-ingest upside is capped at ~20–30% (save the parse portion; write stays serial). Not the dramatic win I originally promised. A future commit-2 redesign would need to split parse-from-write (e.g., parallel parse into Arrow batches, then a single serialized writer) — but even then, ~20% savings is probably not worth the complexity.
+
+**The only path to >3× loader speedup** on the roadmap is option 2: pre-built Parquet distribution. Bypasses both the shapefile-parse *and* the INSERT-write bottlenecks.
 
 **Where the real wins are:** removing work, not parallelizing it. `edge_containment` precompute is ~1–2 min per state and many users don't need GEOIDs — making it opt-out is the one remaining in-process lever that actually moves the needle.
 
