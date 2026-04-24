@@ -190,3 +190,4 @@ DELETE FROM @TIGER@.cousub           WHERE statefp = '@STATEFP@';
 DELETE FROM @TIGER@.zip_state        WHERE statefp = '@STATEFP@';
 DELETE FROM @TIGER@.zip_state_loc    WHERE statefp = '@STATEFP@';
 DELETE FROM @TIGER@.zip_lookup_base  WHERE statefp = '@STATEFP@';
+DELETE FROM @TIGER@.edge_containment WHERE statefp = '@STATEFP@';
