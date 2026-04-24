@@ -12,6 +12,30 @@ CALL load_tiger_state('ZZ');
 ----
 unknown state abbreviation 'ZZ'
 
+# --- build_containment opt-out + standalone build_edge_containment ----------
+# Both named params accepted at bind; build_edge_containment validates abbrevs
+# the same way the state loaders do.
+
+statement error
+CALL load_tiger_state('RI', '/nonexistent/tiger', build_containment := false);
+----
+us_geocoder loader
+
+statement error
+CALL build_edge_containment('ZZ');
+----
+unknown state abbreviation 'ZZ'
+
+statement error
+CALL build_edge_containment(['RI', 'ZZ']);
+----
+unknown state abbreviation 'ZZ'
+
+statement error
+CALL build_edge_containment(CAST([] AS VARCHAR[]));
+----
+no state abbreviations provided
+
 # --- load_tiger_states (plural, VARCHAR[] arg) ------------------------------
 statement error
 CALL load_tiger_states(['ZZ']);

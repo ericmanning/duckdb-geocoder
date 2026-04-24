@@ -80,6 +80,13 @@ struct LoaderBindData : public FunctionData {
 	struct StatePlan { std::string abbrev; std::string fips; };
 	std::vector<StatePlan> states;
 
+	// Whether to compute tiger.edge_containment inline at the end of each
+	// state's load. Eager by default — the geocoder's GEOID output columns
+	// and the `require_containment` filter both depend on it. Set to false
+	// to skip (~1-2 min saved per state); then call build_edge_containment(states)
+	// separately when you actually need the GEOIDs.
+	bool build_containment = true;
+
 	bool is_state_loader = false;
 
 public:
@@ -91,6 +98,7 @@ public:
 		copy->source = source;
 		copy->year = year;
 		copy->states = states;
+		copy->build_containment = build_containment;
 		copy->is_state_loader = is_state_loader;
 		return std::move(copy);
 	}
@@ -262,6 +270,10 @@ static void ApplyYearSourceTarget(LoaderBindData &bind, const TableFunctionBindI
 	}
 	if (!found_source) {
 		bind.source = CensusUrl(bind.year);
+	}
+	auto bc_it = input.named_parameters.find("build_containment");
+	if (bc_it != input.named_parameters.end() && !bc_it->second.IsNull()) {
+		bind.build_containment = bc_it->second.GetValue<bool>();
 	}
 }
 
@@ -603,12 +615,14 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind,
 	// Build per-state derived tables. edge_containment is expensive
 	// (ST_Within on ~150K rows) so it runs last; the zip_* tables are
 	// pure INSERT…SELECT and finish in milliseconds.
-	const char *derived[] = {
+	std::vector<const char *> derived = {
 	    "derived_zip_state",
 	    "derived_zip_state_loc",
 	    "derived_zip_lookup_base",
-	    "derived_edge_containment",
 	};
+	if (bind.build_containment) {
+		derived.push_back("derived_edge_containment");
+	}
 	for (const auto *name : derived) {
 		auto section = ExtractSection(tmpl, name);
 		auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc},
@@ -616,6 +630,9 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind,
 		                                         {"@STATEFP@", fips}});
 		int64_t rows = ExecuteInsert(conn, rendered, name);
 		out.push_back({name, rows});
+	}
+	if (!bind.build_containment) {
+		out.push_back({"skipped:edge_containment", 0});
 	}
 }
 
@@ -857,6 +874,77 @@ static void SetReferenceExecute(ClientContext &context, TableFunctionInput &data
 }
 
 // =====================================================================
+// build_edge_containment(states VARCHAR | VARCHAR[], target_db := NULL,
+//                        target_schema := 'tiger')
+//   Run the derived_edge_containment step for one or more already-loaded
+//   states. Idempotent — DELETEs existing rows for each statefp first.
+//   Used after `load_tiger_*(build_containment := false)` to populate the
+//   GEOIDs on demand.
+// =====================================================================
+
+static unique_ptr<FunctionData> BuildContainmentBind(ClientContext &context,
+                                                      TableFunctionBindInput &input,
+                                                      vector<LogicalType> &return_types,
+                                                      vector<string> &names) {
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("step");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("rows_loaded");
+
+	if (input.inputs.empty() || input.inputs[0].IsNull()) {
+		throw BinderException("build_edge_containment: states (VARCHAR or VARCHAR[]) is required");
+	}
+	auto bind_data = make_uniq<LoaderBindData>("tiger");
+	bind_data->is_state_loader = true; // reuse the state-resolution flow
+	auto abbrevs = AbbrevsFromValue(input.inputs[0], "build_edge_containment");
+	ApplyTargetParams(*bind_data, input);
+	Connection conn(*context.db);
+	ResolveStates(conn, *bind_data, abbrevs);
+	return std::move(bind_data);
+}
+
+static void BuildContainmentExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<LoaderBindData>();
+	auto &gstate = data_p.global_state->Cast<LoaderGlobalState>();
+
+	if (!gstate.executed) {
+		gstate.executed = true;
+		Connection conn(*context.db);
+		const auto &data_loc = bind.data_location;
+		const auto &func_loc = bind.func_schema;
+		const auto &tmpl = LoaderTemplatesSql();
+		auto section = ExtractSection(tmpl, "derived_edge_containment");
+
+		for (const auto &state : bind.states) {
+			gstate.results.push_back({"begin:" + state.abbrev, 0});
+			// Idempotent: wipe existing rows for this state first, then recompute.
+			auto del_sql = "DELETE FROM " + data_loc + ".edge_containment WHERE statefp = '" +
+			               state.fips + "'";
+			auto del = conn.Query(del_sql);
+			if (del->HasError()) {
+				throw IOException("us_geocoder build_edge_containment (delete %s): %s",
+				                  state.abbrev, del->GetError());
+			}
+			auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc},
+			                                         {"@FUNC@", func_loc},
+			                                         {"@STATEFP@", state.fips}});
+			int64_t rows = ExecuteInsert(conn, rendered, "edge_containment:" + state.abbrev);
+			gstate.results.push_back({"edge_containment:" + state.abbrev, rows});
+			gstate.results.push_back({"done:" + state.abbrev, 0});
+		}
+	}
+
+	idx_t emitted = 0;
+	while (gstate.row_idx < gstate.results.size() && emitted < STANDARD_VECTOR_SIZE) {
+		const auto &r = gstate.results[gstate.row_idx++];
+		output.SetValue(0, emitted, Value(r.step));
+		output.SetValue(1, emitted, Value::BIGINT(r.rows));
+		++emitted;
+	}
+	output.SetCardinality(emitted);
+}
+
+// =====================================================================
 // Registration
 // =====================================================================
 
@@ -868,6 +956,7 @@ static void AddLoaderNamedParams(TableFunction &fn) {
 	fn.named_parameters["source"] = LogicalType::VARCHAR;
 	fn.named_parameters["target_db"] = LogicalType::VARCHAR;
 	fn.named_parameters["target_schema"] = LogicalType::VARCHAR;
+	fn.named_parameters["build_containment"] = LogicalType::BOOLEAN;
 }
 
 void RegisterLoaderFunctions(ExtensionLoader &loader, const std::string &) {
@@ -941,6 +1030,23 @@ void RegisterLoaderFunctions(ExtensionLoader &loader, const std::string &) {
 	TableFunction set_ref_fn2("set_tiger_reference", {LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                          SetReferenceExecute, SetReferenceBind, SchemaOpGlobalState::Init);
 	loader.RegisterFunction(set_ref_fn2);
+
+	// build_edge_containment(VARCHAR | VARCHAR[], target_db := NULL,
+	//                        target_schema := 'tiger'])
+	const auto list_vc2 = LogicalType::LIST(LogicalType::VARCHAR);
+	TableFunction bec_varchar("build_edge_containment", {LogicalType::VARCHAR},
+	                           BuildContainmentExecute, BuildContainmentBind,
+	                           LoaderGlobalState::Init);
+	bec_varchar.named_parameters["target_db"] = LogicalType::VARCHAR;
+	bec_varchar.named_parameters["target_schema"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(bec_varchar);
+
+	TableFunction bec_list("build_edge_containment", {list_vc2},
+	                        BuildContainmentExecute, BuildContainmentBind,
+	                        LoaderGlobalState::Init);
+	bec_list.named_parameters["target_db"] = LogicalType::VARCHAR;
+	bec_list.named_parameters["target_schema"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(bec_list);
 }
 
 } // namespace us_geocoder

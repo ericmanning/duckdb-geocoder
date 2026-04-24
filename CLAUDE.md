@@ -41,6 +41,25 @@ The built CLI `build/release/duckdb` statically links the extension, so no `INST
 - **Loader state-list API.** `load_tiger_state(VARCHAR)` and `load_tiger_states(VARCHAR[])` share one bind-data structure (`std::vector<StatePlan>`); `load_tiger_all_states()` resolves the 50+DC list at bind time from `state_lookup WHERE statefp::INT BETWEEN 1 AND 56`.
 - **C++11** is the extension ABI baseline — no `inline constexpr std::string_view`, no structured bindings in public headers.
 
+## Loader performance: what worked and what didn't
+
+Benchmarked on NJ (21 counties, 86 zips, ~800K edges) in April 2026. Details in the memory roadmap; highlights:
+
+**Worked:**
+- Census-nested local mirror + parallel shell download ([`scripts/parallel_download_state.sh`](scripts/parallel_download_state.sh)): 26 s for all 89 NJ zips vs several minutes serial. Real win when users can run a shell script first.
+- `unload_state` DELETE coverage for all 13 TIGER data tables (fixed the `edge_containment` doubling bug).
+
+**Didn't work — measurements were the lesson:**
+- **Parallel HTTP prefetch via `read_blob` inside the loader.** Sounded like an obvious win; measured ~15 s saved on a 7-min NJ load. Likely explanation: Census CDN supports HTTP Range (verified: `accept-ranges: bytes`, 206 Partial Content on a range probe), and GDAL's `/vsicurl/` is designed to exploit that, so serial `/vsicurl/` reads were already doing partial fetches. Our parallel full-zip downloads moved more total bytes and approximately canceled. (Not independently verified via `tcpdump`; if you want the true byte breakdown, measure first before rebuilding this.)
+- **Parallel ingest via K worker Connections + concurrent INSERTs.** Sounded like the obvious next win; measured ~5% saved (556 s → 528 s) with user CPU going *up*. DuckDB's task scheduler was already running each "serial" INSERT at ~6 threads via internal parallelism — outer threading just oversubscribed cores.
+
+**Methodology bite-marks:**
+- Always benchmark before promising order-of-magnitude speedups. My estimates were off by 10× in both cases.
+- Compare `user`/`real` CPU-time ratios to see whether DuckDB is already saturating cores — if user/real is already ~N, adding N more outer workers won't help.
+- Benchmark cold vs warm caches separately. Network variance and CDN warming make consecutive runs non-comparable.
+
+**Where the real wins are:** removing work, not parallelizing it. `edge_containment` precompute is ~1–2 min per state and many users don't need GEOIDs — making it opt-out is the one remaining in-process lever that actually moves the needle.
+
 ## Common traps
 
 - **`CREATE TYPE`** isn't idempotent across DB reopens; use `CREATE TYPE IF NOT EXISTS`.

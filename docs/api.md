@@ -30,8 +30,9 @@ Loads a single state's TIGER data: state-level `place` and `cousub`, county-leve
 - `state_abbrev` — 2-letter postal code, case-insensitive (`'RI'`, `'ri'`, `'Ri'` all work).
 - `source` / `year` — same as `load_tiger_nation`.
 - `target_db` / `target_schema` — same as `load_tiger_nation`. Must match the target used for `load_tiger_nation` (the state loader reads `<target>.county` to enumerate counties).
+- `build_containment BOOLEAN DEFAULT true` — when `false`, skip the eager `edge_containment` precompute at the end of the state load (saves ~1-2 min per state). Populate it later with [`build_edge_containment()`](#build_edge_containmentstates-varchar--varchar-target_db-varchar-default-null-target_schema-varchar-default-tiger--table).
 
-Idempotent via **DELETE-first**: re-running wipes all rows for that state before reinserting.
+Idempotent via **DELETE-first**: re-running wipes all rows for that state before reinserting (including `edge_containment`).
 
 ```sql
 CALL load_tiger_state('RI');                                 -- from Census, into tiger.* locally
@@ -107,6 +108,25 @@ CALL install_tiger_schema('ref', 'tgr25'); -- creates ref.tgr25.*
 ```
 
 The loaders call this automatically when `target_db` is set, so you only need `install_tiger_schema` explicitly if you want an empty-but-valid schema (e.g. to hand-populate for tests) or are building a reference DB via some other ETL.
+
+### `build_edge_containment(states VARCHAR | VARCHAR[], target_db VARCHAR DEFAULT NULL, target_schema VARCHAR DEFAULT 'tiger') → TABLE(step VARCHAR, rows_loaded BIGINT)`
+
+Compute (or recompute) `tiger.edge_containment` for one or more already-loaded states. Useful after `load_tiger_state(..., build_containment := false)` when you want to defer the ~1-2-min-per-state precompute and fill it in later.
+
+Idempotent: DELETEs existing rows for each `statefp` before reinserting. `target_db` / `target_schema` route the writes to an attached catalog, same semantics as the loaders.
+
+```sql
+-- Fast initial load, defer containment:
+CALL load_tiger_nation();
+CALL load_tiger_states(['NJ','NY','PA'], build_containment := false);
+
+-- ...later, when you want GEOIDs:
+CALL build_edge_containment(['NJ','NY','PA']);
+-- or a single state:
+CALL build_edge_containment('NJ');
+```
+
+Prerequisite: the state's `edges` and `faces` rows must be loaded (via any `load_tiger_*` call). If they're missing, the INSERT runs but produces 0 rows.
 
 ### `set_tiger_reference([database VARCHAR [, schema VARCHAR DEFAULT 'tiger']]) → TABLE(table VARCHAR, kind VARCHAR)`
 
