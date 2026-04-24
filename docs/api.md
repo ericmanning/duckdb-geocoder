@@ -206,6 +206,34 @@ SELECT a.id, g.rating, ST_AsText(g.geom)
 FROM my_addresses a, LATERAL tiger.geocode(a.input, 1, NULL, 'none') g;
 ```
 
+### `tiger.geocode(raw_text VARCHAR) → TABLE`
+
+One-arg shortcut for free-form strings. Equivalent to `tiger.geocode(tiger.from_pagc(raw_text), 10, NULL, 'none')`.
+
+```sql
+SELECT rating, ST_AsText(geom), block_geoid
+FROM tiger.geocode('120 Benefit St, Providence RI 02903');
+```
+
+**Availability.** Registered only when the `us_address_standardizer` community extension is present. The extension auto-loads and populates its `us_lex` / `us_gaz` / `us_rules` tables via `load_us_address_data()` when `us_geocoder` is loaded — no manual setup required if the ext is already `INSTALL`ed. If `us_address_standardizer` isn't installed, call [`from_pagc`](#tigerfrom_pagcraw_text-varchar--tigergeocode_input) yourself or pass a `geocode_input` struct.
+
+For per-row `max_results` / `restrict_geom` / `require_containment` control with free-form input, call the 4-arg form explicitly:
+
+```sql
+SELECT * FROM tiger.geocode(
+    tiger.from_pagc('120 Benefit St, Providence RI 02903'),
+    1,
+    NULL,
+    'block'
+);
+```
+
+### `tiger.from_pagc(raw_text VARCHAR) → tiger.geocode_input`
+
+Standardizer adapter. Parses a free-form address string into a `geocode_input` struct suitable for `tiger.geocode()`. Built on the `us_address_standardizer` community extension's `standardize_address('us_lex', 'us_gaz', 'us_rules', …)` (PAGC) + `parse_address(…)` fallback for fields the standardizer leaves empty.
+
+See [§ geocode_input](#tigergeocode_input) for the output shape and the `canon_*` macros for individual field normalization.
+
 ### `tiger.geocode_intersection(road1 VARCHAR, road2 VARCHAR, state VARCHAR, city VARCHAR, zip VARCHAR, max_results INT) → TABLE`
 
 Finds intersections of two streets. Joins candidate edges on shared TIGER node IDs (`tnidf`/`tnidt`) — not `ST_Intersects` — which means intersecting edges are found in O(joins) rather than O(spatial).

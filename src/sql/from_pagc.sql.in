@@ -4,6 +4,11 @@
 -- LoadInternal but swallowed if those aren't resolvable; users who need
 -- from_pagc must LOAD us_address_standardizer, then LOAD us_geocoder again.
 --
+-- The 4-arg form of standardize_address takes (lex_table, gaz_table,
+-- rules_table, raw_text). The community extension ships a convenience
+-- loader `load_us_address_data()` that populates us_lex / us_gaz /
+-- us_rules in the `main` schema; LoadInternal calls it best-effort.
+--
 -- The COALESCE cascade on location/state_abbrev/zip is load-bearing
 -- for PostGIS parity — standardize_address sometimes leaves those empty
 -- on addresses where parse_address's blunter regex picks them up.
@@ -22,6 +27,65 @@ CREATE OR REPLACE MACRO @TIGER@.from_pagc(raw_text) AS (
                            NULLIF(split_part(COALESCE(sa.r.postcode, ''), '-', 1), ''),
                            NULLIF(pa.r.zip, '')))
     )::@TIGER@.geocode_input
-    FROM (SELECT standardize_address(raw_text) AS r) sa,
+    FROM (SELECT standardize_address('us_lex', 'us_gaz', 'us_rules', raw_text) AS r) sa,
          (SELECT parse_address(raw_text) AS r) pa
+);
+
+-- Redefine tiger.geocode with BOTH overloads: the 4-arg struct form (as
+-- defined in geocode.sql.in) plus a new 1-arg VARCHAR shortcut that
+-- internally calls from_pagc() and dispatches to the 4-arg form with
+-- defaults.
+--
+-- Two subtleties:
+--
+-- 1. DuckDB macro overloading requires all overloads to be in a SINGLE
+--    CREATE OR REPLACE statement (comma-separated bodies). Separate CREATE
+--    statements against the same name are "replace," not "add." Hence the
+--    4-arg body is restated here, kept in sync with geocode.sql.in.
+--
+-- 2. This redefinition only succeeds when from_pagc() registered successfully
+--    above, which requires us_address_standardizer to be loaded. If the
+--    standardizer is absent, the earlier from_pagc CREATE fails, this file
+--    aborts, and only the 4-arg geocode (from geocode.sql.in) remains —
+--    struct-input users unaffected.
+CREATE OR REPLACE MACRO @TIGER@.geocode(
+    input_geocode_input,
+    max_results,
+    restrict_geom,
+    require_containment
+) AS TABLE (
+    WITH
+    stage_a AS (
+        SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
+        FROM @TIGER@.geocode_address_impl(input_geocode_input, max_results, restrict_geom, 2.0)
+    ),
+    stage_b AS (
+        SELECT addy, geom, rating,
+               NULL::VARCHAR AS block_geoid,
+               NULL::VARCHAR AS tract_geoid,
+               NULL::VARCHAR AS blkgrp_geoid,
+               false AS containment_guaranteed
+        FROM @TIGER@.geocode_location_impl(input_geocode_input, restrict_geom)
+        WHERE NOT EXISTS (SELECT 1 FROM stage_a)
+    ),
+    combined AS (
+        SELECT * FROM stage_a
+        UNION ALL
+        SELECT * FROM stage_b
+    )
+    SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
+    FROM combined
+    WHERE require_containment IS NULL
+       OR require_containment = 'none'
+       OR (require_containment IN ('block', 'tract', 'blkgrp') AND containment_guaranteed)
+    ORDER BY rating
+    LIMIT max_results
+),
+(raw_text) AS TABLE (
+    SELECT * FROM @TIGER@.geocode(
+        @TIGER@.from_pagc(raw_text),
+        10,       -- max_results
+        NULL,     -- restrict_geom
+        'none'    -- require_containment
+    )
 );

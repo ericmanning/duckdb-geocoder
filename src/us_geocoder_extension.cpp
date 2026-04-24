@@ -95,6 +95,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TryRegisterOptional(conn, us_geocoder::ReverseGeocodeSql(), kDefaultTigerSchema);
 	conn.Commit();
 
+	// us_address_standardizer's standardize_address() needs lex/gaz/rules
+	// tables in `main` to resolve at call time. The community ext ships a
+	// convenience loader that populates them from bundled defaults. We
+	// auto-call it best-effort here so that `tiger.from_pagc()` and the
+	// arity-1 `tiger.geocode(VARCHAR)` overload work out of the box once
+	// us_address_standardizer is loaded.
+	ExtensionHelper::TryAutoLoadExtension(db, "us_address_standardizer");
+	{
+		auto r = conn.Query("SELECT load_us_address_data()");
+		(void)r; // silently no-op if the standardizer ext is absent.
+	}
 	conn.BeginTransaction();
 	TryRegisterOptional(conn, us_geocoder::FromPagcSql(), kDefaultTigerSchema);
 	conn.Commit();

@@ -13,10 +13,12 @@
 -- conservative; the three values are equivalent until dissolved polygons
 -- are materialized in a follow-up).
 --
--- Raw VARCHAR input is not a separate overload (DuckDB can't dispatch by
--- arg type at one arg count): users with raw strings call
---   tiger.geocode(tiger.from_pagc('1731 New Hampshire Ave NW ...'))
--- The from_pagc adapter only resolves if us_address_standardizer is loaded.
+-- This file defines the 4-arg struct-input overload only. When
+-- us_address_standardizer is available, from_pagc.sql.in *redefines*
+-- tiger.geocode to have both the 4-arg form (repeated from here, kept in
+-- sync) and a 1-arg VARCHAR shortcut. If the standardizer is absent, only
+-- this 4-arg version remains. If you edit the 4-arg body below, edit the
+-- identical block in from_pagc.sql.in too.
 
 CREATE OR REPLACE MACRO @TIGER@.geocode(
     input_geocode_input,

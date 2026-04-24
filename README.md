@@ -95,6 +95,17 @@ SELECT * FROM tiger.geocode(...);
 
 ## Geocode
 
+The quickest path — a free-form single-string address:
+
+```sql
+SELECT rating, (addy).address, (addy).street_name, ST_AsText(geom), block_geoid
+FROM tiger.geocode('120 Benefit St, Providence RI 02903');
+```
+
+This routes through [`tiger.from_pagc()`](docs/api.md) (PAGC standardizer) and dispatches to the full geocoder with defaults (`max_results=10`, no spatial restriction, no containment filter). Requires `us_address_standardizer` to be installed — auto-loaded on first use.
+
+For full control, pass a `geocode_input` struct and tune `max_results` / `restrict_geom` / `require_containment`:
+
 ```sql
 SELECT rating, (addy).address, (addy).street_name, (addy).location,
        ST_AsText(geom), block_geoid, tract_geoid, containment_guaranteed
@@ -124,6 +135,28 @@ tract_geoid=44007003100, containment_guaranteed=true
 
 See [docs/api.md](docs/api.md) for the full reference, including `geocode_intersection`, `reverse_geocode`, and the rating scale.
 
+### Batch: a table of addresses
+
+Vectorize across a whole table via `CROSS JOIN LATERAL`:
+
+```sql
+WITH inputs AS (
+    SELECT id, address AS _raw FROM my_table   -- alias to avoid a name clash below
+)
+SELECT inputs.id, inputs._raw AS address,
+       g.rating, ST_X(g.geom) AS lng, ST_Y(g.geom) AS lat,
+       g.block_geoid, g.containment_guaranteed
+FROM inputs
+CROSS JOIN LATERAL tiger.geocode(_raw) AS g;
+```
+
+Two DuckDB binder quirks worth knowing:
+
+- **Reference the column unqualified inside the LATERAL call** (`tiger.geocode(_raw)`, not `tiger.geocode(inputs._raw)`). When the outer source is a CTE, DuckDB mis-parses `alias.col` as struct-field access on a row.
+- **Don't reuse the CSV column name as an output alias.** `SELECT ... address` while the input column is also `address` triggers "column cannot be referenced before it is defined." Rename one side (the CTE column, above) to avoid the clash.
+
+Working end-to-end scripts in [scripts/demo/](scripts/demo/): `build_nj_db.sql` builds a portable NJ reference DB from the Census CDN, then `geocode_addresses.sql` (structured input) and `geocode_raw.sql` (free-form single-string input) each read a CSV and write a geocoded CSV.
+
 ## Runtime dependencies
 
 | ext | source | required for |
@@ -138,7 +171,7 @@ See [docs/api.md](docs/api.md) for the full reference, including `geocode_inters
 ```sh
 git submodule update --init --recursive
 make release                   # ~10 min first time (builds duckdb from source)
-make test                      # 216 assertions across 14 sqllogictest files
+make test                      # 218 assertions across 14 sqllogictest files
 ```
 
 The build produces a loadable extension at `build/release/extension/us_geocoder/us_geocoder.duckdb_extension` and a DuckDB CLI at `build/release/duckdb` with the extension statically linked.
@@ -158,51 +191,19 @@ Benchmarked on TIGER 2025 Rhode Island (136K edges, 126K featnames, 105K addr) o
 
 ### Faster HTTP loads
 
-The Census CDN path issues one HTTPS fetch per `(county, table-type)` via GDAL's `/vsicurl/`, which doesn't parallelize well for large states. For NJ / NY / CA etc., pre-download into a Census-nested local mirror via `wget --mirror` (or parallel `curl`) and point the loader at the local copy:
+The Census CDN path issues one HTTPS fetch per `(county, table-type)` via GDAL's `/vsicurl/`, which doesn't parallelize well for large states (NJ ≈ 8 min, CA ≈ 30 min). The fix is a parallel pre-download into a Census-nested local mirror + local ingest:
 
 ```sh
-# Mirror the Census tree for NJ (statefp 34) + nation-level zips.
-# Keeps the STATE/, EDGES/, FACES/, … subdirectory structure the loader expects.
-DEST=/tmp/tiger_nj
-ROOT=https://www2.census.gov/geo/tiger/TIGER2025
-mkdir -p $DEST
-wget -q -nH --cut-dirs=3 -x -P $DEST \
-     -A 'tl_2025_us_*.zip,tl_2025_34_*.zip,tl_2025_34???_*.zip' \
-     -r -np -l 2 $ROOT/ 2>/dev/null
+./scripts/parallel_download_state.sh NJ ./tiger_nj        # ~26 s for all 89 NJ zips
+./build/release/duckdb tiger_nj.duckdb <<'EOF'
+CALL load_tiger_nation('./tiger_nj');
+CALL load_tiger_state('NJ', './tiger_nj');                -- ~3-4 min local ingest
+EOF
 ```
 
-Or, for only the tables the geocoder uses, hand-roll a parallel curl loop:
+The script uses `xargs -P 16 curl` and scrapes the Census directory index for county-level enumeration — no hardcoded per-state FIPS list. See [scripts/parallel_download_state.sh](scripts/parallel_download_state.sh) for knobs (parallelism, year, destination).
 
-```sh
-DEST=/tmp/tiger_nj; ROOT=https://www2.census.gov/geo/tiger/TIGER2025
-mkdir -p $DEST/{STATE,COUNTY,ZCTA520,PLACE,COUSUB,EDGES,FACES,FEATNAMES,ADDR}
-
-# nation-level
-for f in STATE/tl_2025_us_state.zip COUNTY/tl_2025_us_county.zip ZCTA520/tl_2025_us_zcta520.zip; do
-  curl -sS -o $DEST/$f $ROOT/$f &
-done
-# state-level
-for f in PLACE/tl_2025_34_place.zip COUSUB/tl_2025_34_cousub.zip; do
-  curl -sS -o $DEST/$f $ROOT/$f &
-done
-# county-level (NJ FIPS 34; counties run 001..041 odd)
-for c in $(seq -f "%03g" 1 2 41); do
-  for sub in EDGES FACES FEATNAMES ADDR; do
-    curl -sS -o $DEST/$sub/tl_2025_34${c}_$(echo $sub | tr A-Z a-z).zip \
-         $ROOT/$sub/tl_2025_34${c}_$(echo $sub | tr A-Z a-z).zip &
-    (( $(jobs -r | wc -l) >= 8 )) && wait -n
-  done
-done
-wait
-```
-
-Then:
-```sql
-CALL load_tiger_nation('/tmp/tiger_nj');
-CALL load_tiger_state('NJ', '/tmp/tiger_nj');  -- ~2 min total
-```
-
-A genuinely-parallel HTTP mode inside the loader is a v0.2 target. Attempts with `UNION ALL`-of-`ST_Read` batching didn't parallelize in practice (DuckDB 1.5 + duckdb-spatial), so v0.1 ships the serial fetch plus this workaround.
+A genuinely-parallel HTTP mode inside the loader (`httpfs` + `read_blob()` prefetch, eliminating the need for a shell script) is a v0.2 target.
 
 ## License
 
