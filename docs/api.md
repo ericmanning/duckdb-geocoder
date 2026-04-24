@@ -1,15 +1,19 @@
 # API reference
 
-All functions live in the `tiger` schema of whatever database `LOAD us_geocoder` was first invoked against. For v0.1, the schema name is fixed at `tiger`; cross-catalog / portable-DB attach patterns are on the roadmap (see [README § Runtime dependencies](../README.md) and the spec's `reference_db`/`reference_schema` section).
+All functions live in the `tiger` schema of whatever database `LOAD us_geocoder` was first invoked against. The schema name is fixed at `tiger` in the local catalog — that's where the macros, lookup tables, and (by default) the 13 TIGER data tables live.
+
+The **data tables** can be repointed to an attached catalog via [`set_tiger_reference`](#set_tiger_referencedatabase-varchar-schema-varchar-default-tiger--table) without touching the macros. See [§ Reference databases](#reference-databases).
 
 ## Loaders
 
-### `load_tiger_nation([source VARCHAR], year INT DEFAULT 2025) → TABLE(step VARCHAR, rows_loaded BIGINT)`
+### `load_tiger_nation([source VARCHAR], year INT DEFAULT 2025, target_db VARCHAR DEFAULT NULL, target_schema VARCHAR DEFAULT 'tiger') → TABLE(step VARCHAR, rows_loaded BIGINT)`
 
-Loads three nation-wide TIGER tables into the `tiger` schema: `state` (56 rows), `county` (~3,200), `zcta5` (~33,800). Must run **before** any `load_tiger_state` call — the state loader enumerates counties from the `tiger.county` table populated here.
+Loads three nation-wide TIGER tables into the target schema: `state` (56 rows), `county` (~3,200), `zcta5` (~33,800). Must run **before** any `load_tiger_state` call — the state loader enumerates counties from the `county` table populated here.
 
 - `source` — optional URL or local filesystem path. When omitted (or empty), defaults to `https://www2.census.gov/geo/tiger/TIGER<year>` and auto-loads the `httpfs` extension.
 - `year` — TIGER vintage; default `2025`.
+- `target_db` — attached catalog name to write into. `NULL` (default) means the current database.
+- `target_schema` — schema name inside the target catalog; default `tiger`. Created idempotently.
 
 Emits one summary row per loaded file. Idempotent: re-running skips rows that already exist (checked by FIPS / GEOID).
 
@@ -19,38 +23,121 @@ CALL load_tiger_nation(year := 2025);                     -- from Census CDN
 CALL load_tiger_nation('/data/tiger_2025', year := 2025); -- from local dir
 ```
 
-### `load_tiger_state(state_abbrev VARCHAR, [source VARCHAR], year INT DEFAULT 2025) → TABLE(step VARCHAR, rows_loaded BIGINT)`
+### `load_tiger_state(state_abbrev VARCHAR, [source VARCHAR], year INT DEFAULT 2025, target_db VARCHAR DEFAULT NULL, target_schema VARCHAR DEFAULT 'tiger') → TABLE(step VARCHAR, rows_loaded BIGINT)`
 
 Loads a single state's TIGER data: state-level `place` and `cousub`, county-level `edges`, `faces`, `featnames`, `addr` (for every county in the state), and the derived `zip_state`, `zip_state_loc`, `zip_lookup_base`, `edge_containment` tables.
 
 - `state_abbrev` — 2-letter postal code, case-insensitive (`'RI'`, `'ri'`, `'Ri'` all work).
 - `source` / `year` — same as `load_tiger_nation`.
+- `target_db` / `target_schema` — same as `load_tiger_nation`. Must match the target used for `load_tiger_nation` (the state loader reads `<target>.county` to enumerate counties).
 
 Idempotent via **DELETE-first**: re-running wipes all rows for that state before reinserting.
 
 ```sql
-CALL load_tiger_state('RI');                                 -- from Census, year default 2025
+CALL load_tiger_state('RI');                                 -- from Census, into tiger.* locally
 CALL load_tiger_state('RI', '/data/tiger_2025', year := 2025);
+CALL load_tiger_state('RI', target_db := 'work');            -- write to attached 'work' catalog
 ```
 
-### Local source layouts
+### `load_tiger_states(states VARCHAR[], [source VARCHAR], year INT DEFAULT 2025, target_db VARCHAR DEFAULT NULL, target_schema VARCHAR DEFAULT 'tiger') → TABLE(step VARCHAR, rows_loaded BIGINT)`
 
-Local sources expect a **flat** layout — all zips in one directory:
+Same as `load_tiger_state` but accepts a list of abbreviations. States are loaded sequentially in the order provided; the output row stream interleaves `begin:<ABBREV>` / per-file / `done:<ABBREV>` markers so you can tail progress.
+
+Case-insensitive and deduped — `['ri','RI']` loads RI once. Unknown abbreviations fail at bind time.
+
+```sql
+CALL load_tiger_states(['RI','MA','CT']);
+CALL load_tiger_states(['RI','MA','CT'], '/data/tiger_2025');
+CALL load_tiger_states(['RI','MA','CT'], target_db := 'work');
+```
+
+### `load_tiger_all_states([source VARCHAR], year INT DEFAULT 2025, target_db VARCHAR DEFAULT NULL, target_schema VARCHAR DEFAULT 'tiger') → TABLE(step VARCHAR, rows_loaded BIGINT)`
+
+Convenience wrapper over `load_tiger_states` that enumerates the 50 states + DC from `state_lookup`. Concretely: `SELECT abbrev FROM tiger.state_lookup WHERE CAST(statefp AS INTEGER) BETWEEN 1 AND 56` — the Census FIPS scheme reserves 01–56 for the 50 states + DC (with gaps at 03/07/14/43/52) and ≥60 for territories (AS, GU, MP, PR, VI) and freely-associated states (FM, MH, PW). Call `load_tiger_states(['PR',...])` explicitly if you need those.
+
+```sql
+CALL load_tiger_all_states();                                    -- ~3-4 hours over Census CDN
+CALL load_tiger_all_states('/data/tiger_2025');                  -- from local mirror, faster
+CALL load_tiger_all_states(target_db := 'tiger_us_2025');        -- build a portable reference DB
+```
+
+You'll typically want to run `load_tiger_nation` first with the same target; the state loader reads from `<target>.county`. A full nation + all-states load to a single `.duckdb` file is the canonical way to build a portable reference (§ Reference databases).
+
+### Local source layout
+
+Local sources use the **Census-nested** layout — a (partial) mirror of `https://www2.census.gov/geo/tiger/TIGER<year>/` with one subdirectory per table-type:
+
 ```
 /data/tiger_2025/
-  tl_2025_us_state.zip
-  tl_2025_us_county.zip
-  tl_2025_us_zcta520.zip
-  tl_2025_44_place.zip
-  tl_2025_44_cousub.zip
-  tl_2025_44001_edges.zip
-  tl_2025_44001_faces.zip
-  tl_2025_44001_featnames.zip
-  tl_2025_44001_addr.zip
-  … (and 4 more per county)
+  STATE/tl_2025_us_state.zip
+  COUNTY/tl_2025_us_county.zip
+  ZCTA520/tl_2025_us_zcta520.zip
+  PLACE/tl_2025_44_place.zip
+  COUSUB/tl_2025_44_cousub.zip
+  EDGES/tl_2025_44007_edges.zip
+  FACES/tl_2025_44007_faces.zip
+  FEATNAMES/tl_2025_44007_featnames.zip
+  ADDR/tl_2025_44007_addr.zip
+  …
 ```
 
-If you mirrored the Census tree (nested `STATE/`, `EDGES/`, etc.), either flatten or make one call per subdir. HTTP sources always follow the Census nested layout automatically.
+This is what `wget --mirror` against the Census FTP produces out of the box. The HTTP source mode uses the same subdirectory convention, so swapping between HTTP and local is a one-line change.
+
+Other layouts are **not** supported in v0.1:
+
+- Flat-in-one-directory (all zips in `/data/tiger_2025/` with no `EDGES/`, `FACES/`, … subdirs) — fails because the loader always inserts the Census subdir when constructing the `/vsizip/` path.
+- Pre-extracted shapefiles (unzipped `.shp` + `.dbf` + `.shx` on disk) — fails because the loader always wraps in `/vsizip/`, which requires a real zip.
+
+Unzip and flattening are explicit out-of-scope; a user who wants either can either rewrap (zip the files back up, or create symlinks with the expected nested structure) or open an issue for explicit support.
+
+---
+
+## Reference databases
+
+The geocoder macros (`tiger.geocode`, `tiger.reverse_geocode`, `tiger.geocode_intersection`, and their helpers) always live in the local `tiger` schema. The 13 **data tables** (`state`, `county`, `place`, `cousub`, `zcta5`, `zip_state`, `zip_state_loc`, `zip_lookup_base`, `edges`, `faces`, `featnames`, `addr`, `edge_containment`) can be either base tables in the current catalog or views pointing at an attached catalog.
+
+### `install_tiger_schema(database VARCHAR, schema VARCHAR DEFAULT 'tiger') → TABLE(step VARCHAR, rows_loaded BIGINT)`
+
+Creates the TIGER data schema + 13 empty tables in an attached catalog. Idempotent (safe to re-run; existing rows are preserved). Pass `database := ''` to target the current catalog.
+
+```sql
+ATTACH 'tiger_ref.duckdb' AS ref;
+CALL install_tiger_schema('ref');          -- creates ref.tiger.*
+CALL install_tiger_schema('ref', 'tgr25'); -- creates ref.tgr25.*
+```
+
+The loaders call this automatically when `target_db` is set, so you only need `install_tiger_schema` explicitly if you want an empty-but-valid schema (e.g. to hand-populate for tests) or are building a reference DB via some other ETL.
+
+### `set_tiger_reference([database VARCHAR [, schema VARCHAR DEFAULT 'tiger']]) → TABLE(table VARCHAR, kind VARCHAR)`
+
+Swaps the 13 local `tiger.<table>` between base-table form and view form.
+
+- **No args / `NULL` / empty string first arg** — drops any existing local `tiger.<data_table>` (view or base table) and recreates empty base tables. Use this to "unbind" from an attached reference.
+- **`database` non-empty** — drops the local tables and recreates them as `VIEW tiger.<t> AS SELECT * FROM <database>.<schema>.<t>`. Reads through those views land in the attached catalog; macros, lookup tables, and everything else stay local.
+
+Emits one row per data table with `kind ∈ {'base_table', 'view'}`.
+
+```sql
+-- Mode B: attached read-write
+ATTACH 'work.duckdb' AS work;
+CALL load_tiger_state('RI', target_db := 'work');
+CALL set_tiger_reference('work');
+SELECT * FROM tiger.geocode(...);          -- reads from work.tiger.*
+
+-- Mode C: portable, read-only
+ATTACH 'tiger_us_2025.duckdb' AS ref (READ_ONLY);
+CALL set_tiger_reference('ref');
+SELECT * FROM tiger.geocode(...);
+
+-- Reset to empty local base tables:
+CALL set_tiger_reference();
+```
+
+**Caveats.**
+
+- `set_tiger_reference()` with no args is **destructive to local data tables** — any rows previously loaded via `load_tiger_state()` into the local `tiger.*` are dropped. Reload after resetting.
+- The attached catalog must already contain the 13 tables with the expected columns. `install_tiger_schema` + the loader's `target_db` are the sanctioned way to build one.
+- Lookup dictionaries (`state_lookup`, `street_type_lookup`, `direction_lookup`, `secondary_unit_lookup`) are not affected — they live in the local `tiger` schema and are seeded by the extension at load time.
 
 ---
 

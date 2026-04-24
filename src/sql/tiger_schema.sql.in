@@ -7,6 +7,8 @@
 -- best-effort by LoadInternal; if spatial isn't loaded, DDL fails and
 -- the tables are absent.
 
+CREATE SCHEMA IF NOT EXISTS @TIGER@;
+
 -- Nation-level reference tables
 CREATE TABLE IF NOT EXISTS @TIGER@.state (
     statefp   VARCHAR,

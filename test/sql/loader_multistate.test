@@ -1,0 +1,56 @@
+# name: test/sql/loader_multistate.test
+# description: load_tiger_state[s] + load_tiger_all_states — binder-level checks.
+#              We don't actually fetch/read TIGER shapefiles here (that requires
+#              fixtures on disk); we just verify the bind paths, argument
+#              handling, and error messages.
+
+require us_geocoder
+
+# --- load_tiger_state with a bogus abbrev fails at bind time -----------------
+statement error
+CALL load_tiger_state('ZZ');
+----
+unknown state abbreviation 'ZZ'
+
+# --- load_tiger_states (plural, VARCHAR[] arg) ------------------------------
+statement error
+CALL load_tiger_states(['ZZ']);
+----
+unknown state abbreviation 'ZZ'
+
+# Mixing a valid + invalid abbrev: fails on the invalid one.
+statement error
+CALL load_tiger_states(['RI', 'ZZ']);
+----
+unknown state abbreviation 'ZZ'
+
+# An empty list has no states to load; bind rejects it.
+statement error
+CALL load_tiger_states(CAST([] AS VARCHAR[]));
+----
+no state abbreviations provided
+
+# --- load_tiger_all_states binds but fails on the fetch stage ----------------
+# All 51 abbrevs must resolve; the function will then try to actually fetch
+# TIGER data, which needs a valid source. We pass an invalid local path so
+# the bind + state resolution succeeds and the error comes from the fetch
+# phase (confirms 51 states resolved without issue).
+statement error
+CALL load_tiger_all_states('/nonexistent/path/used/for/testing');
+----
+us_geocoder loader
+
+# --- named-param source is accepted -----------------------------------------
+statement error
+CALL load_tiger_state('RI', source := '/nonexistent/tiger');
+----
+us_geocoder loader
+
+# --- Case-insensitive + dedup in the list -----------------------------------
+# 'ri', 'RI', 'Ri' should all dedup to one state; with only invalid dupes the
+# error surfaces on the unique fetch. With a valid single abbrev in different
+# cases, bind succeeds and the fetch fails at the first nonexistent file.
+statement error
+CALL load_tiger_states(['ri', 'RI'], '/nonexistent/tiger');
+----
+us_geocoder loader

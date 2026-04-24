@@ -57,35 +57,49 @@ struct LoaderResult {
 };
 
 struct LoaderBindData : public FunctionData {
-	explicit LoaderBindData(std::string tiger_schema) : tiger_schema(std::move(tiger_schema)) {
+	explicit LoaderBindData(std::string func_schema) : func_schema(std::move(func_schema)) {
+		data_location = this->func_schema; // default: write to same place macros live
 	}
-	std::string tiger_schema;
+	// Where the macros/lookup tables live (always local "tiger" in current catalog).
+	std::string func_schema;
+	// Where the TIGER data tables live. Equals func_schema for in-DB loads; becomes
+	// "<target_db>.<target_schema>" when the user passes target_db. Used as @TIGER@
+	// in templates; func_schema is used as @FUNC@.
+	std::string data_location;
+	// For bootstrap: the unqualified schema name on the target side (e.g. "tiger").
+	// Used when rendering tiger_schema.sql.in against the target DB.
+	std::string target_schema = "tiger";
+	std::string target_db; // empty → current catalog
 
 	// For load_tiger_nation
 	std::string source;
 	int32_t year = 2025;
 
-	// For load_tiger_state — adds these:
-	std::string state_abbrev; // e.g. "RI"
-	std::string state_fips;   // resolved at bind time
+	// For load_tiger_state / load_tiger_states / load_tiger_all_states:
+	// one entry per state to load, resolved at bind time.
+	struct StatePlan { std::string abbrev; std::string fips; };
+	std::vector<StatePlan> states;
 
 	bool is_state_loader = false;
 
 public:
 	unique_ptr<FunctionData> Copy() const override {
-		auto copy = make_uniq<LoaderBindData>(tiger_schema);
+		auto copy = make_uniq<LoaderBindData>(func_schema);
+		copy->data_location = data_location;
+		copy->target_schema = target_schema;
+		copy->target_db = target_db;
 		copy->source = source;
 		copy->year = year;
-		copy->state_abbrev = state_abbrev;
-		copy->state_fips = state_fips;
+		copy->states = states;
 		copy->is_state_loader = is_state_loader;
 		return std::move(copy);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<LoaderBindData>();
-		return tiger_schema == other.tiger_schema && source == other.source && year == other.year &&
-		       state_abbrev == other.state_abbrev && is_state_loader == other.is_state_loader;
+		return func_schema == other.func_schema && data_location == other.data_location &&
+		       source == other.source && year == other.year &&
+		       is_state_loader == other.is_state_loader && states.size() == other.states.size();
 	}
 };
 
@@ -115,16 +129,16 @@ static std::string ZeroPad(const std::string &s, size_t width) {
 // featnames and addr are DBF-only (no geometry). GDAL can read both via
 // ST_Read() — pass the correct inner extension.
 //
-// Source handling:
-//   * http:// or https:// URL → /vsizip//vsicurl/<url>/<SUBDIR>/<zip>/<inner>
-//     Census organizes TIGER by table-type subdirectory (STATE/, EDGES/,
-//     etc.), so HTTP paths always include the subdir. The double slash
-//     after /vsizip/ is required; it tells GDAL the next token is another
-//     VSI handler (vsicurl), not a local path.
-//   * Local filesystem path → /vsizip/<path>/<zip>/<inner>
-//     Local mode defaults to flat layout (all zips in one directory).
-//     Users who mirrored the Census tree can pass `.../TIGER2025/STATE`
-//     etc. as the source for each call, or flatten their local mirror.
+// Both local and HTTP sources use the Census **nested** layout:
+//   <source>/<SUBDIR>/<zip_base>.zip         — e.g. <root>/EDGES/tl_2025_44007_edges.zip
+//
+// For HTTP, we prefix /vsizip//vsicurl/ (double slash tells GDAL that the
+// next token is another VSI handler, not a local path).
+//
+// For local sources, the user passes the root of a (partial) mirror of
+// https://www2.census.gov/geo/tiger/TIGER<year>/ — exactly what `wget -r`
+// or a manual download-by-directory script produces. There is no flat
+// layout in v0.1; put the zips under STATE/, EDGES/, etc. directories.
 static std::string BuildVsiPath(const std::string &source, const std::string &subdir,
                                 const std::string &zip_base,
                                 const std::string &inner_ext = "shp") {
@@ -133,10 +147,11 @@ static std::string BuildVsiPath(const std::string &source, const std::string &su
 	if (!src.empty() && src.back() != '/') {
 		src += '/';
 	}
+	const std::string inner = zip_base + "." + inner_ext;
 	if (is_http) {
-		return "/vsizip//vsicurl/" + src + subdir + "/" + zip_base + ".zip/" + zip_base + "." + inner_ext;
+		return "/vsizip//vsicurl/" + src + subdir + "/" + zip_base + ".zip/" + inner;
 	}
-	return "/vsizip/" + src + zip_base + ".zip/" + zip_base + "." + inner_ext;
+	return "/vsizip/" + src + subdir + "/" + zip_base + ".zip/" + inner;
 }
 
 // Run one INSERT statement against a Connection, return the number of rows
@@ -161,6 +176,95 @@ static int64_t ExecuteInsert(Connection &conn, const std::string &sql, const std
 	}
 }
 
+// DuckDB identifier quoting: wrap in double quotes and escape any embedded ".
+// Used for target_db / target_schema, which may contain mixed case or awkward
+// names the user chose for their ATTACH alias.
+static std::string QuoteIdent(const std::string &s) {
+	std::string out = "\"";
+	for (char c : s) {
+		if (c == '"') {
+			out += "\"\"";
+		} else {
+			out += c;
+		}
+	}
+	out += "\"";
+	return out;
+}
+
+// Resolve target_db / target_schema named params into a qualified data location
+// ("schema" or "db.schema"). Also stashes them on the bind data so the bootstrap
+// pass knows where to create the schema.
+static void ApplyTargetParams(LoaderBindData &bind, const TableFunctionBindInput &input) {
+	auto db_it = input.named_parameters.find("target_db");
+	if (db_it != input.named_parameters.end() && !db_it->second.IsNull()) {
+		bind.target_db = StringValue::Get(db_it->second);
+	}
+	auto schema_it = input.named_parameters.find("target_schema");
+	if (schema_it != input.named_parameters.end() && !schema_it->second.IsNull()) {
+		auto s = StringValue::Get(schema_it->second);
+		if (!s.empty()) {
+			bind.target_schema = s;
+		}
+	}
+	if (bind.target_db.empty()) {
+		bind.data_location = bind.target_schema; // e.g. "tiger"
+	} else {
+		bind.data_location = QuoteIdent(bind.target_db) + "." + QuoteIdent(bind.target_schema);
+	}
+}
+
+// Ensure the target catalog.schema has the 13 TIGER data tables (+ schema).
+// Renders tiger_schema.sql.in with @TIGER@ → data_location. Idempotent: all
+// statements are CREATE TABLE/SCHEMA IF NOT EXISTS. This makes the loader
+// self-sufficient even when writing to a freshly-attached empty DB.
+static void BootstrapTargetSchema(Connection &conn, const LoaderBindData &bind) {
+	if (bind.data_location == bind.func_schema) {
+		return; // default "tiger" location; already created by LoadInternal.
+	}
+	auto rendered = ApplySubstitutions(TigerSchemaSql(), {{"@TIGER@", bind.data_location}});
+	auto result = conn.Query(rendered);
+	if (result->HasError()) {
+		throw IOException("us_geocoder loader (bootstrap %s): %s", bind.data_location, result->GetError());
+	}
+}
+
+// Census default source URL for a given year.
+static std::string CensusUrl(int year) {
+	return "https://www2.census.gov/geo/tiger/TIGER" + std::to_string(year);
+}
+
+// Read year + source + target_db/schema from a TableFunctionBindInput and
+// populate the bind data. `source_input_index` is the positional slot that
+// accepts the source string on this overload (-1 to disable positional).
+// source is also accepted via the `source` named parameter.
+static void ApplyYearSourceTarget(LoaderBindData &bind, const TableFunctionBindInput &input,
+                                   int source_input_index) {
+	auto year_it = input.named_parameters.find("year");
+	if (year_it != input.named_parameters.end() && !year_it->second.IsNull()) {
+		bind.year = year_it->second.GetValue<int32_t>();
+	}
+	ApplyTargetParams(bind, input);
+	bool found_source = false;
+	if (source_input_index >= 0 && static_cast<int>(input.inputs.size()) > source_input_index &&
+	    !input.inputs[source_input_index].IsNull() &&
+	    !StringValue::Get(input.inputs[source_input_index]).empty()) {
+		bind.source = StringValue::Get(input.inputs[source_input_index]);
+		found_source = true;
+	}
+	if (!found_source) {
+		auto src_it = input.named_parameters.find("source");
+		if (src_it != input.named_parameters.end() && !src_it->second.IsNull() &&
+		    !StringValue::Get(src_it->second).empty()) {
+			bind.source = StringValue::Get(src_it->second);
+			found_source = true;
+		}
+	}
+	if (!found_source) {
+		bind.source = CensusUrl(bind.year);
+	}
+}
+
 // Resolve state abbrev → 2-digit FIPS via the lookup table.
 static std::string LookupStateFips(Connection &conn, const std::string &schema, const std::string &abbrev) {
 	auto sql = "SELECT statefp FROM " + schema + ".state_lookup WHERE upper(abbrev) = upper('" + abbrev + "') LIMIT 1";
@@ -179,11 +283,6 @@ static std::string LookupStateFips(Connection &conn, const std::string &schema, 
 // load_tiger_nation(source VARCHAR, year INTEGER DEFAULT 2025)
 // =====================================================================
 
-// Census default source URL for a given year.
-static std::string CensusUrl(int year) {
-	return "https://www2.census.gov/geo/tiger/TIGER" + std::to_string(year);
-}
-
 static unique_ptr<FunctionData> LoadTigerNationBind(ClientContext &context, TableFunctionBindInput &input,
                                                      vector<LogicalType> &return_types,
                                                      vector<string> &names) {
@@ -192,19 +291,8 @@ static unique_ptr<FunctionData> LoadTigerNationBind(ClientContext &context, Tabl
 	return_types.emplace_back(LogicalType::BIGINT);
 	names.emplace_back("rows_loaded");
 
-	auto bind_data = make_uniq<LoaderBindData>("tiger"); // schema fixed in v0.1
-	auto year_it = input.named_parameters.find("year");
-	if (year_it != input.named_parameters.end() && !year_it->second.IsNull()) {
-		bind_data->year = year_it->second.GetValue<int32_t>();
-	}
-
-	// Positional arg: source (optional, defaults to Census URL).
-	if (input.inputs.empty() || input.inputs[0].IsNull() || StringValue::Get(input.inputs[0]).empty()) {
-		bind_data->source = CensusUrl(bind_data->year);
-	} else {
-		bind_data->source = StringValue::Get(input.inputs[0]);
-	}
-
+	auto bind_data = make_uniq<LoaderBindData>("tiger"); // local func/lookup schema
+	ApplyYearSourceTarget(*bind_data, input, /*source_input_index=*/0);
 	return std::move(bind_data);
 }
 
@@ -219,7 +307,9 @@ static void EnsureHttpfsIfRemote(DatabaseInstance &db, const std::string &source
 static void DoLoadNation(ClientContext &context, const LoaderBindData &bind, std::vector<LoaderResult> &out) {
 	EnsureHttpfsIfRemote(*context.db, bind.source);
 	Connection conn(*context.db);
-	const auto &schema = bind.tiger_schema;
+	BootstrapTargetSchema(conn, bind);
+	const auto &data_loc = bind.data_location;
+	const auto &func_loc = bind.func_schema;
 	const std::string year = std::to_string(bind.year);
 	const auto &tmpl = LoaderTemplatesSql();
 
@@ -242,7 +332,9 @@ static void DoLoadNation(ClientContext &context, const LoaderBindData &bind, std
 		}
 		auto vsi = BuildVsiPath(bind.source, step.subdir, zip_base);
 		auto section = ExtractSection(tmpl, step.section);
-		auto rendered = RenderTemplate(section, {{"@TIGER@", schema}, {"@VSIPATH@", vsi}});
+		auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc},
+		                                         {"@FUNC@", func_loc},
+		                                         {"@VSIPATH@", vsi}});
 		int64_t rows = ExecuteInsert(conn, rendered, step.section);
 		out.push_back({step.section, rows});
 	}
@@ -268,8 +360,57 @@ static void LoadTigerNationExecute(ClientContext &context, TableFunctionInput &d
 }
 
 // =====================================================================
-// load_tiger_state(state_abbrev VARCHAR, source VARCHAR, year INT DEFAULT 2025)
+// load_tiger_state(VARCHAR) — single state by abbrev (back-compat).
+// load_tiger_states(LIST<VARCHAR>) — multiple states in one call.
+// load_tiger_all_states() — every row of state_lookup with statefp ≤ 56
+//   (= 50 states + DC; excludes PR, VI, Guam, AS, MP).
+// All three land on the same LoaderBindData::states[] + DoLoadState per-state.
 // =====================================================================
+
+// Resolve a list of state abbreviations into LoaderBindData::states (in order).
+// Dedups case-insensitively while preserving first-occurrence order; errors on
+// any unknown abbrev.
+static void ResolveStates(Connection &conn, LoaderBindData &bind,
+                           const std::vector<std::string> &abbrevs) {
+	std::vector<std::string> seen;
+	for (const auto &raw : abbrevs) {
+		std::string up;
+		up.reserve(raw.size());
+		for (char c : raw) { up += static_cast<char>(std::toupper(static_cast<unsigned char>(c))); }
+		bool dup = false;
+		for (const auto &s : seen) { if (s == up) { dup = true; break; } }
+		if (dup) continue;
+		seen.push_back(up);
+		auto fips = LookupStateFips(conn, bind.func_schema, up);
+		bind.states.push_back({up, fips});
+	}
+	if (bind.states.empty()) {
+		throw BinderException("us_geocoder: no state abbreviations provided");
+	}
+}
+
+// Extract varchar abbrevs from a LIST<VARCHAR> Value (or a single scalar VARCHAR).
+static std::vector<std::string> AbbrevsFromValue(const Value &v, const char *context_fn) {
+	std::vector<std::string> out;
+	if (v.IsNull()) {
+		throw BinderException("%s: states argument is NULL", context_fn);
+	}
+	if (v.type().id() == LogicalTypeId::LIST) {
+		auto &children = ListValue::GetChildren(v);
+		for (const auto &child : children) {
+			if (child.IsNull()) continue;
+			auto s = StringValue::Get(child);
+			if (!s.empty()) out.push_back(s);
+		}
+	} else if (v.type().id() == LogicalTypeId::VARCHAR) {
+		auto s = StringValue::Get(v);
+		if (!s.empty()) out.push_back(s);
+	} else {
+		throw BinderException("%s: expected VARCHAR or VARCHAR[], got %s",
+		                      context_fn, v.type().ToString());
+	}
+	return out;
+}
 
 static unique_ptr<FunctionData> LoadTigerStateBind(ClientContext &context, TableFunctionBindInput &input,
                                                     vector<LogicalType> &return_types,
@@ -282,40 +423,89 @@ static unique_ptr<FunctionData> LoadTigerStateBind(ClientContext &context, Table
 	if (input.inputs.empty() || input.inputs[0].IsNull()) {
 		throw BinderException("load_tiger_state: state_abbrev is required");
 	}
-
 	auto bind_data = make_uniq<LoaderBindData>("tiger");
 	bind_data->is_state_loader = true;
-	bind_data->state_abbrev = StringValue::Get(input.inputs[0]);
-	auto it = input.named_parameters.find("year");
-	if (it != input.named_parameters.end() && !it->second.IsNull()) {
-		bind_data->year = it->second.GetValue<int32_t>();
-	}
-	// Positional source optional, defaults to Census URL.
-	if (input.inputs.size() < 2 || input.inputs[1].IsNull() || StringValue::Get(input.inputs[1]).empty()) {
-		bind_data->source = CensusUrl(bind_data->year);
-	} else {
-		bind_data->source = StringValue::Get(input.inputs[1]);
-	}
-
-	// Resolve state_fips now (fail fast if abbrev is invalid).
+	auto abbrevs = AbbrevsFromValue(input.inputs[0], "load_tiger_state");
+	ApplyYearSourceTarget(*bind_data, input, /*source_input_index=*/1);
 	Connection conn(*context.db);
-	bind_data->state_fips = LookupStateFips(conn, bind_data->tiger_schema, bind_data->state_abbrev);
-
+	ResolveStates(conn, *bind_data, abbrevs);
 	return std::move(bind_data);
 }
 
-static void DoLoadState(ClientContext &context, const LoaderBindData &bind, std::vector<LoaderResult> &out) {
+static unique_ptr<FunctionData> LoadTigerStatesBind(ClientContext &context, TableFunctionBindInput &input,
+                                                     vector<LogicalType> &return_types,
+                                                     vector<string> &names) {
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("step");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("rows_loaded");
+
+	if (input.inputs.empty() || input.inputs[0].IsNull()) {
+		throw BinderException("load_tiger_states: states (VARCHAR[]) is required");
+	}
+	auto bind_data = make_uniq<LoaderBindData>("tiger");
+	bind_data->is_state_loader = true;
+	auto abbrevs = AbbrevsFromValue(input.inputs[0], "load_tiger_states");
+	ApplyYearSourceTarget(*bind_data, input, /*source_input_index=*/1);
+	Connection conn(*context.db);
+	ResolveStates(conn, *bind_data, abbrevs);
+	return std::move(bind_data);
+}
+
+static unique_ptr<FunctionData> LoadTigerAllStatesBind(ClientContext &context, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types,
+                                                       vector<string> &names) {
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("step");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("rows_loaded");
+
+	auto bind_data = make_uniq<LoaderBindData>("tiger");
+	bind_data->is_state_loader = true;
+	ApplyYearSourceTarget(*bind_data, input, /*source_input_index=*/0);
+
+	// Enumerate 50 states + DC from the local state_lookup. The Census FIPS
+	// scheme reserves 01–56 for states/DC (with gaps at 03, 07, 14, 43, 52)
+	// and 57+ for territories + freely-associated states (AS=60, FM=64, GU=66,
+	// MH=68, MP=69, PW=70, PR=72, VI=78). No interspersing, so a BETWEEN filter
+	// on CAST(statefp AS INTEGER) is sufficient. Users who want territories
+	// pass the abbrev to load_tiger_states explicitly.
+	Connection conn(*context.db);
+	auto result = conn.Query("SELECT abbrev FROM " + bind_data->func_schema +
+	                          ".state_lookup WHERE CAST(statefp AS INTEGER) BETWEEN 1 AND 56 "
+	                          "ORDER BY CAST(statefp AS INTEGER)");
+	if (result->HasError()) {
+		throw IOException("us_geocoder load_tiger_all_states: %s", result->GetError());
+	}
+	std::vector<std::string> abbrevs;
+	while (auto row = result->Fetch()) {
+		for (idx_t i = 0; i < row->size(); ++i) {
+			auto v = row->GetValue(0, i);
+			if (!v.IsNull()) { abbrevs.push_back(v.GetValue<std::string>()); }
+		}
+	}
+	ResolveStates(conn, *bind_data, abbrevs);
+	return std::move(bind_data);
+}
+
+static void DoLoadState(ClientContext &context, const LoaderBindData &bind,
+                         const LoaderBindData::StatePlan &state,
+                         std::vector<LoaderResult> &out) {
 	EnsureHttpfsIfRemote(*context.db, bind.source);
 	Connection conn(*context.db);
-	const auto &schema = bind.tiger_schema;
-	const std::string &fips = bind.state_fips;
+	BootstrapTargetSchema(conn, bind);
+	const auto &data_loc = bind.data_location;
+	const auto &func_loc = bind.func_schema;
+	const std::string &fips = state.fips;
 	const std::string year = std::to_string(bind.year);
 	const auto &tmpl = LoaderTemplatesSql();
 
 	// Wipe existing rows for this state so the load is idempotent.
 	{
 		auto sec = ExtractSection(tmpl, "unload_state");
-		auto rendered = RenderTemplate(sec, {{"@TIGER@", schema}, {"@STATEFP@", fips}});
+		auto rendered = RenderTemplate(sec, {{"@TIGER@", data_loc},
+		                                     {"@FUNC@", func_loc},
+		                                     {"@STATEFP@", fips}});
 		auto result = conn.Query(rendered);
 		if (result->HasError()) {
 			throw IOException("us_geocoder loader (unload_state): %s", result->GetError());
@@ -337,15 +527,17 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, std:
 		if (pos != std::string::npos) zip_base.replace(pos, 4, fips);
 		auto vsi = BuildVsiPath(bind.source, s.subdir, zip_base);
 		auto section = ExtractSection(tmpl, s.section);
-		auto rendered = RenderTemplate(section, {{"@TIGER@", schema}, {"@VSIPATH@", vsi}});
+		auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc},
+		                                         {"@FUNC@", func_loc},
+		                                         {"@VSIPATH@", vsi}});
 		int64_t rows = ExecuteInsert(conn, rendered, s.section);
 		out.push_back({s.section, rows});
 	}
 
-	// Enumerate counties for this state from tiger.county (must be loaded first).
+	// Enumerate counties for this state from <data_loc>.county (must be loaded first).
 	std::vector<std::string> countyfps;
 	{
-		auto sql = "SELECT countyfp FROM " + schema + ".county WHERE statefp = '" + fips + "' ORDER BY countyfp";
+		auto sql = "SELECT countyfp FROM " + data_loc + ".county WHERE statefp = '" + fips + "' ORDER BY countyfp";
 		auto result = conn.Query(sql);
 		if (result->HasError()) {
 			throw IOException("us_geocoder loader (enumerate counties): %s", result->GetError());
@@ -360,9 +552,9 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, std:
 		}
 	}
 	if (countyfps.empty()) {
-		throw IOException("us_geocoder loader: no counties found for state %s (statefp=%s); "
-		                  "run load_tiger_nation() first to populate tiger.county",
-		                  bind.state_abbrev, fips);
+		throw IOException("us_geocoder loader: no counties found for state %s (statefp=%s) at %s; "
+		                  "run load_tiger_nation() first (with matching target_db/target_schema) to populate .county",
+		                  state.abbrev, fips, data_loc);
 	}
 
 	// County-level files. Per (county, table-type): load one shapefile/DBF
@@ -394,9 +586,11 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, std:
 			if (pos != std::string::npos) zip_base.replace(pos, 10, fips + cfp);
 			auto vsi = BuildVsiPath(bind.source, t.subdir, zip_base, t.ext);
 			auto insert_prefix = RenderTemplate(ExtractSection(tmpl, t.insert_section),
-			                                     {{"@TIGER@", schema}});
+			                                     {{"@TIGER@", data_loc},
+			                                      {"@FUNC@", func_loc}});
 			auto branch = RenderTemplate(ExtractSection(tmpl, t.branch_section),
-			                              {{"@TIGER@", schema},
+			                              {{"@TIGER@", data_loc},
+			                               {"@FUNC@", func_loc},
 			                               {"@VSIPATH@", vsi},
 			                               {"@STATEFP@", fips},
 			                               {"@COUNTYFP@", cfp}});
@@ -417,7 +611,9 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, std:
 	};
 	for (const auto *name : derived) {
 		auto section = ExtractSection(tmpl, name);
-		auto rendered = RenderTemplate(section, {{"@TIGER@", schema}, {"@STATEFP@", fips}});
+		auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc},
+		                                         {"@FUNC@", func_loc},
+		                                         {"@STATEFP@", fips}});
 		int64_t rows = ExecuteInsert(conn, rendered, name);
 		out.push_back({name, rows});
 	}
@@ -429,7 +625,13 @@ static void LoadTigerStateExecute(ClientContext &context, TableFunctionInput &da
 
 	if (!gstate.executed) {
 		gstate.executed = true;
-		DoLoadState(context, bind, gstate.results);
+		// Prepend a "begin:<ABBREV>" marker per state so users tailing output
+		// in a long batch (e.g. load_tiger_all_states) can see progress.
+		for (const auto &st : bind.states) {
+			gstate.results.push_back({"begin:" + st.abbrev, 0});
+			DoLoadState(context, bind, st, gstate.results);
+			gstate.results.push_back({"done:" + st.abbrev, 0});
+		}
 	}
 
 	idx_t emitted = 0;
@@ -443,32 +645,302 @@ static void LoadTigerStateExecute(ClientContext &context, TableFunctionInput &da
 }
 
 // =====================================================================
+// Data-table catalog — the 13 tables that the macros read from, and that
+// set_tiger_reference swaps between base-table and view forms.
+// =====================================================================
+
+static const char *const kDataTables[] = {
+    "state",       "county",     "place",           "cousub",  "zcta5",
+    "zip_state",   "zip_state_loc", "zip_lookup_base",
+    "edges",       "faces",      "featnames",       "addr",
+    "edge_containment",
+};
+static constexpr size_t kDataTableCount = sizeof(kDataTables) / sizeof(kDataTables[0]);
+
+// =====================================================================
+// install_tiger_schema(database VARCHAR, schema VARCHAR DEFAULT 'tiger')
+//   Creates the 13 TIGER data tables + schema in <database>.<schema>.
+//   Idempotent. Used to pre-build a portable reference DB.
+// =====================================================================
+
+struct SchemaOpBindData : public FunctionData {
+	std::string database;
+	std::string schema = "tiger";
+	std::string op; // "install" or "set_reference"
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto c = make_uniq<SchemaOpBindData>();
+		c->database = database;
+		c->schema = schema;
+		c->op = op;
+		return std::move(c);
+	}
+	bool Equals(const FunctionData &o_p) const override {
+		auto &o = o_p.Cast<SchemaOpBindData>();
+		return database == o.database && schema == o.schema && op == o.op;
+	}
+};
+
+struct SchemaOpGlobalState : public GlobalTableFunctionState {
+	std::vector<LoaderResult> results;
+	idx_t row_idx = 0;
+	bool executed = false;
+	static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInput &) {
+		return make_uniq<SchemaOpGlobalState>();
+	}
+};
+
+static unique_ptr<FunctionData> InstallSchemaBind(ClientContext &, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types,
+                                                   vector<string> &names) {
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("step");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("rows_loaded");
+
+	auto bind = make_uniq<SchemaOpBindData>();
+	bind->op = "install";
+	// Positional (database) is required; schema optional.
+	if (input.inputs.empty() || input.inputs[0].IsNull()) {
+		throw BinderException("install_tiger_schema: database (catalog name) is required; "
+		                      "pass '' to target the current catalog");
+	}
+	bind->database = StringValue::Get(input.inputs[0]);
+	if (input.inputs.size() >= 2 && !input.inputs[1].IsNull() && !StringValue::Get(input.inputs[1]).empty()) {
+		bind->schema = StringValue::Get(input.inputs[1]);
+	}
+	return std::move(bind);
+}
+
+static std::string QualifyLocation(const std::string &database, const std::string &schema) {
+	if (database.empty()) {
+		return QuoteIdent(schema);
+	}
+	return QuoteIdent(database) + "." + QuoteIdent(schema);
+}
+
+static void InstallSchemaExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<SchemaOpBindData>();
+	auto &gstate = data_p.global_state->Cast<SchemaOpGlobalState>();
+	if (!gstate.executed) {
+		gstate.executed = true;
+		Connection conn(*context.db);
+		auto qualified = QualifyLocation(bind.database, bind.schema);
+		auto rendered = ApplySubstitutions(TigerSchemaSql(), {{"@TIGER@", qualified}});
+		auto result = conn.Query(rendered);
+		if (result->HasError()) {
+			throw IOException("us_geocoder install_tiger_schema (%s): %s", qualified, result->GetError());
+		}
+		gstate.results.push_back({"installed:" + qualified, (int64_t)kDataTableCount});
+	}
+
+	idx_t emitted = 0;
+	while (gstate.row_idx < gstate.results.size() && emitted < STANDARD_VECTOR_SIZE) {
+		const auto &r = gstate.results[gstate.row_idx++];
+		output.SetValue(0, emitted, Value(r.step));
+		output.SetValue(1, emitted, Value::BIGINT(r.rows));
+		++emitted;
+	}
+	output.SetCardinality(emitted);
+}
+
+// =====================================================================
+// set_tiger_reference(database VARCHAR, schema VARCHAR DEFAULT 'tiger')
+//   Repoints the 13 local tiger.<table> to views over <database>.<schema>.<table>.
+//   Passing database := NULL (or empty) restores empty local base tables.
+// =====================================================================
+
+static unique_ptr<FunctionData> SetReferenceBind(ClientContext &, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types,
+                                                  vector<string> &names) {
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("table");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("kind"); // 'view' | 'base_table'
+
+	auto bind = make_uniq<SchemaOpBindData>();
+	bind->op = "set_reference";
+	if (!input.inputs.empty() && !input.inputs[0].IsNull()) {
+		bind->database = StringValue::Get(input.inputs[0]);
+	}
+	if (input.inputs.size() >= 2 && !input.inputs[1].IsNull() && !StringValue::Get(input.inputs[1]).empty()) {
+		bind->schema = StringValue::Get(input.inputs[1]);
+	}
+	return std::move(bind);
+}
+
+static void SetReferenceExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<SchemaOpBindData>();
+	auto &gstate = data_p.global_state->Cast<SchemaOpGlobalState>();
+
+	if (!gstate.executed) {
+		gstate.executed = true;
+		Connection conn(*context.db);
+
+		// Always operate on the local "tiger" schema (where macros live and read from).
+		const std::string local = "tiger";
+		const bool resetting = bind.database.empty();
+		std::string source_qualified;
+		if (!resetting) {
+			source_qualified = QualifyLocation(bind.database, bind.schema);
+		}
+
+		conn.BeginTransaction();
+		try {
+			for (size_t i = 0; i < kDataTableCount; ++i) {
+				const std::string tbl = kDataTables[i];
+				const std::string local_ref = QuoteIdent(local) + "." + QuoteIdent(tbl);
+				// Drop whichever form is currently there. DROP TABLE / DROP VIEW
+				// are not mutually forgiving, so we try both.
+				{
+					auto r = conn.Query("DROP VIEW IF EXISTS " + local_ref);
+					if (r->HasError()) { /* swallow; fall through to DROP TABLE */ }
+				}
+				{
+					auto r = conn.Query("DROP TABLE IF EXISTS " + local_ref);
+					if (r->HasError()) {
+						throw IOException("us_geocoder set_tiger_reference (drop %s): %s", tbl, r->GetError());
+					}
+				}
+
+				std::string kind;
+				if (resetting) {
+					// Recreate empty local base tables from the schema template.
+					// Render tiger_schema.sql.in but pull out just the single table.
+					// Easier: render the whole template once per call (idempotent).
+					// We do this ONCE outside the loop — see post-loop below.
+					kind = "base_table";
+				} else {
+					auto view_sql = "CREATE VIEW " + local_ref + " AS SELECT * FROM " +
+					                source_qualified + "." + QuoteIdent(tbl);
+					auto r = conn.Query(view_sql);
+					if (r->HasError()) {
+						throw IOException("us_geocoder set_tiger_reference (create view %s): %s",
+						                  tbl, r->GetError());
+					}
+					kind = "view";
+				}
+				gstate.results.push_back({tbl, 0});
+				(void)kind; // captured into results' step field? No — we return tbl+kind below.
+				// Store kind in rows field as 0/1 to keep schema simple? Use a side vector.
+				// Simpler: re-run the tiger_schema template once after the loop to recreate
+				// base tables when resetting. We'll just report "view" or "base_table" via
+				// a second results field — extend LoaderResult below? Easier: encode in step.
+				// Keep step = tbl, rows = 0; we emit a "kind" column by looking up resetting.
+			}
+
+			if (resetting) {
+				// Recreate all 13 base tables in one render.
+				auto rendered = ApplySubstitutions(TigerSchemaSql(), {{"@TIGER@", QuoteIdent(local)}});
+				auto r = conn.Query(rendered);
+				if (r->HasError()) {
+					throw IOException("us_geocoder set_tiger_reference (recreate base tables): %s",
+					                  r->GetError());
+				}
+			}
+			conn.Commit();
+		} catch (...) {
+			conn.Rollback();
+			throw;
+		}
+	}
+
+	idx_t emitted = 0;
+	const std::string kind = bind.database.empty() ? "base_table" : "view";
+	while (gstate.row_idx < gstate.results.size() && emitted < STANDARD_VECTOR_SIZE) {
+		const auto &r = gstate.results[gstate.row_idx++];
+		output.SetValue(0, emitted, Value(r.step));
+		output.SetValue(1, emitted, Value(kind));
+		++emitted;
+	}
+	output.SetCardinality(emitted);
+}
+
+// =====================================================================
 // Registration
 // =====================================================================
 
+// Attach the standard named parameters to a load_tiger_* TableFunction
+// before registration. `source` is accepted positionally on overloads that
+// reserve a slot for it and as a named parameter everywhere.
+static void AddLoaderNamedParams(TableFunction &fn) {
+	fn.named_parameters["year"] = LogicalType::INTEGER;
+	fn.named_parameters["source"] = LogicalType::VARCHAR;
+	fn.named_parameters["target_db"] = LogicalType::VARCHAR;
+	fn.named_parameters["target_schema"] = LogicalType::VARCHAR;
+}
+
 void RegisterLoaderFunctions(ExtensionLoader &loader, const std::string &) {
-	// load_tiger_nation([source VARCHAR], year := 2025)
+	// load_tiger_nation([source VARCHAR], year := 2025,
+	//                   target_db := NULL, target_schema := 'tiger')
 	// Source defaults to the Census TIGER URL for the given year.
+	// target_db / target_schema control where the TIGER data tables live.
 	TableFunction nation_fn0("load_tiger_nation", {}, LoadTigerNationExecute,
 	                         LoadTigerNationBind, LoaderGlobalState::Init);
-	nation_fn0.named_parameters["year"] = LogicalType::INTEGER;
+	AddLoaderNamedParams(nation_fn0);
 	loader.RegisterFunction(nation_fn0);
 
 	TableFunction nation_fn1("load_tiger_nation", {LogicalType::VARCHAR}, LoadTigerNationExecute,
 	                         LoadTigerNationBind, LoaderGlobalState::Init);
-	nation_fn1.named_parameters["year"] = LogicalType::INTEGER;
+	AddLoaderNamedParams(nation_fn1);
 	loader.RegisterFunction(nation_fn1);
 
-	// load_tiger_state(state_abbrev VARCHAR [, source VARCHAR], year := 2025)
+	// load_tiger_state(state_abbrev VARCHAR [, source VARCHAR], ...)
 	TableFunction state_fn1("load_tiger_state", {LogicalType::VARCHAR}, LoadTigerStateExecute,
 	                        LoadTigerStateBind, LoaderGlobalState::Init);
-	state_fn1.named_parameters["year"] = LogicalType::INTEGER;
+	AddLoaderNamedParams(state_fn1);
 	loader.RegisterFunction(state_fn1);
 
 	TableFunction state_fn2("load_tiger_state", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LoadTigerStateExecute,
 	                        LoadTigerStateBind, LoaderGlobalState::Init);
-	state_fn2.named_parameters["year"] = LogicalType::INTEGER;
+	AddLoaderNamedParams(state_fn2);
 	loader.RegisterFunction(state_fn2);
+
+	// load_tiger_states(states VARCHAR[] [, source VARCHAR], ...)
+	const auto list_vc = LogicalType::LIST(LogicalType::VARCHAR);
+	TableFunction states_fn1("load_tiger_states", {list_vc}, LoadTigerStateExecute,
+	                         LoadTigerStatesBind, LoaderGlobalState::Init);
+	AddLoaderNamedParams(states_fn1);
+	loader.RegisterFunction(states_fn1);
+
+	TableFunction states_fn2("load_tiger_states", {list_vc, LogicalType::VARCHAR},
+	                         LoadTigerStateExecute, LoadTigerStatesBind, LoaderGlobalState::Init);
+	AddLoaderNamedParams(states_fn2);
+	loader.RegisterFunction(states_fn2);
+
+	// load_tiger_all_states([source VARCHAR], ...)
+	//   Loads every row of state_lookup with statefp 01–56 (50 states + DC).
+	TableFunction all_states_fn0("load_tiger_all_states", {}, LoadTigerStateExecute,
+	                              LoadTigerAllStatesBind, LoaderGlobalState::Init);
+	AddLoaderNamedParams(all_states_fn0);
+	loader.RegisterFunction(all_states_fn0);
+
+	TableFunction all_states_fn1("load_tiger_all_states", {LogicalType::VARCHAR},
+	                              LoadTigerStateExecute, LoadTigerAllStatesBind, LoaderGlobalState::Init);
+	AddLoaderNamedParams(all_states_fn1);
+	loader.RegisterFunction(all_states_fn1);
+
+	// install_tiger_schema(database VARCHAR [, schema VARCHAR DEFAULT 'tiger'])
+	//   Creates the TIGER data tables in a target catalog. Idempotent.
+	TableFunction install_fn1("install_tiger_schema", {LogicalType::VARCHAR},
+	                          InstallSchemaExecute, InstallSchemaBind, SchemaOpGlobalState::Init);
+	loader.RegisterFunction(install_fn1);
+	TableFunction install_fn2("install_tiger_schema", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                          InstallSchemaExecute, InstallSchemaBind, SchemaOpGlobalState::Init);
+	loader.RegisterFunction(install_fn2);
+
+	// set_tiger_reference([database VARCHAR, schema VARCHAR DEFAULT 'tiger'])
+	//   No-arg / NULL / empty-string first arg → restore empty local base tables.
+	//   Non-empty database → repoint local tiger.<table> to VIEWs over <db>.<schema>.<table>.
+	TableFunction set_ref_fn0("set_tiger_reference", {},
+	                          SetReferenceExecute, SetReferenceBind, SchemaOpGlobalState::Init);
+	loader.RegisterFunction(set_ref_fn0);
+	TableFunction set_ref_fn1("set_tiger_reference", {LogicalType::VARCHAR},
+	                          SetReferenceExecute, SetReferenceBind, SchemaOpGlobalState::Init);
+	loader.RegisterFunction(set_ref_fn1);
+	TableFunction set_ref_fn2("set_tiger_reference", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                          SetReferenceExecute, SetReferenceBind, SchemaOpGlobalState::Init);
+	loader.RegisterFunction(set_ref_fn2);
 }
 
 } // namespace us_geocoder

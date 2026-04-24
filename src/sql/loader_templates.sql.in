@@ -1,10 +1,15 @@
 -- Per-table INSERT templates for the TIGER loader. Sections are delimited
 -- by lines of the form "-- @SECTION:name@" and parsed by
 -- src/loader.cpp::GetLoaderTemplate(). Placeholders substituted per-call:
---   @TIGER@      → target schema
+--   @TIGER@      → target data location ("tiger" locally, or "refdb.tiger" in Mode 3)
+--   @FUNC@       → local function/macro location (always "tiger" in current catalog)
 --   @VSIPATH@    → '/vsizip/<source>/<zip>/<shp>' (HTTP or local filesystem)
 --   @STATEFP@    → 2-digit state FIPS (county-level tables only)
 --   @COUNTYFP@   → 3-digit county FIPS (county-level tables only)
+--
+-- @TIGER@ and @FUNC@ are the same string for in-DB loads; they differ only
+-- when writing to an attached catalog via target_db. Macro calls must use
+-- @FUNC@ because macros are installed once, locally, at extension load.
 
 -- @SECTION:nation_state@
 INSERT INTO @TIGER@.state (statefp, stusps, name, the_geom)
@@ -72,7 +77,7 @@ SELECT '@STATEFP@', TLID, NAME, FULLNAME,
        NULLIF(PREDIRABRV, ''), NULLIF(PRETYPABRV, ''), NULLIF(PREQUALABR, ''),
        NULLIF(SUFTYPABRV, ''), NULLIF(SUFDIRABRV, ''), MTFCC,
        lower(NAME),
-       @TIGER@.normalize_street_name(FULLNAME),
+       @FUNC@.normalize_street_name(FULLNAME),
        soundex(NAME)
 FROM ST_Read('@VSIPATH@')
 
@@ -131,12 +136,12 @@ SELECT
     e.statefp, e.tlid,
     CASE WHEN f_l.the_geom IS NULL THEN false
          ELSE ST_Within(
-                  @TIGER@.interpolate_from_address(1, '1', '1', e.the_geom, 'L', 10),
+                  @FUNC@.interpolate_from_address(1, '1', '1', e.the_geom, 'L', 10),
                   f_l.the_geom)
     END AS guaranteed_l,
     CASE WHEN f_r.the_geom IS NULL THEN false
          ELSE ST_Within(
-                  @TIGER@.interpolate_from_address(1, '1', '1', e.the_geom, 'R', 10),
+                  @FUNC@.interpolate_from_address(1, '1', '1', e.the_geom, 'R', 10),
                   f_r.the_geom)
     END AS guaranteed_r,
     CASE WHEN f_l.tractce20 IS NULL OR f_l.blockce20 IS NULL THEN NULL

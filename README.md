@@ -29,18 +29,69 @@ LOAD us_address_standardizer;  -- if installed
 From the Census CDN (default — needs `httpfs`):
 
 ```sql
-CALL load_tiger_nation(year := 2025);          -- one-time: state, county, zcta5
-CALL load_tiger_state('RI', year := 2025);     -- per-state: place, cousub, edges, faces, featnames, addr + derived
+CALL load_tiger_nation(year := 2025);                     -- one-time: state, county, zcta5
+CALL load_tiger_state('RI');                              -- one state
+CALL load_tiger_states(['RI','MA','CT']);                 -- several states in one call
+CALL load_tiger_all_states();                             -- all 50 states + DC
 ```
 
-Or from a local directory of zips (flat layout):
+Or from a local **Census-nested** mirror of `https://www2.census.gov/geo/tiger/TIGER<year>/`:
+
+```
+/data/tiger_2025/
+  STATE/tl_2025_us_state.zip
+  COUNTY/tl_2025_us_county.zip
+  ZCTA520/tl_2025_us_zcta520.zip
+  PLACE/tl_2025_44_place.zip
+  COUSUB/tl_2025_44_cousub.zip
+  EDGES/tl_2025_44007_edges.zip
+  FACES/tl_2025_44007_faces.zip
+  FEATNAMES/tl_2025_44007_featnames.zip
+  ADDR/tl_2025_44007_addr.zip
+  …
+```
 
 ```sql
-CALL load_tiger_nation('/data/tiger_2025', year := 2025);
-CALL load_tiger_state('RI', '/data/tiger_2025', year := 2025);
+CALL load_tiger_nation('/data/tiger_2025');
+CALL load_tiger_states(['RI','MA'], '/data/tiger_2025');
 ```
 
-`load_tiger_state` must run after `load_tiger_nation` — the state loader enumerates a state's counties from the `tiger.county` table populated by the nation load. Loading one state (all 5 counties of RI) from the Census CDN takes ~45s over residential broadband; a local source cuts that to ~25s.
+This layout matches what `wget --recursive` / `curl --remote-name` against the Census FTP produces, so it's also what the parallel-fetch recipe below targets. `load_tiger_state[s]` must run after `load_tiger_nation` — the state loader enumerates counties from the `tiger.county` table populated by the nation load. Loading one state (all 5 counties of RI) from the Census CDN takes ~45s over residential broadband; a local source cuts that to ~25s.
+
+## Reference databases (attached catalogs)
+
+The 13 TIGER data tables can live in the current database, in a separate read-write attached catalog, or in a shared read-only attached catalog. The macros always stay local — only the data moves.
+
+**Current DB (default):**
+```sql
+CALL load_tiger_state('RI');
+SELECT * FROM tiger.geocode(...);
+```
+
+**Attached read-write:**
+```sql
+ATTACH 'work.duckdb' AS work;
+CALL load_tiger_state('RI', target_db := 'work');
+CALL set_tiger_reference('work');                -- repoint local tiger.* at work.tiger.*
+SELECT * FROM tiger.geocode(...);
+```
+
+**Attached read-only (portable-DB workflow for secure / air-gapped envs):**
+```sql
+-- Staging env, with internet:
+ATTACH 'tiger_us_2025.duckdb' AS tgt;
+CALL load_tiger_nation(target_db := 'tgt');
+CALL load_tiger_state('RI', target_db := 'tgt');
+DETACH tgt;
+-- Ship tiger_us_2025.duckdb to the secure env.
+
+-- Secure env, no internet:
+ATTACH 'tiger_us_2025.duckdb' AS ref (READ_ONLY);
+CALL set_tiger_reference('ref');
+SELECT * FROM tiger.geocode(...);
+```
+
+`set_tiger_reference()` with no arguments resets the local `tiger.*` data tables to empty base tables. See [docs/api.md](docs/api.md) for the full contract.
 
 ## Geocode
 
@@ -87,7 +138,7 @@ See [docs/api.md](docs/api.md) for the full reference, including `geocode_inters
 ```sh
 git submodule update --init --recursive
 make release                   # ~10 min first time (builds duckdb from source)
-make test                      # 183 assertions across 12 sqllogictest files
+make test                      # 216 assertions across 14 sqllogictest files
 ```
 
 The build produces a loadable extension at `build/release/extension/us_geocoder/us_geocoder.duckdb_extension` and a DuckDB CLI at `build/release/duckdb` with the extension statically linked.
@@ -107,23 +158,47 @@ Benchmarked on TIGER 2025 Rhode Island (136K edges, 126K featnames, 105K addr) o
 
 ### Faster HTTP loads
 
-The Census CDN path issues one HTTPS fetch per `(county, table-type)` via GDAL's `/vsicurl/`, which doesn't parallelize well for large states. For NJ / NY / CA etc., pre-download in parallel via `curl` + `xargs` and load from local:
+The Census CDN path issues one HTTPS fetch per `(county, table-type)` via GDAL's `/vsicurl/`, which doesn't parallelize well for large states. For NJ / NY / CA etc., pre-download into a Census-nested local mirror via `wget --mirror` (or parallel `curl`) and point the loader at the local copy:
 
 ```sh
-mkdir -p /tmp/tiger_nj
-python3 -c "
-counties = [f'{i:03d}' for i in range(1, 42, 2)]  # NJ odd-numbered county FIPS
-print('\n'.join(
-    f'https://www2.census.gov/geo/tiger/TIGER2025/{sub}/tl_2025_34{c}_{tbl}.zip'
-    for c in counties
-    for sub, tbl in [('EDGES','edges'),('FACES','faces'),('FEATNAMES','featnames'),('ADDR','addr')]
-) + '\nhttps://www2.census.gov/geo/tiger/TIGER2025/PLACE/tl_2025_34_place.zip'
-    + '\nhttps://www2.census.gov/geo/tiger/TIGER2025/COUSUB/tl_2025_34_cousub.zip')
-" | xargs -n 1 -P 8 -I {} curl -sS -o /tmp/tiger_nj/\$(basename {}) {}
+# Mirror the Census tree for NJ (statefp 34) + nation-level zips.
+# Keeps the STATE/, EDGES/, FACES/, … subdirectory structure the loader expects.
+DEST=/tmp/tiger_nj
+ROOT=https://www2.census.gov/geo/tiger/TIGER2025
+mkdir -p $DEST
+wget -q -nH --cut-dirs=3 -x -P $DEST \
+     -A 'tl_2025_us_*.zip,tl_2025_34_*.zip,tl_2025_34???_*.zip' \
+     -r -np -l 2 $ROOT/ 2>/dev/null
+```
+
+Or, for only the tables the geocoder uses, hand-roll a parallel curl loop:
+
+```sh
+DEST=/tmp/tiger_nj; ROOT=https://www2.census.gov/geo/tiger/TIGER2025
+mkdir -p $DEST/{STATE,COUNTY,ZCTA520,PLACE,COUSUB,EDGES,FACES,FEATNAMES,ADDR}
+
+# nation-level
+for f in STATE/tl_2025_us_state.zip COUNTY/tl_2025_us_county.zip ZCTA520/tl_2025_us_zcta520.zip; do
+  curl -sS -o $DEST/$f $ROOT/$f &
+done
+# state-level
+for f in PLACE/tl_2025_34_place.zip COUSUB/tl_2025_34_cousub.zip; do
+  curl -sS -o $DEST/$f $ROOT/$f &
+done
+# county-level (NJ FIPS 34; counties run 001..041 odd)
+for c in $(seq -f "%03g" 1 2 41); do
+  for sub in EDGES FACES FEATNAMES ADDR; do
+    curl -sS -o $DEST/$sub/tl_2025_34${c}_$(echo $sub | tr A-Z a-z).zip \
+         $ROOT/$sub/tl_2025_34${c}_$(echo $sub | tr A-Z a-z).zip &
+    (( $(jobs -r | wc -l) >= 8 )) && wait -n
+  done
+done
+wait
 ```
 
 Then:
 ```sql
+CALL load_tiger_nation('/tmp/tiger_nj');
 CALL load_tiger_state('NJ', '/tmp/tiger_nj');  -- ~2 min total
 ```
 

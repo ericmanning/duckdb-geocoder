@@ -1,0 +1,163 @@
+# name: test/sql/set_tiger_reference.test
+# description: Mode 3 — schema in current DB / attached read-write DB / attached read-only DB.
+#              Covers install_tiger_schema, set_tiger_reference, and the view-vs-table swap.
+
+require us_geocoder
+
+statement ok
+LOAD spatial;
+
+# --------------------------------------------------------------------
+# Mode 1: schema within the current DB (baseline).
+# The 13 data tables are base tables, in the local 'tiger' schema.
+# --------------------------------------------------------------------
+
+query I
+SELECT table_type FROM information_schema.tables
+WHERE table_catalog = current_catalog() AND table_schema = 'tiger' AND table_name = 'edges';
+----
+BASE TABLE
+
+# --------------------------------------------------------------------
+# Mode 3 setup: attach a second in-memory catalog as a reference DB.
+# install_tiger_schema creates the 13 tables there.
+# --------------------------------------------------------------------
+
+statement ok
+ATTACH ':memory:' AS refdb;
+
+statement ok
+CALL install_tiger_schema('refdb');
+
+query I
+SELECT COUNT(*) FROM duckdb_tables()
+WHERE database_name = 'refdb' AND schema_name = 'tiger'
+  AND table_name IN ('state','county','place','cousub','zcta5',
+                     'zip_state','zip_state_loc','zip_lookup_base',
+                     'edges','faces','featnames','addr','edge_containment');
+----
+13
+
+# Populate refdb.tiger with a minimal fixture.
+statement ok
+INSERT INTO refdb.tiger.state (statefp, stusps, name, the_geom) VALUES
+    ('44', 'RI', 'Rhode Island',
+     ST_GeomFromText('POLYGON((-71.9 41.1, -71.0 41.1, -71.0 42.1, -71.9 42.1, -71.9 41.1))'));
+
+statement ok
+INSERT INTO refdb.tiger.zip_lookup_base (zip, state, county, city, statefp) VALUES
+    ('02903', 'RI', 'Providence', 'Providence', '44');
+
+# --------------------------------------------------------------------
+# Repoint local tiger.* at refdb.tiger.*.
+# The 13 data tables in the local catalog become views.
+# --------------------------------------------------------------------
+
+statement ok
+CALL set_tiger_reference('refdb');
+
+query I
+SELECT table_type FROM information_schema.tables
+WHERE table_catalog = current_catalog() AND table_schema = 'tiger' AND table_name = 'edges';
+----
+VIEW
+
+query I
+SELECT COUNT(*) FROM information_schema.tables
+WHERE table_catalog = current_catalog() AND table_schema = 'tiger' AND table_type = 'VIEW'
+  AND table_name IN ('state','county','place','cousub','zcta5',
+                     'zip_state','zip_state_loc','zip_lookup_base',
+                     'edges','faces','featnames','addr','edge_containment');
+----
+13
+
+# Reads through the local view land in refdb.
+query I
+SELECT name FROM tiger.state WHERE statefp = '44';
+----
+Rhode Island
+
+query I
+SELECT city FROM tiger.zip_lookup_base WHERE zip = '02903';
+----
+Providence
+
+# Macro schema (lookup + rate_attributes + canon_*) is not repointed —
+# still lives in local 'tiger' and is fully accessible.
+query I
+SELECT statefp FROM tiger.state_lookup WHERE abbrev = 'RI';
+----
+44
+
+# --------------------------------------------------------------------
+# Reset: set_tiger_reference() with no args restores empty local base tables.
+# --------------------------------------------------------------------
+
+statement ok
+CALL set_tiger_reference();
+
+query I
+SELECT table_type FROM information_schema.tables
+WHERE table_catalog = current_catalog() AND table_schema = 'tiger' AND table_name = 'edges';
+----
+BASE TABLE
+
+# Local tiger.state is an empty base table now; the refdb row is invisible.
+query I
+SELECT COUNT(*) FROM tiger.state;
+----
+0
+
+# refdb.tiger.state is untouched by the reset.
+query I
+SELECT name FROM refdb.tiger.state WHERE statefp = '44';
+----
+Rhode Island
+
+# --------------------------------------------------------------------
+# Idempotent: running install_tiger_schema a second time is a no-op.
+# --------------------------------------------------------------------
+
+statement ok
+CALL install_tiger_schema('refdb');
+
+# Data survives the idempotent re-install.
+query I
+SELECT name FROM refdb.tiger.state WHERE statefp = '44';
+----
+Rhode Island
+
+# --------------------------------------------------------------------
+# Explicit target_schema (non-default name).
+# --------------------------------------------------------------------
+
+statement ok
+CALL install_tiger_schema('refdb', 'tiger2');
+
+query I
+SELECT COUNT(*) FROM duckdb_tables()
+WHERE database_name = 'refdb' AND schema_name = 'tiger2' AND table_name = 'edges';
+----
+1
+
+statement ok
+CALL set_tiger_reference('refdb', 'tiger2');
+
+query I
+SELECT table_type FROM information_schema.tables
+WHERE table_catalog = current_catalog() AND table_schema = 'tiger' AND table_name = 'edges';
+----
+VIEW
+
+# tiger2 was empty, so the view returns 0 rows.
+query I
+SELECT COUNT(*) FROM tiger.state;
+----
+0
+
+# Reset back to local base tables for cleanliness.
+statement ok
+CALL set_tiger_reference();
+
+statement ok
+DETACH refdb;
