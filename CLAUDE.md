@@ -67,9 +67,13 @@ Benchmarked on NJ (21 counties, 86 zips, ~800K edges) in April 2026. Details in 
 
 **Follow-up at NJ scale** (`BENCH_STATE=NJ BENCH_FIPS=34`, 21 counties, ~835 MB zips): the RI-scale caveat was right. NJ reveals a real signal RI hid — parallel `SELECT … FROM ST_Read(…) UNION ALL …` with threads=4 gets **~2× speedup**. But the same UNION-ALL shape wrapped in `INSERT INTO … SELECT …` stays at 1.06× (no speedup).
 
-**Parse parallelizes; write serializes.** That's the actual story. Row-group allocation / WAL / something in the INSERT-write path doesn't scale with concurrency, and it cancels the parse-phase gain. Upshot for engineering: the parallel-ingest upside is capped at ~20–30% (save the parse portion; write stays serial). Not the dramatic win I originally promised. A future commit-2 redesign would need to split parse-from-write (e.g., parallel parse into Arrow batches, then a single serialized writer) — but even then, ~20% savings is probably not worth the complexity.
+**Parse parallelizes; write serializes.** That's the actual story. Row-group allocation / WAL / something in the INSERT-write path doesn't scale with concurrency, and it cancels the parse-phase gain.
 
-**The only path to >3× loader speedup** on the roadmap is option 2: pre-built Parquet distribution. Bypasses both the shapefile-parse *and* the INSERT-write bottlenecks.
+**April 2026 commit-3 attempt** (parse-parallel → serialized-write architecture): **also failed.** I built K worker Connections each running `CREATE TABLE scratch.<tbl>_<cfp> AS SELECT ... FROM ST_Read(...)` into a distinct scratch schema, then a main-thread UNION-ALL merge into the real targets, then `DROP SCHEMA CASCADE`. On NJ: **parallel 604s vs legacy serial 405s — 1.5× SLOWER.** Likely causes: 84 total scratch tables add catalog-lock contention during the parallel CTAS phase, and the merge step is essentially a full second pass over the data (scan 21 scratch tables per target, INSERT into real target) that serial never has to do. Test C's 2× signal on raw `SELECT … FROM ST_Read(…) UNION ALL …` does NOT translate to CTAS-concurrent-across-Connections at 84-table scale.
+
+**Three strategies attempted, all reverted:** parallel HTTP prefetch (commit-1 attempt), parallel INSERT-to-shared (commit-2 attempt), parallel CTAS-into-scratch + merge (commit-3 attempt). Pattern is clear: **no application-layer parallelism strategy at our code layer beats serial loading at NJ scale on this hardware.**
+
+**The only remaining path to >3× loader speedup** is option 2: pre-built Parquet distribution. Bypasses shapefile-parse *and* INSERT-write *and* all the parallelism dead-ends.
 
 **Where the real wins are:** removing work, not parallelizing it. `edge_containment` precompute is ~1–2 min per state and many users don't need GEOIDs — making it opt-out is the one remaining in-process lever that actually moves the needle.
 
