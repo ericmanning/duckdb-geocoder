@@ -58,6 +58,15 @@ Benchmarked on NJ (21 counties, 86 zips, ~800K edges) in April 2026. Details in 
 - Compare `user`/`real` CPU-time ratios to see whether DuckDB is already saturating cores — if user/real is already ~N, adding N more outer workers won't help.
 - Benchmark cold vs warm caches separately. Network variance and CDN warming make consecutive runs non-comparable.
 
+**April 2026 follow-up hypothesis tests** ([`scripts/benchmarks/`](scripts/benchmarks/)): wrote four targeted tests to isolate *why* parallel download and parallel ingest didn't pay off, expecting at least one hypothesis to be confirmed. **All four were falsified:**
+
+- `/vsicurl/` is NOT doing partial Range fetches — we measured 128% of full-zip bytes on the wire during a serial load. Census does support Range; GDAL apparently isn't using it for shapefile reads. So commit 1's "parallel prefetch moves more bytes" story was wrong — both paths move roughly full-zip bytes.
+- DuckDB is NOT internally parallelizing `INSERT ... FROM ST_Read(...)` — `threads=1` vs `threads=14` ran the same INSERT in 0.45s vs 0.41s. So commit 2's "outer parallelism oversubscribes cores" story was also wrong; DuckDB wasn't using those cores for the INSERT.
+- 4 separate CLI **processes** reading 4 distinct local shapefiles only got 1.10× speedup, and in-process UNION-ALL only got 1.35×. GDAL doesn't have an obvious in-process driver lock (processes would have worked); but *something* OS-level is capping concurrency on small workloads (possibly disk I/O queue + CLI startup cost).
+- Scratch-table CTAS was *slower* than shared-target UNION-ALL INSERT, not faster — so MVCC write contention isn't the bottleneck either.
+
+**Bottom line:** at the RI workload size (0.5s per file), every obvious explanation for why parallelism doesn't help is wrong. The most likely remaining culprit is that the parse phase is neither compute- nor network- nor I/O-bound in a way we can exploit from SQL/app code — something in GDAL's shapefile read path simply doesn't scale with concurrency at this scale. **Re-run `scripts/benchmarks/run_all.sh` with `BENCH_STATE=NJ` before investing more engineering** — bigger files might tell a different story.
+
 **Where the real wins are:** removing work, not parallelizing it. `edge_containment` precompute is ~1–2 min per state and many users don't need GEOIDs — making it opt-out is the one remaining in-process lever that actually moves the needle.
 
 ## Common traps
