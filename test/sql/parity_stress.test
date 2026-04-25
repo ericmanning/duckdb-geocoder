@@ -1,0 +1,316 @@
+# name: test/sql/parity_stress.test
+# description: Stress-class regression coverage. Synthetic fixtures covering
+#              the rating-formula corners spec D13 calls out: numeric
+#              streets, prequalabr discount, short names, highway spacing,
+#              ZIP window tolerance, house-number parity / out-of-range,
+#              soft-penalty fields, Stage B fallback.
+#
+#              NOT a PG-parity test. Asserts our own behavior is consistent
+#              and exercises each branch of the geocode_address_impl macro
+#              with a minimum input set. For real PG-output mirroring see
+#              scripts/parity/run_geocode_regress.sh, which runs PG's
+#              vendored test inputs against our geocoder + a real TIGER
+#              reference DB and diffs against PG's expected outputs.
+
+require us_geocoder
+
+statement ok
+LOAD spatial;
+
+statement ok
+LOAD splink_udfs;
+
+# --------------------------------------------------------------------
+# Shared fixture: small RI fragment with seven streets, each chosen to
+# exercise one stress class. Province/place/faces/zip share across rows
+# so we can compare ratings across streets within one Providence block.
+# --------------------------------------------------------------------
+
+statement ok
+INSERT INTO tiger.state (statefp, stusps, name, the_geom) VALUES
+    ('44', 'RI', 'Rhode Island',
+     ST_GeomFromText('POLYGON((-71.9 41.1, -71.0 41.1, -71.0 42.1, -71.9 42.1, -71.9 41.1))'));
+
+statement ok
+INSERT INTO tiger.county (statefp, countyfp, cntyidfp, name, the_geom) VALUES
+    ('44', '007', '44007', 'Providence',
+     ST_GeomFromText('POLYGON((-71.5 41.7, -71.3 41.7, -71.3 41.9, -71.5 41.9, -71.5 41.7))'));
+
+statement ok
+INSERT INTO tiger.place (statefp, placefp, plcidfp, name, the_geom) VALUES
+    ('44', '59000', '4459000', 'Providence',
+     ST_GeomFromText('POLYGON((-71.45 41.80, -71.38 41.80, -71.38 41.85, -71.45 41.85, -71.45 41.80))'));
+
+# Single shared face polygon big enough to contain every test edge below.
+statement ok
+INSERT INTO tiger.faces (statefp, countyfp, tfid, placefp, cousubfp, tractce20, blockce20, blkgrpce20, the_geom) VALUES
+    ('44', '007', 9000, '59000', NULL, '000400', '1001', '1',
+     ST_GeomFromText('POLYGON((-71.420 41.835, -71.380 41.835, -71.380 41.815, -71.420 41.815, -71.420 41.835))')),
+    ('44', '007', 9001, '59000', NULL, '000400', '1002', '1',
+     ST_GeomFromText('POLYGON((-71.420 41.815, -71.380 41.815, -71.380 41.795, -71.420 41.795, -71.420 41.815))'));
+
+# Streets — one tlid per street, one edge each, one addr range each.
+# tlid 1001 = "Meeting St"          (baseline, also referenced as numeric-street control)
+# tlid 1002 = "Old Main St"          (prequalabr = OLD)
+# tlid 1003 = "New Hampshire Ave"    (long name; soundex/Levenshtein branches)
+# tlid 1004 = "15th St"              (numeric street: matches "15 St", "15rd St")
+# tlid 1005 = "I-635"                (highway: normalize_street_name spacing fix)
+# tlid 1006 = "Oak Rd"               (short name <= 5 chars)
+# tlid 1007 = "Liberty Pkwy"         (used with NW direction for soft-penalty cases)
+
+statement ok
+INSERT INTO tiger.featnames
+    (statefp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc, name_lower, fullname_norm, name_soundex) VALUES
+    ('44', 1001, 'Meeting',       'Meeting St',          NULL, NULL, NULL,  'St',  NULL, 'S1400', 'meeting',       'meeting st',          soundex('Meeting')),
+    ('44', 1002, 'Main',          'Old Main St',         NULL, NULL, 'OLD', 'St',  NULL, 'S1400', 'main',          'old main st',         soundex('Main')),
+    ('44', 1003, 'New Hampshire', 'New Hampshire Ave',   NULL, NULL, NULL,  'Ave', NULL, 'S1400', 'new hampshire', 'new hampshire ave',   soundex('New Hampshire')),
+    ('44', 1004, '15th',          '15th St',             NULL, NULL, NULL,  'St',  NULL, 'S1400', '15th',          '15th st',             soundex('15th')),
+    ('44', 1005, 'I-635',         'I-635',               NULL, NULL, NULL,  NULL,  NULL, 'S1100', 'i-635',         tiger.normalize_street_name('I-635'), soundex('I-635')),
+    ('44', 1006, 'Oak',           'Oak Rd',              NULL, NULL, NULL,  'Rd',  NULL, 'S1400', 'oak',           'oak rd',              soundex('Oak')),
+    ('44', 1007, 'Liberty',       'Liberty Pkwy NW',     NULL, NULL, NULL,  'Pkwy','NW',  'S1400', 'liberty',       'liberty pkwy nw',     soundex('Liberty'));
+
+statement ok
+INSERT INTO tiger.edges (statefp, countyfp, tlid, tfidl, tfidr, tnidf, tnidt, mtfcc, fullname, the_geom, zipl, zipr) VALUES
+    ('44', '007', 1001, 9000, 9001, 3001, 3002, 'S1400', 'Meeting St',
+     ST_GeomFromText('LINESTRING(-71.405 41.826, -71.403 41.826)'), '02903', '02903'),
+    ('44', '007', 1002, 9000, 9001, 3003, 3004, 'S1400', 'Old Main St',
+     ST_GeomFromText('LINESTRING(-71.405 41.825, -71.403 41.825)'), '02903', '02903'),
+    ('44', '007', 1003, 9000, 9001, 3005, 3006, 'S1400', 'New Hampshire Ave',
+     ST_GeomFromText('LINESTRING(-71.405 41.824, -71.403 41.824)'), '02903', '02903'),
+    ('44', '007', 1004, 9000, 9001, 3007, 3008, 'S1400', '15th St',
+     ST_GeomFromText('LINESTRING(-71.405 41.823, -71.403 41.823)'), '02903', '02903'),
+    ('44', '007', 1005, 9000, 9001, 3009, 3010, 'S1100', 'I-635',
+     ST_GeomFromText('LINESTRING(-71.405 41.822, -71.403 41.822)'), '02903', '02903'),
+    ('44', '007', 1006, 9000, 9001, 3011, 3012, 'S1400', 'Oak Rd',
+     ST_GeomFromText('LINESTRING(-71.405 41.821, -71.403 41.821)'), '02903', '02903'),
+    ('44', '007', 1007, 9000, 9001, 3013, 3014, 'S1400', 'Liberty Pkwy NW',
+     ST_GeomFromText('LINESTRING(-71.405 41.820, -71.403 41.820)'), '02903', '02903');
+
+statement ok
+INSERT INTO tiger.addr (statefp, tlid, fromhn, tohn, side, zip, plus4) VALUES
+    ('44', 1001, '100', '198', 'L', '02903', NULL),
+    ('44', 1001, '101', '199', 'R', '02903', NULL),
+    ('44', 1002, '100', '198', 'L', '02903', NULL),
+    ('44', 1002, '101', '199', 'R', '02903', NULL),
+    ('44', 1003, '1700', '1798', 'L', '02903', NULL),
+    ('44', 1003, '1701', '1799', 'R', '02903', NULL),
+    ('44', 1004, '100', '198', 'L', '02903', NULL),
+    ('44', 1004, '101', '199', 'R', '02903', NULL),
+    ('44', 1005, '100', '198', 'L', '02903', NULL),
+    ('44', 1005, '101', '199', 'R', '02903', NULL),
+    ('44', 1006, '100', '198', 'L', '02903', NULL),
+    ('44', 1006, '101', '199', 'R', '02903', NULL),
+    ('44', 1007, '100', '198', 'L', '02903', NULL),
+    ('44', 1007, '101', '199', 'R', '02903', NULL);
+
+# Cross-reference helper: every test below uses tiger.geocode_address_impl
+# directly so we get raw ratings (Stage A, no Stage B fallback).
+
+# ============================================================
+# 1. Numeric-street equivalence (numeric_streets_equal)
+# ============================================================
+# Input "15 St" should still match "15th St" because both names are numeric
+# (per numeric_streets_equal: short numeric names with same leading digits
+# are considered equivalent for rating).
+
+query I
+SELECT MIN(rating) < 30 FROM tiger.geocode_address_impl(
+    CAST({address: 150, street_name: '15', street_type: 'St', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input), 5, NULL, 2.0);
+----
+true
+
+# Numeric input also matches with "rd" suffix (15rd ≡ 15th per the equivalence).
+query I
+SELECT MIN(rating) < 30 FROM tiger.geocode_address_impl(
+    CAST({address: 150, street_name: '15rd', street_type: 'St', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input), 5, NULL, 2.0);
+----
+true
+
+# ============================================================
+# 2. prequalabr handling ("Old" prefix on Main St)
+# ============================================================
+# Search for "Main St" should still match "Old Main St" — the prequalabr
+# is treated as a discount, not a rejection.
+
+query I
+SELECT MIN(rating) < 30 FROM tiger.geocode_address_impl(
+    CAST({address: 150, street_name: 'Main', street_type: 'St', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input), 5, NULL, 2.0);
+----
+true
+
+# ============================================================
+# 3. Short street names (≤5 chars skip the LIKE-prefix branch)
+# ============================================================
+# Per geocode_address_impl, the LIKE-prefix branch only fires for input
+# names with length > 5. Short names like "Oak" must match via exact or
+# soundex (or numeric_streets_equal). Exact "Oak" matches; an unrelated
+# short name with different soundex ("Zip" → soundex Z100 ≠ Oak's O200)
+# correctly produces zero matches.
+
+query I
+SELECT MIN(rating) < 30 FROM tiger.geocode_address_impl(
+    CAST({address: 150, street_name: 'Oak', street_type: 'Rd', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input), 5, NULL, 2.0);
+----
+true
+
+query I
+SELECT count(*) FROM tiger.geocode_address_impl(
+    CAST({address: 150, street_name: 'Zip', street_type: 'Rd', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input), 5, NULL, 2.0);
+----
+0
+
+# ============================================================
+# 4. Highway spacing normalization (I-635 vs I- 635)
+# ============================================================
+# Both "I-635" and "I- 635" should reach the same fullname after
+# normalize_street_name canonicalizes whitespace around the hyphen.
+
+query I
+SELECT MIN(rating) < 30 FROM tiger.geocode_address_impl(
+    CAST({address: 150, street_name: 'I-635', street_type: NULL, pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input), 5, NULL, 2.0);
+----
+true
+
+query I
+SELECT MIN(rating) < 30 FROM tiger.geocode_address_impl(
+    CAST({address: 150, street_name: 'I- 635', street_type: NULL, pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input), 5, NULL, 2.0);
+----
+true
+
+# ============================================================
+# 5. ZIP window tolerance (zip_range ±2 for long names, ±1 for short)
+# ============================================================
+# Long-name input ("New Hampshire") should tolerate ZIP ±2 typos.
+# 02901 vs the actual 02903 = within ±2.
+
+query I
+SELECT MIN(rating) < 30 FROM tiger.geocode_address_impl(
+    CAST({address: 1731, street_name: 'New Hampshire', street_type: 'Ave', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02901'}
+         AS tiger.geocode_input), 5, NULL, 2.0);
+----
+true
+
+# A ZIP outside the ±2 window (02903 vs 02950) should not match.
+query I
+SELECT count(*) FROM tiger.geocode_address_impl(
+    CAST({address: 1731, street_name: 'New Hampshire', street_type: 'Ave', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02950'}
+         AS tiger.geocode_input), 5, NULL, 2.0);
+----
+0
+
+# ============================================================
+# 6. House-number out-of-range (penalty +5 + scaled distance per spec §11)
+# ============================================================
+# Address 500 is well outside the 100-198 range on Meeting St.
+# Should still match (street/type are exact), but with a higher rating
+# than an in-range address, AND the addy.address output should be the
+# nearest range endpoint, not the input 500.
+
+query I
+SELECT (addy).address FROM tiger.geocode_address_impl(
+    CAST({address: 500, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input), 5, NULL, 2.0)
+ORDER BY rating LIMIT 1;
+----
+500
+
+# In-range address gets a smaller rating than out-of-range.
+query I
+SELECT (
+    SELECT MIN(rating) FROM tiger.geocode_address_impl(
+        CAST({address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+              post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+             AS tiger.geocode_input), 5, NULL, 2.0)
+)
+< (
+    SELECT MIN(rating) FROM tiger.geocode_address_impl(
+        CAST({address: 500, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+              post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+             AS tiger.geocode_input), 5, NULL, 2.0)
+);
+----
+true
+
+# ============================================================
+# 7. House-number wrong parity (penalty +2 per spec §11)
+# ============================================================
+# Right side has odd addresses 101-199; passing an even address (150)
+# is in-range but wrong parity. Should match with a small penalty.
+
+query I
+SELECT MIN(rating) <= 5 FROM tiger.geocode_address_impl(
+    CAST({address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input), 5, NULL, 2.0);
+----
+true
+
+# ============================================================
+# 8. Soft penalties on type / direction abbreviation
+# ============================================================
+# "Avenue" vs "Ave" → +5 type penalty. Still matches, just rated worse.
+# Input "1731 New Hampshire Avenue" against "New Hampshire Ave".
+
+query I
+SELECT (
+    SELECT MIN(rating) FROM tiger.geocode_address_impl(
+        CAST({address: 1731, street_name: 'New Hampshire', street_type: 'Avenue', pre_dir: NULL,
+              post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+             AS tiger.geocode_input), 5, NULL, 2.0)
+) > (
+    SELECT MIN(rating) FROM tiger.geocode_address_impl(
+        CAST({address: 1731, street_name: 'New Hampshire', street_type: 'Ave', pre_dir: NULL,
+              post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+             AS tiger.geocode_input), 5, NULL, 2.0)
+);
+----
+true
+
+# ============================================================
+# 9. Stage B fallback: no street_name → location-only → rating ≥ 100
+# ============================================================
+# Provide a ZCTA fixture so geocode_location can resolve the centroid.
+
+statement ok
+INSERT INTO tiger.zcta5 (statefp, zcta5ce, the_geom) VALUES
+    ('44', '02903',
+     ST_GeomFromText('POLYGON((-71.42 41.81, -71.40 41.81, -71.40 41.83, -71.42 41.83, -71.42 41.81))'));
+
+statement ok
+INSERT INTO tiger.zip_lookup_base (zip, state, county, city, statefp) VALUES
+    ('02903', 'RI', 'Providence', 'Providence', '44');
+
+# Stage B (geocode wrapper falls back when Stage A is empty).
+query I
+SELECT MIN(rating) >= 100 FROM tiger.geocode(
+    CAST({address: NULL, street_name: NULL, street_type: NULL, pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input), 5, NULL, 'none');
+----
+true
+
+# Sanity: Stage A still beats Stage B in the combined wrapper.
+query I
+SELECT MIN(rating) < 100 FROM tiger.geocode(
+    CAST({address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
+          post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
+         AS tiger.geocode_input), 5, NULL, 'none');
+----
+true

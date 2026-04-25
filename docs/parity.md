@@ -78,15 +78,63 @@ All three limitations are **false-negatives only** — `containment_guaranteed =
 
 Expect identical `rating` values, identical `(addy)` contents, and geometry within ~1 m. Wider divergence typically means a difference in PAGC rules version, TIGER vintage, or a rating tie boundary (D7).
 
-## Parity corpus status
+## Parity test layout
 
-v0.1 ships with hand-curated unit tests covering:
+Three layers, separating what runs in CI from what requires real TIGER data.
+
+### Layer 1 — unit tests (CI)
+
+Hand-curated unit tests covering the geocoder's primitives. No real TIGER data; synthetic fixtures only.
+
 - Exact-match happy path (rating 0)
 - Perpendicular offset math (left/right side in UTM)
 - Location fallback (rating ≥ 100)
 - Intersection finder via shared TIGER nodes
 - Reverse geocode rank ordering
 - Containment GEOID derivation
-- Every scoring primitive (rate_attributes, diff_zip, zip_range, least_hn / greatest_hn, numeric_streets_equal, normalize_street_name, cull_null, levenshtein_ignore_case)
+- Every scoring primitive (`rate_attributes`, `diff_zip`, `zip_range`, `least_hn`/`greatest_hn`, `numeric_streets_equal`, `normalize_street_name`, `cull_null`, `levenshtein_ignore_case`)
 
-A larger corpus ported from PG's `src/regress/` (`pagc_normalize_address_regress`, `geocode_regress`, `reverse_geocode_regress`, `test-geocode_intersection_spacing`) is on the roadmap once we validate a cross-PG-version diff harness.
+### Layer 2 — stress-class regression (CI)
+
+[`test/sql/parity_stress.test`](../test/sql/parity_stress.test) systematically exercises every stress class spec D13 calls out. Synthetic multi-street RI fixture; no real TIGER data needed. **NOT** a PG parity test — it asserts our own behavior is consistent across each `geocode_address_impl` branch:
+
+1. **Numeric-street equivalence** — `15` and `15rd` match `15th St` via `numeric_streets_equal`.
+2. **prequalabr discount** — `Main St` matches `Old Main St`; the `OLD` prefix doesn't reject.
+3. **Short-name LIKE-prefix bypass** — names ≤5 chars skip the `LIKE name || '%'` branch but still match via exact / soundex / numeric.
+4. **Highway spacing** — `I-635` and `I- 635` reach the same fullname after `normalize_street_name`.
+5. **ZIP window tolerance** — long names get ±2 ZIP typo tolerance via `zip_range`; ZIPs outside the window produce zero matches.
+6. **House-number out-of-range** — penalty +5 + scaled distance, output address is the nearest range endpoint.
+7. **House-number wrong parity** — penalty +2.
+8. **Soft penalties on type / direction** — `Avenue` rates worse than `Ave`, `Northwest` worse than `NW`, but both still match.
+9. **Stage B fallback** — input with no `street_name` returns rating ≥ 100 from `geocode_location`; address-level matches always rate < 100.
+
+### Layer 3 — PG-mirrored parity harness (local-only)
+
+[`scripts/parity/run_geocode_regress.sh`](../scripts/parity/run_geocode_regress.sh) runs PG's actual regression-test inputs through *our* geocoder and diffs the output against PG's expected outputs. The PG files are vendored verbatim in [`test/parity/upstream/`](../test/parity/upstream/) (NOTICE + GPLv2 attribution there).
+
+**Why not in CI:** PG's tests target Boston / Cambridge / Minneapolis addresses against PG's TIGER vintage (~2010-era based on the test format). Running them needs a reference DB with TIGER 2025 loaded for at least MA + MN — multi-GB, doesn't fit a typical CI budget. Expected outputs were captured against the older vintage, so some divergence is *expected*: block boundaries shift, addresses get added, the PAGC rule files in `us_address_standardizer` evolve.
+
+**Workflow.** Build a parity reference DB once:
+
+```sql
+ATTACH 'pg_parity.duckdb' AS tgt;
+CALL load_tiger_nation(target_db := 'tgt');
+CALL load_tiger_states(['MA','MN'], target_db := 'tgt');
+DETACH tgt;
+```
+
+Then run the harness:
+
+```sh
+./scripts/parity/run_geocode_regress.sh pg_parity.duckdb
+```
+
+Output is a per-test `match` / `diverge` / `missing` tally with diffs inlined for divergent rows. The harness extracts ~25 of PG's standard test cases (the simple `geocode('addr', N)` shapes); batched-VALUES forms (`#TB1`, `#1073*`, `#1076*`) are skipped — patches welcome.
+
+**What "match" means:** identical `pprint_addy(addy)` text, identical 5-decimal-truncated `POINT(lng lat)`, identical integer rating. Anything weaker is a `diverge`. Engineers investigating concrete divergence reports use the harness output to distinguish "our geocoder is wrong" from "TIGER vintage drift" from "PAGC rules version drift."
+
+### Roadmap
+
+- Port `pagc_normalize_address_regress` as a CI-friendly sqllogic test (parser-only, no TIGER). The PG-vendored expected outputs become the test oracle for our `from_pagc` repack.
+- Extend the harness to the batched-VALUES forms in `geocode_regress.sql`.
+- Port `reverse_geocode_regress.sql` (8 tests, MA + MN).

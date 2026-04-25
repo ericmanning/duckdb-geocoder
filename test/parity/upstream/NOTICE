@@ -1,0 +1,29 @@
+Vendored regression test files from postgis_tiger_geocoder
+============================================================
+
+Source:   https://gitea.osgeo.org/postgis/postgis_tiger_geocoder
+          (paths: src/regress/*)
+Mirror:   https://github.com/ericmanning/postgis_tiger_geocoder
+License:  GPL v2 (same as us_geocoder)
+Copyright the PostGIS project / individual contributors.
+
+These files are vendored verbatim — no modifications — so the parity
+harness in scripts/parity/ can compare our geocoder's output against
+PostGIS's reference behavior.
+
+Files:
+  geocode_regress.sql                       — input test queries
+  geocode_regress                           — expected outputs from PG
+  pagc_normalize_address_regress.sql        — input parser test queries
+  pagc_normalize_address_regress            — expected outputs from PG
+  pagc_normalize_address_desired_regress    — aspirational outputs (PG TODO list)
+  reverse_geocode_regress.sql               — input reverse-geocode queries
+  reverse_geocode_regress                   — expected outputs from PG
+  regress.sql                               — runner (sets debug flags, includes others)
+
+The expected outputs were captured against a specific TIGER vintage
+(likely 2010-era) using PG's PAGC standardizer rules of that time. Exact
+numeric parity with TIGER 2025 + the current us_address_standardizer
+community extension is not expected — block boundaries shift, addresses
+get added, PAGC rule files evolve. The harness reports diffs; engineers
+investigating divergence claims interpret them.
