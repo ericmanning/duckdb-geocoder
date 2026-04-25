@@ -203,7 +203,8 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                 ELSE 5
               END
             + CASE
-                WHEN ff.p_zip IS NULL OR ff.a_zip IS NULL THEN 0
+                WHEN ff.p_zip IS NULL THEN 1
+                WHEN ff.a_zip IS NULL THEN 0
                 ELSE LEAST(@TIGER@.diff_zip(ff.p_zip, ff.a_zip) * zip_penalty, 20 * zip_penalty)::INTEGER
               END
             + CASE

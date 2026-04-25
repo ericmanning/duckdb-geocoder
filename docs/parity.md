@@ -146,7 +146,7 @@ Of the 23 divergences, the surface tally was misleading until validated against 
 | Class | Tests | Reading |
 |---|---|---|
 | **A. Match PG-with-PAGC, both off vendored by +1** | T3, T6, T9, T18b | Pure parser-version artifact. Vendored expected was built with `normalize_address`, not PAGC. PAGC parses these inputs slightly differently from the built-in. **Not a bug.** |
-| **B. We are 1 lower than PG-with-PAGC and vendored** | T12, T13, T14, T15, T16 | Real arithmetic divergence. Common factor: input has **no ZIP**. PG's [`geocode_address.sql:124-127`](../scripts/parity/pg_compare/tiger_geocoder/src/geocode/geocode_address.sql) uses literal `+1` as the ZIP-term fallback when input ZIP is missing; our [`src/sql/geocode_address.sql.in:206`](../src/sql/geocode_address.sql.in) uses `+0`. Single-character fix. |
+| **B. We were 1 lower than PG-with-PAGC** | T12, T13, T14, T15, T16 | **Fixed.** Common factor: input has **no ZIP**. PG's [`geocode_address.sql:124-127`](../scripts/parity/pg_compare/tiger_geocoder/src/geocode/geocode_address.sql) uses literal `+1` as the ZIP-term fallback when input ZIP is missing; we used `+0`. The CASE in [`src/sql/geocode_address.sql.in:206`](../src/sql/geocode_address.sql.in) now splits the NULL branches (`p_zip IS NULL → 1`, `a_zip IS NULL → 0`, else compute). T12-T16 ratings (1, 1, 1, 11, 11) match PG-with-PAGC exactly post-fix. |
 | **C. Same misparse, different downstream pick** | T18a | Both PAGC implementations misparse "26 Court Street, 02109" (city='STREET'). PG and we both end at rating 18. PG picks "26 Court **Sq**, Boston"; we pick "26 Court **St**, Boston". Tiebreak ordering differs. Worth a separate investigation, but not a rating-arithmetic issue. |
 
 **Reproduce locally:**
@@ -164,7 +164,7 @@ bash scripts/parity/pg_compare/load_tiger_via_pg.sh MA,MN     # ~1 hour
 ) | docker exec -i pgparity psql -U postgres -d parity
 ```
 
-Net: the parity harness's surface "0 match" is inflated by the parser-baseline mismatch. After the no-ZIP +1 fix lands, expect the actual divergence count to drop to T18a only. Investigate T18a if pursuing strict parity becomes a goal.
+Net: the parity harness's surface "0 match" tally against the vendored expected file is heavily inflated by the parser-baseline mismatch (vendored built with the built-in normalizer, our outputs come from PAGC). With the no-ZIP +1 fix landed, T-series tests T2-T16 now match PG-with-PAGC exactly; remaining differences are T18a (tiebreak ordering — we and PG both score "26 Court Street, 02109" candidates equivalently after the misparse, but pick different streets) and the batched-VALUES `#1073…#1145…` tests, which mostly reflect TIGER vintage drift between PG's regress baseline and 2025 data.
 
 ### Roadmap
 
