@@ -12,15 +12,41 @@
 -- The COALESCE cascade on location/state_abbrev/zip is load-bearing
 -- for PostGIS parity — standardize_address sometimes leaves those empty
 -- on addresses where parse_address's blunter regex picks them up.
+--
+-- Both PAGC parsers misparse "26 Court Street, 02109" (no city before ZIP),
+-- consuming the trailing street-type word as the city. The CASE checks below
+-- detect that and recover by injecting the word as street_type and (when both
+-- parsers agree) nulling the location. The hardcoded suffix-word list is
+-- intentionally narrower than `street_type_lookup` — entries like PARK,
+-- PLAZA, GREEN, HEIGHTS are common city names and would mass-trigger the
+-- recovery path on legitimate inputs.
+CREATE OR REPLACE MACRO @TIGER@._is_street_type_word(s) AS (
+    s IS NOT NULL AND upper(s) IN (
+        'STREET','ST','AVENUE','AVE','BOULEVARD','BLVD','ROAD','RD',
+        'DRIVE','DR','LANE','LN','COURT','CT','PLACE','PL','SQUARE','SQ',
+        'TERRACE','TER','HIGHWAY','HWY','PARKWAY','PKWY','CIRCLE','CIR',
+        'TRAIL','TRL','WAY','PLAZA','PLZ','ALLEY','ALY','CROSSING','XING',
+        'EXPRESSWAY','EXPY','FREEWAY','FWY','TURNPIKE','TPKE')
+);
+
 CREATE OR REPLACE MACRO @TIGER@.from_pagc(raw_text) AS (
     SELECT STRUCT_PACK(
         address      := TRY_CAST(regexp_extract(sa.r.house_num, '\d+') AS INTEGER),
         street_name  := NULLIF(trim(sa.r.name), ''),
-        street_type  := @TIGER@.canon_street_type(COALESCE(sa.r.suftype, sa.r.pretype)),
+        street_type  := @TIGER@.canon_street_type(COALESCE(
+                           sa.r.suftype, sa.r.pretype,
+                           CASE WHEN sa.r.suftype IS NULL
+                                 AND @TIGER@._is_street_type_word(sa.r.city)
+                                THEN sa.r.city END)),
         pre_dir      := @TIGER@.canon_dir(sa.r.predir),
         post_dir     := @TIGER@.canon_dir(sa.r.sufdir),
-        location     := COALESCE(NULLIF(trim(sa.r.city), ''),
-                                 NULLIF(trim(pa.r.city), '')),
+        location     := CASE
+                           WHEN @TIGER@._is_street_type_word(sa.r.city)
+                            AND @TIGER@._is_street_type_word(pa.r.city)
+                           THEN NULL
+                           ELSE COALESCE(NULLIF(trim(sa.r.city), ''),
+                                         NULLIF(trim(pa.r.city), ''))
+                        END,
         state_abbrev := @TIGER@.canon_state(COALESCE(NULLIF(trim(sa.r.state), ''),
                                                      NULLIF(trim(pa.r.state), ''))),
         zip          := @TIGER@.canon_zip(COALESCE(

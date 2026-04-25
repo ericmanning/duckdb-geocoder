@@ -135,16 +135,36 @@ Output is a per-test `match` / `diverge` / `missing` tally with diffs inlined fo
 
 ### Baseline (TIGER 2025, April 2026)
 
-Captured at [`test/parity/baseline/geocode_regress.txt`](../test/parity/baseline/geocode_regress.txt). Tally: `0 match / 23 diverge / 35 missing`. Manual classification of the 23 divergences ([details](../test/parity/baseline/README.md)):
+Captured at [`test/parity/baseline/geocode_regress.txt`](../test/parity/baseline/geocode_regress.txt). Tally vs the *vendored* expected file: `0 match / 23 diverge / 35 missing`. The 35 missing are batched-VALUES PG tests the harness regex doesn't extract.
 
-- **10 = TIGER vintage drift** — same address, same rating, position off ≤10 m
-- **4 = small rating-arithmetic difference** — same address, rating off by 1-2
-- **8 = relaxed Stage A/B short-circuit (D7)** — we list extra fallback candidates
-- **1 = semantic divergence** worth investigating (`T18a`: ZIP-only input picks `Court Sq` vs PG's `Court St`)
+Of the 23 divergences, the surface tally was misleading until validated against an actual PG instance running with PAGC enabled. See the next section.
 
-The 35 missing are batched-VALUES PG tests the harness regex doesn't extract.
+### PG-on-PG validation (Docker side-by-side)
 
-Net read: no real geocoder bugs detected against PG, just TIGER drift + the documented D7 relaxation. Investigate `T18a` if pursuing strict parity becomes a goal.
+[`scripts/parity/pg_compare/`](../scripts/parity/pg_compare/) builds a Docker image with PG 16 + PostGIS + the upstream `address_standardizer` + `postgis_tiger_geocoder`, loads TIGER 2025 for MA + MN, and runs PG's `geocode_regress.sql` with `set_geocode_setting('use_pagc_address_parser','true')`. Three-way diff (PG-with-PAGC vs us-with-PAGC vs the vendored expected, which was generated with PG's *built-in* normalizer, not PAGC):
+
+| Class | Tests | Reading |
+|---|---|---|
+| **A. Match PG-with-PAGC, both off vendored by +1** | T3, T6, T9, T18b | Pure parser-version artifact. Vendored expected was built with `normalize_address`, not PAGC. PAGC parses these inputs slightly differently from the built-in. **Not a bug.** |
+| **B. We are 1 lower than PG-with-PAGC and vendored** | T12, T13, T14, T15, T16 | Real arithmetic divergence. Common factor: input has **no ZIP**. PG's [`geocode_address.sql:124-127`](../scripts/parity/pg_compare/tiger_geocoder/src/geocode/geocode_address.sql) uses literal `+1` as the ZIP-term fallback when input ZIP is missing; our [`src/sql/geocode_address.sql.in:206`](../src/sql/geocode_address.sql.in) uses `+0`. Single-character fix. |
+| **C. Same misparse, different downstream pick** | T18a | Both PAGC implementations misparse "26 Court Street, 02109" (city='STREET'). PG and we both end at rating 18. PG picks "26 Court **Sq**, Boston"; we pick "26 Court **St**, Boston". Tiebreak ordering differs. Worth a separate investigation, but not a rating-arithmetic issue. |
+
+**Reproduce locally:**
+
+```sh
+docker build -t duckdb-geocoder-pgparity scripts/parity/pg_compare/
+docker run -d --rm --name pgparity --shm-size=2g \
+    -p 55432:5432 -e POSTGRES_PASSWORD=parity duckdb-geocoder-pgparity
+bash scripts/parity/pg_compare/load_tiger_via_pg.sh MA,MN     # ~1 hour
+
+# Run regress with PAGC enabled
+( echo "SELECT tiger.set_geocode_setting('use_pagc_address_parser','true');"
+  echo "\\pset format unaligned" "\\pset fieldsep '|'" "\\pset tuples_only on"
+  cat scripts/parity/pg_compare/tiger_geocoder/src/regress/geocode_regress.sql
+) | docker exec -i pgparity psql -U postgres -d parity
+```
+
+Net: the parity harness's surface "0 match" is inflated by the parser-baseline mismatch. After the no-ZIP +1 fix lands, expect the actual divergence count to drop to T18a only. Investigate T18a if pursuing strict parity becomes a goal.
 
 ### Roadmap
 
