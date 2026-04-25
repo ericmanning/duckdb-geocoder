@@ -53,7 +53,7 @@ CREATE OR REPLACE MACRO @TIGER@.from_pagc(raw_text) AS (
                            NULLIF(split_part(COALESCE(sa.r.postcode, ''), '-', 1), ''),
                            NULLIF(pa.r.zip, '')))
     )::@TIGER@.geocode_input
-    FROM (SELECT standardize_address('us_lex', 'us_gaz', 'us_rules', raw_text) AS r) sa,
+    FROM (SELECT standardize_address('@TIGER@.pagc_lex', '@TIGER@.pagc_gaz', '@TIGER@.pagc_rules', raw_text) AS r) sa,
          (SELECT parse_address(raw_text) AS r) pa
 );
 

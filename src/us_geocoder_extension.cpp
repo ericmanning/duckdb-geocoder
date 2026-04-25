@@ -70,6 +70,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		ExecuteEmbeddedSql(conn, us_geocoder::CanonMacrosSql(), kDefaultTigerSchema);
 		ExecuteEmbeddedSql(conn, us_geocoder::ScoringMacrosSql(), kDefaultTigerSchema);
 		ExecuteEmbeddedSql(conn, us_geocoder::GeocodeInputTypeSql(), kDefaultTigerSchema);
+		ExecuteEmbeddedSql(conn, us_geocoder::PprintAddySql(), kDefaultTigerSchema);
 		conn.Commit();
 	} catch (...) {
 		conn.Rollback();
@@ -106,7 +107,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 		auto r = conn.Query("SELECT load_us_address_data()");
 		(void)r; // silently no-op if the standardizer ext is absent.
 	}
+	// Populate our own TIGER-tuned PAGC tables (tiger.pagc_lex/gaz/rules)
+	// alongside the community ext's upstream-faithful us_*. from_pagc reads
+	// from tiger.pagc_* via standardize_address(); the us_* tables remain
+	// untouched for any caller that wants the upstream rule set.
 	conn.BeginTransaction();
+	TryRegisterOptional(conn, us_geocoder::PagcTablesSql(), kDefaultTigerSchema);
 	TryRegisterOptional(conn, us_geocoder::FromPagcSql(), kDefaultTigerSchema);
 	conn.Commit();
 
