@@ -1,3 +1,9 @@
+# Local clone of upstream postgis_tiger_geocoder (Docker parity-harness build
+# context). Not tracked — clone separately:
+#   git clone https://github.com/ericmanning/postgis_tiger_geocoder \
+#       scripts/parity/pg_compare/tiger_geocoder
+scripts/parity/pg_compare/tiger_geocoder/
+
 # Prerequisites
 *.d
 
