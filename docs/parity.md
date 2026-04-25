@@ -24,9 +24,11 @@ PG returns a single record with parallel arrays (`intpt[]`, `addy[]`, `street[]`
 
 ### D7: Stage A/B short-circuits relaxed
 
-PG's geocoder has multiple `rating = 0 → return immediately` and `exact_street → skip Stage B` short-circuits. `us_geocoder` computes all Stage A candidates in one vectorized pass and uses `ORDER BY rating LIMIT max_results`; Stage B runs only when Stage A returns zero rows.
+PG's geocoder has multiple `rating = 0 → return immediately` and `exact_street → skip Stage B` short-circuits. PG also has *two* Stage A SQL queries: a primary that filters by ZIP info (uses `+1` as the no-input-ZIP rating fallback) and a fallback that re-runs against location-derived ZIPs (uses `+3` to penalize the weaker confidence). `us_geocoder` computes all Stage A candidates in one vectorized pass and uses `ORDER BY rating LIMIT max_results`; Stage B runs only when Stage A returns zero rows.
 
-**Observable effect:** at tie-rating boundaries (e.g. multiple exact matches on a multi-block street), `us_geocoder` may return a different element of the tie than PG. The top-N set by rating is the same; the *order within a rating tier* can differ.
+**Observable effects:**
+- At tie-rating boundaries (e.g. multiple exact matches on a multi-block street), `us_geocoder` may return a different element of the tie than PG. The top-N set by rating is the same; the *order within a rating tier* can differ.
+- We use `+1` as the no-input-ZIP rating fallback uniformly; PG's primary path uses `+1` and its fallback path uses `+3`. Since we don't reproduce the two-pass structure, we don't have a natural site for the `+3` and it's omitted. In practice this matters only for inputs that *would* trip PG's primary into returning weak-rating candidates; current parity corpus shows no test hitting that boundary except `#1112a` (where we miss a Stage A candidate entirely — separate issue).
 
 ### D8: tract / bg / tabblock20 tables dropped
 
@@ -180,12 +182,21 @@ Comparing that oracle to our output (post +1 fix), 26 of 58 unique test IDs matc
 | #1076g, #1087a/b/c | #1112a (we drop to Stage B where PG finds Stage A) |
 | #1112b/c/d/e, #1113f, #1145c | |
 
-**Three buckets remain:**
+**Two real buckets remain (everything else is upstream parser drift):**
 
-- **Bucket 1 — T18a tiebreak (1 test):** both implementations score "26 Court St" and "26 Court Sq" equivalently after the PAGC misparse; PG picks Sq, we pick St. Add a stable secondary sort key (likely TLID) to match PG's pick.
-- **Bucket 2 — `Old` prequalabr round-trip (5 tests):** PG's `pprint_addy` includes the prequalabr word ("Old Cedar Ave S"); ours strips it. Output formatting issue, not a scoring issue. Fix is in `pprint_addy` / our addy struct.
-- **Bucket 3 — Numeric-named-street ordering (10+ tests):** both PG and we recognize "Co Rd 24" ≡ "24 Co Rd" via `numeric_streets_equal`, but the rating each side assigns the rearranged-name match differs (we score 0, PG scores 25). Investigate `numeric_streets_equal` short-circuit interaction with `rate_attributes`.
-- **Singleton — #1112a Stage A miss:** PG finds "8401 W 35W Svc Rd NE" at rating 10; we don't and fall through to Stage B (rating 100). Our Stage A query has a missing candidate path. Diagnostic: run `geocode_address_impl` directly against this input and see why the candidate isn't materialized.
+- **Bucket 1 — T18a is intentionally better than PG, not a bug:** input "26 Court Street, 02109" has no city-before-ZIP. Both PAGC parsers misparse `city='STREET'`, no `suftype`. PG's [`pagc_normalize_address`](../scripts/parity/pg_compare/tiger_geocoder/src/pagc_normalize/pagc_normalize_address.sql) is a thin COALESCE wrapper around the two parsers — no validation, no recovery — so the misparse flows straight into scoring: `lev('STREET','BOSTON')` ≈ 6 plus `lev('','St')*5` = 10 type penalty per candidate → Court St and Court Sq both rate 18 (true tie, broken arbitrarily toward Court Sq). Our [`from_pagc`](../src/sql/from_pagc.sql.in) adds a post-PAGC validation step PG doesn't have: when both parsers agree the "city" is a street-type word (a hardcoded list of suffix abbreviations), infer `street_type` from that word and null out `location`. That changes our scoring so Court St rates 7 and Court Sq rates 12 (the type-match resolves the tie correctly). We pick Court St — same address as the vendored expected (rating 6), at rating 7. **The workaround is a DuckDB-specific value-add, not a port artifact** — do not remove it in any "bit-match PG exactly" cleanup; doing so would regress this case to PG's wrong-pick.
+
+- **Bucket 2 — `us_address_standardizer` rule-file drift (~15 tests including #1076*, #1112*, #1113*, #1145*):** the DuckDB community extension's PAGC rule files (`us_lex`, `us_gaz`, `us_rules`) materially differ from PG's bundled rule files (`pagc_lex`, `pagc_gaz`, `pagc_rules`). Same `address_standardizer` C library; different rule data. Verified against three concrete cases:
+
+  | Input | Our parse | PG's parse |
+  |-------|-----------|-----------|
+  | `"8401 W 35W Service Dr NE"` | house=`35 W`, name=SERVICE, unit=`# 8401 W` (broken) | house=8401, name=`"35 W"`, suftype=`SVC DR`, sufdir=NE |
+  | `"8040 OLD CEDAR AVE S"` | name=CEDAR, **qual**=OLD (split) | name=`"OLD CEDAR"` (kept together) |
+  | `"16725 Co Rd 24"` | pretype=`COUNTY ROAD`, name=24 | suftype=`CO RD`, name=24 |
+
+  These flow into our geocoder as different field assignments → different scoring/output formatting. **Our geocoder is correct given the parses it receives**; the divergence is upstream of us. Fix is to align the community extension's rule files with PG's, or to monkey-patch our rule-loader to override critical entries. Tracked in [project memory](../.claude/projects/-Users-ericmm-Documents-GitHub-duckdb-geocoder/memory/project_us_address_standardizer_rules.md).
+
+The remaining surface-level divergences (T6, T12, T13, T16 multi-row outputs) reflect documented D7 (relaxed dedup) and float precision at the 5th decimal — first-row picks match.
 
 The full PG-2025-PAGC oracle is the new parity baseline; the original vendored file is retained as historical reference (PG's built-in normalizer + ~2010-era TIGER) but should not be used for new parity work.
 
