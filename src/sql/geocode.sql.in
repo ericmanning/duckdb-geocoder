@@ -50,6 +50,10 @@ CREATE OR REPLACE MACRO @TIGER@.geocode(
     WHERE require_containment IS NULL
        OR require_containment = 'none'
        OR (require_containment IN ('block', 'tract', 'blkgrp') AND containment_guaranteed)
-    ORDER BY rating
+    -- Secondary sort by geom coords keeps tie-breaking deterministic across
+    -- runs. e_tlid (used inside geocode_address_impl) isn't visible here
+    -- after the addy struct is packed; the rounded geom string is the next-
+    -- best stable key and matches the parity harness's output formatting.
+    ORDER BY rating, ST_X(geom), ST_Y(geom)
     LIMIT max_results
 );

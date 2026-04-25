@@ -242,9 +242,14 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
             ) AS containment_guaranteed,
             ROW_NUMBER() OVER (
                 PARTITION BY f_name, COALESCE(f_suftype, f_pretype), f_sufdir, place_name, state_abbrev, a_zip
-                ORDER BY rating, a_fromhn
+                ORDER BY rating, a_fromhn, e_tlid
             ) AS dedup_rn,
-            ROW_NUMBER() OVER (ORDER BY rating) AS rating_rn
+            -- Secondary sort key e_tlid mirrors PG's tfidr/tfidl tiebreak (PG
+            -- breaks rating ties by TIGER face IDs; tlid is the most stable
+            -- equivalent we expose in our pipeline). DuckDB's planner doesn't
+            -- preserve insertion order across windows, so without this ties
+            -- shuffle non-deterministically across runs.
+            ROW_NUMBER() OVER (ORDER BY rating, e_tlid) AS rating_rn
         FROM candidates c
         LEFT JOIN @TIGER@.edge_containment ec
                ON ec.statefp = c.fc_statefp AND ec.tlid = c.e_tlid
@@ -252,5 +257,5 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
     SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
     FROM ranked
     WHERE dedup_rn = 1 AND rating_rn <= max_results
-    ORDER BY rating
+    ORDER BY rating, rating_rn
 );
