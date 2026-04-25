@@ -87,20 +87,7 @@ LOAD us_address_standardizer;
 .separator '|'
 .headers off
 
-CREATE OR REPLACE MACRO pprint_addy(a) AS (
-    REGEXP_REPLACE(
-        TRIM(
-            COALESCE(CAST(a.address AS VARCHAR), '') || ' ' ||
-            COALESCE(a.pre_dir || ' ', '') ||
-            COALESCE(a.street_name || ' ', '') ||
-            COALESCE(a.street_type || ' ', '') ||
-            COALESCE(a.post_dir, '')
-        ) || ', ' ||
-        COALESCE(a.location, '') || ', ' ||
-        COALESCE(a.state_abbrev, '') ||
-        COALESCE(' ' || a.zip, ''),
-        '\\s+', ' ', 'g')
-);
+-- Use the extension's tiger.pprint_addy (handles is_hw type-prepending).
 
 -- DuckDB rejects correlated columns inside the geocode() macro's
 -- internal LIMIT. Workaround: ask for up to 50 candidates (largest
@@ -129,7 +116,7 @@ geocoded AS (
     CROSS JOIN LATERAL tiger.geocode(tiger.from_pagc(raw), 50, NULL, 'none') AS g
 )
 SELECT
-    test_id || '|' || pprint_addy(addy)
+    test_id || '|' || tiger.pprint_addy(addy)
         || CASE WHEN is_batched = 1 THEN '|' || target ELSE '' END
         || '|POINT(' || pt_key || ')|'
         || rating::VARCHAR

@@ -1,0 +1,38 @@
+-- pprint_addy: render an addy struct as the canonical PostGIS-tiger-geocoder
+-- text form ("529 Main St, Boston, MA 02129"). Ported from PG's
+-- src/normalize/pprint_addy.sql.
+--
+-- Two-positional rule for street_type: types flagged is_hw=true in
+-- street_type_lookup ("Co Rd", "Co Hwy", "Hwy", "Camino", ...) get prepended
+-- before the street name ("Co Rd 24"), not appended after ("24 Co Rd").
+-- The is_hw flag in PG's column name is misleading — it covers any
+-- prefix-positioned type, including foreign-influenced names like Camino.
+
+CREATE OR REPLACE MACRO @TIGER@.is_pretype(t) AS (
+    EXISTS (
+        SELECT 1 FROM @TIGER@.street_type_lookup
+        WHERE upper(name) = upper(t) AND is_hw
+    )
+);
+
+CREATE OR REPLACE MACRO @TIGER@.pprint_addy(a) AS (
+    regexp_replace(
+        trim(
+            COALESCE(CAST(a.address AS VARCHAR), '')
+            || COALESCE(' ' || a.pre_dir, '')
+            || CASE WHEN @TIGER@.is_pretype(a.street_type)
+                    THEN COALESCE(' ' || a.street_type, '')
+                    ELSE '' END
+            || COALESCE(' ' || a.street_name, '')
+            || CASE WHEN NOT @TIGER@.is_pretype(a.street_type)
+                    THEN COALESCE(' ' || a.street_type, '')
+                    ELSE '' END
+            || COALESCE(' ' || a.post_dir, '')
+        )
+        || CASE WHEN a.address IS NOT NULL OR a.street_name IS NOT NULL THEN ', ' ELSE '' END
+        || COALESCE(a.location, '')
+        || CASE WHEN a.location IS NOT NULL THEN ', ' ELSE '' END
+        || COALESCE(a.state_abbrev || ' ', '')
+        || COALESCE(a.zip, ''),
+        '\s+', ' ', 'g')
+);
