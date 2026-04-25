@@ -166,6 +166,29 @@ bash scripts/parity/pg_compare/load_tiger_via_pg.sh MA,MN     # ~1 hour
 
 Net: the parity harness's surface "0 match" tally against the vendored expected file is heavily inflated by the parser-baseline mismatch (vendored built with the built-in normalizer, our outputs come from PAGC). With the no-ZIP +1 fix landed, T-series tests T2-T16 now match PG-with-PAGC exactly; remaining differences are T18a (tiebreak ordering — we and PG both score "26 Court Street, 02109" candidates equivalently after the misparse, but pick different streets) and the batched-VALUES `#1073…#1145…` tests, which mostly reflect TIGER vintage drift between PG's regress baseline and 2025 data.
 
+### PG-2025-PAGC oracle (April 2026)
+
+[`scripts/parity/pg_compare/regenerate_expected.sh`](../scripts/parity/pg_compare/regenerate_expected.sh) regenerates [`test/parity/upstream/geocode_regress_2025_pagc`](../test/parity/upstream/geocode_regress_2025_pagc) by running our test inputs through the PG container with `use_pagc_address_parser=true` against TIGER 2025. Output is byte-stable across re-runs (rows ordered by `(test_id, target, rating, geom WKT)`).
+
+Comparing that oracle to our output (post +1 fix), 26 of 58 unique test IDs match PG-2025-PAGC exactly on first-row rating + picked address:
+
+| ✓ Match (26) | ✗ Diverge (32) |
+|---|---|
+| T1-T17, T18b | T18a (tiebreak) |
+| #TB1 (batched) | #1073a/b, #1076a-h, #1145a/b/d/e (numeric-named streets / batched edge cases) |
+| #1074a/b | #1113a-e (prequalabr `Old` handling — PG keeps it, we strip it) |
+| #1076g, #1087a/b/c | #1112a (we drop to Stage B where PG finds Stage A) |
+| #1112b/c/d/e, #1113f, #1145c | |
+
+**Three buckets remain:**
+
+- **Bucket 1 — T18a tiebreak (1 test):** both implementations score "26 Court St" and "26 Court Sq" equivalently after the PAGC misparse; PG picks Sq, we pick St. Add a stable secondary sort key (likely TLID) to match PG's pick.
+- **Bucket 2 — `Old` prequalabr round-trip (5 tests):** PG's `pprint_addy` includes the prequalabr word ("Old Cedar Ave S"); ours strips it. Output formatting issue, not a scoring issue. Fix is in `pprint_addy` / our addy struct.
+- **Bucket 3 — Numeric-named-street ordering (10+ tests):** both PG and we recognize "Co Rd 24" ≡ "24 Co Rd" via `numeric_streets_equal`, but the rating each side assigns the rearranged-name match differs (we score 0, PG scores 25). Investigate `numeric_streets_equal` short-circuit interaction with `rate_attributes`.
+- **Singleton — #1112a Stage A miss:** PG finds "8401 W 35W Svc Rd NE" at rating 10; we don't and fall through to Stage B (rating 100). Our Stage A query has a missing candidate path. Diagnostic: run `geocode_address_impl` directly against this input and see why the candidate isn't materialized.
+
+The full PG-2025-PAGC oracle is the new parity baseline; the original vendored file is retained as historical reference (PG's built-in normalizer + ~2010-era TIGER) but should not be used for new parity work.
+
 ### Roadmap
 
 - Port `pagc_normalize_address_regress` as a CI-friendly sqllogic test (parser-only, no TIGER). The PG-vendored expected outputs become the test oracle for our `from_pagc` repack.

@@ -32,14 +32,32 @@ cd "$(dirname "$0")/../.."
 
 REPO_ROOT="$(pwd)"
 DUCKDB_BIN="${DUCKDB_BIN:-$REPO_ROOT/build/release/duckdb}"
-REF_DB="${1:-}"
-EXPECTED="$REPO_ROOT/test/parity/upstream/geocode_regress"
+REF_DB=""
+BASELINE="${BASELINE:-pg2025}"
+
+# Two positional/flag forms supported:
+#   $0 <reference_db.duckdb>                       # default baseline = pg2025
+#   $0 <reference_db.duckdb> --baseline=vendored   # legacy comparison
+for arg in "$@"; do
+    case "$arg" in
+        --baseline=pg2025|--baseline=vendored) BASELINE="${arg#*=}" ;;
+        *) [[ -z "$REF_DB" ]] && REF_DB="$arg" ;;
+    esac
+done
+
+case "$BASELINE" in
+    pg2025)   EXPECTED="$REPO_ROOT/test/parity/upstream/geocode_regress_2025_pagc" ;;
+    vendored) EXPECTED="$REPO_ROOT/test/parity/upstream/geocode_regress" ;;
+esac
+
 INPUTS="$REPO_ROOT/test/parity/inputs/geocode_regress.csv"
 ACTUAL=/tmp/parity_geocode_actual.txt
 
 if [[ -z "$REF_DB" ]]; then
-    echo "usage: $0 <reference_db.duckdb>" >&2
+    echo "usage: $0 <reference_db.duckdb> [--baseline=pg2025|vendored]" >&2
     echo "  reference_db must have TIGER loaded for MA + MN (and ideally other test states)" >&2
+    echo "  default baseline = pg2025 (PG-with-PAGC against TIGER 2025; the parity oracle)" >&2
+    echo "  --baseline=vendored compares against PG's original expected file (built-in parser, ~2010-era TIGER)" >&2
     exit 2
 fi
 if [[ ! -x "$DUCKDB_BIN" ]]; then
@@ -96,19 +114,28 @@ WITH inputs AS (
 geocoded AS (
     SELECT inputs.test_id, inputs.raw AS target, inputs.max_n,
            inputs.is_batched, g.addy, g.geom, g.rating,
-           ROW_NUMBER() OVER (PARTITION BY inputs.test_id, inputs.raw ORDER BY g.rating) AS rn
+           -- Secondary sort key: 5-decimal-padded point-string. PG's
+           -- ST_AsText(ST_SnapToGrid(geom, 0.00001)) keeps trailing zeros
+           -- ("42.35900"); DuckDB's ROUND-cast drops them ("42.359"). printf
+           -- forces consistent .5f formatting so byte-comparison succeeds.
+           printf('%.5f', ST_X(g.geom)) || ' ' ||
+               printf('%.5f', ST_Y(g.geom)) AS pt_key,
+           ROW_NUMBER() OVER (
+               PARTITION BY inputs.test_id, inputs.raw
+               ORDER BY g.rating,
+                        ROUND(ST_X(g.geom), 5), ROUND(ST_Y(g.geom), 5)
+           ) AS rn
     FROM inputs
     CROSS JOIN LATERAL tiger.geocode(tiger.from_pagc(raw), 50, NULL, 'none') AS g
 )
 SELECT
     test_id || '|' || pprint_addy(addy)
         || CASE WHEN is_batched = 1 THEN '|' || target ELSE '' END
-        || '|POINT(' || ROUND(ST_X(geom), 5)::VARCHAR || ' '
-                     || ROUND(ST_Y(geom), 5)::VARCHAR || ')|'
+        || '|POINT(' || pt_key || ')|'
         || rating::VARCHAR
 FROM geocoded
 WHERE rn <= max_n
-ORDER BY test_id, target, rating;
+ORDER BY test_id, target, rating, pt_key;
 EOF
 
 echo "  wrote $(wc -l < "$ACTUAL" | tr -d ' ') output rows to $ACTUAL"
@@ -121,8 +148,10 @@ echo
 
 ACTUAL_BY_ID=/tmp/parity_actual_by_id.txt
 EXPECTED_BY_ID=/tmp/parity_expected_by_id.txt
-sort "$ACTUAL"   > "$ACTUAL_BY_ID"
-sort "$EXPECTED" > "$EXPECTED_BY_ID"
+# Filter to test-id-prefixed rows (drops `# ...` provenance comments in
+# the pg2025 baseline; harmless on the vendored file which has none).
+grep -E '^[T#][A-Za-z0-9]' "$ACTUAL"   | sort > "$ACTUAL_BY_ID"
+grep -E '^[T#][A-Za-z0-9]' "$EXPECTED" | sort > "$EXPECTED_BY_ID"
 
 ids_actual="$(awk -F'|' '{print $1}' "$ACTUAL_BY_ID"   | sort -u)"
 ids_expected="$(awk -F'|' '{print $1}' "$EXPECTED_BY_ID" | sort -u)"
