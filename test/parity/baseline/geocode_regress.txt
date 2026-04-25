@@ -1,0 +1,197 @@
+Extracting test cases from /Users/ericmm/Documents/GitHub/duckdb-geocoder/test/parity/upstream/geocode_regress.sql ...
+  24 test cases extracted (others skipped — see harness comments)
+Running our geocoder against /Users/ericmm/pg_parity.duckdb ...
+  wrote 51 output rows to /tmp/parity_geocode_actual.txt
+
+Comparing to PG expected (/Users/ericmm/Documents/GitHub/duckdb-geocoder/test/parity/upstream/geocode_regress):
+
+  ✗ #1070a          MISSING (test was not run by harness)
+  ✗ #1070b          MISSING (test was not run by harness)
+  ✗ #1073a          MISSING (test was not run by harness)
+  ! #1073b          diverge
+      1c1,2
+      < #1073b|212 3rd Ave N, Minneapolis, MN 55401|POINT(-93.27181 44.98502)|0
+      ---
+      > #1073b|212 3rd Ave N, Minneapolis, MN 55401|POINT(-93.27173 44.98521)|20
+      > #1073b|212 3rd Ave S, Minneapolis, MN 55401|POINT(-93.26345 44.98092)|22
+  ✗ #1074a          MISSING (test was not run by harness)
+  ✗ #1074b          MISSING (test was not run by harness)
+  ✗ #1076a          MISSING (test was not run by harness)
+  ✗ #1076b          MISSING (test was not run by harness)
+  ✗ #1076c          MISSING (test was not run by harness)
+  ✗ #1076d          MISSING (test was not run by harness)
+  ✗ #1076e          MISSING (test was not run by harness)
+  ✗ #1076f          MISSING (test was not run by harness)
+  ✗ #1076g          MISSING (test was not run by harness)
+  ✗ #1076h          MISSING (test was not run by harness)
+  ! #1087a          diverge
+      1c1
+      < #1087a|75 State St, Boston, MA 02109|POINT(-71.0557 42.35908)|1
+      ---
+      > #1087a|75 State St, Boston, MA 02109|POINT(-71.05559 42.359)|2
+  ! #1087b          diverge
+      1,2c1,3
+      < #1087b|75 State St, Boston, MA 02109|POINT(-71.0557 42.35908)|1
+      < #1087b|75 State St, Milton, MA 02186|POINT(-71.04091 42.25635)|4
+      ---
+      > #1087b|75 State St, Boston, MA 02109|POINT(-71.05559 42.359)|0
+      > #1087b|75 State St, Milton, MA 02186|POINT(-71.04085 42.25627)|3
+      > #1087b|75 State St, Woburn, MA 01801|POINT(-71.14118 42.49865)|4
+  ! #1087c          diverge
+      1c1
+      < #1087c|75 State St, Boston, MA 02109|POINT(-71.0557 42.35908)|0
+      ---
+      > #1087c|75 State St, Boston, MA 02109|POINT(-71.05559 42.359)|0
+  ✗ #1112a          MISSING (test was not run by harness)
+  ✗ #1112b          MISSING (test was not run by harness)
+  ✗ #1112c          MISSING (test was not run by harness)
+  ✗ #1112d          MISSING (test was not run by harness)
+  ✗ #1112e          MISSING (test was not run by harness)
+  ✗ #1113a          MISSING (test was not run by harness)
+  ✗ #1113b          MISSING (test was not run by harness)
+  ✗ #1113c          MISSING (test was not run by harness)
+  ✗ #1113d          MISSING (test was not run by harness)
+  ✗ #1113e          MISSING (test was not run by harness)
+  ✗ #1113f          MISSING (test was not run by harness)
+  ✗ #1145a          MISSING (test was not run by harness)
+  ✗ #1145b          MISSING (test was not run by harness)
+  ✗ #1145c          MISSING (test was not run by harness)
+  ✗ #1145d          MISSING (test was not run by harness)
+  ✗ #1145e          MISSING (test was not run by harness)
+  ✗ #1333a          MISSING (test was not run by harness)
+  ✗ #1333b          MISSING (test was not run by harness)
+  ✗ #1392a          MISSING (test was not run by harness)
+  ✗ #1392b          MISSING (test was not run by harness)
+  ✗ #2899           MISSING (test was not run by harness)
+  ✗ #TB1            MISSING (test was not run by harness)
+  ! T1              diverge
+      1c1
+      < T1|529 Main St, Boston, MA 02129|POINT(-71.07187 42.38351)|0
+      ---
+      > T1|529 Main St, Boston, MA 02129|POINT(-71.07177 42.38357)|0
+  ! T10             diverge
+      1c1
+      < T10|530 Main St, Boston, MA 02129|POINT(-71.07173 42.38345)|0
+      ---
+      > T10|530 Main St, Boston, MA 02129|POINT(-71.07192 42.38343)|0
+  ! T11             diverge
+      1c1
+      < T11|76 State St, Boston, MA 02109|POINT(-71.05615 42.359)|0
+      ---
+      > T11|76 State St, Boston, MA 02109|POINT(-71.05613 42.3591)|0
+  ! T12             diverge
+      1,3c1,5
+      < T12|101 Federal St, Boston, MA 02110|POINT(-71.0563 42.35469)|1
+      < T12|98 Federal Ln, Dedham, MA 02026|POINT(-71.18356 42.2383)|27
+      < T12|99 Federal Ct, Boston, MA 02110|POINT(-71.05672 42.35413)|14
+      ---
+      > T12|101 Federal Ct, Boston, MA 02110|POINT(-71.05671 42.35453)|5
+      > T12|101 Federal St, Blackstone, MA 01504|POINT(-71.52505 42.02755)|5
+      > T12|101 Federal St, Boston, MA 02110|POINT(-71.05646 42.35496)|0
+      > T12|101 Federal St, Lynn, MA 01905|POINT(-70.96771 42.4659)|5
+      > T12|101 Federal St, Montague, MA 01349|POINT(-72.49841 42.57006)|6
+  ! T13             diverge
+      1,3c1,5
+      < T13|101 Federal St, Boston, MA 02110|POINT(-71.0563 42.35469)|1
+      < T13|98 Federal Ln, Dedham, MA 02026|POINT(-71.18356 42.2383)|27
+      < T13|99 Federal Ct, Boston, MA 02110|POINT(-71.05672 42.35413)|14
+      ---
+      > T13|101 Federal Ct, Boston, MA 02110|POINT(-71.05671 42.35453)|5
+      > T13|101 Federal St, Blackstone, MA 01504|POINT(-71.52505 42.02755)|5
+      > T13|101 Federal St, Boston, MA 02110|POINT(-71.05646 42.35496)|0
+      > T13|101 Federal St, Lynn, MA 01905|POINT(-70.96771 42.4659)|5
+      > T13|101 Federal St, Salem, MA 01970|POINT(-70.90086 42.52191)|6
+  ! T14             diverge
+      1c1
+      < T14|101 Federal St, Boston, MA 02110|POINT(-71.0563 42.35469)|1
+      ---
+      > T14|101 Federal St, Boston, MA 02110|POINT(-71.05646 42.35496)|0
+  ! T15             diverge
+      1c1
+      < T15|101 Federal St, Boston, MA 02110|POINT(-71.0563 42.35469)|11
+      ---
+      > T15|101 Federal St, Boston, MA 02110|POINT(-71.05646 42.35496)|10
+  ! T16             diverge
+      1,3c1,16
+      < T16|101 Federal St, Boston, MA 02110|POINT(-71.0563 42.35469)|11
+      < T16|98 Federal Ln, Dedham, MA 02026|POINT(-71.18356 42.2383)|37
+      < T16|99 Federal Ct, Boston, MA 02110|POINT(-71.05672 42.35413)|24
+      ---
+      > T16|101 Federal Ct, Boston, MA 02110|POINT(-71.05671 42.35453)|15
+      > T16|101 Federal St, Agawam Town, MA 01001|POINT(-72.62205 42.08359)|18
+      > T16|101 Federal St, Andover, MA 01810|POINT(-71.20113 42.69016)|17
+      > T16|101 Federal St, Belchertown, MA 01007|POINT(-72.41173 42.29432)|19
+      > T16|101 Federal St, Belchertown, MA 01007|POINT(-72.41201 42.29429)|17
+      > T16|101 Federal St, Beverly, MA 01915|POINT(-70.88123 42.5498)|21
+      > T16|101 Federal St, Blackstone, MA 01504|POINT(-71.52505 42.02755)|15
+      > T16|101 Federal St, Boston, MA 02110|POINT(-71.05646 42.35496)|10
+      > T16|101 Federal St, Greenfield, MA 01301|POINT(-72.5986 42.59079)|20
+      > T16|101 Federal St, Lynn, MA 01905|POINT(-70.96771 42.4659)|15
+      > T16|101 Federal St, Montague, MA 01349|POINT(-72.49841 42.57006)|16
+      > T16|101 Federal St, Northampton, MA 01062|POINT(-72.65527 42.32277)|17
+      > T16|101 Federal St, Salem, MA 01970|POINT(-70.90086 42.52191)|16
+      > T16|101 Federal St, Weymouth Town, MA 02188|POINT(-70.96043 42.20789)|19
+      > T16|101 Federal St, Wilmington, MA 01887|POINT(-71.15319 42.55734)|17
+      > T16|101 Federal St, Woburn, MA 01801|POINT(-71.15344 42.48001)|19
+  ! T17             diverge
+      1c1
+      < T17|77 Massachusetts Ave, Cambridge, MA 02139|POINT(-71.09436 42.35981)|0
+      ---
+      > T17|77 Massachusetts Ave, Cambridge, MA 02139|POINT(-71.09339 42.35893)|0
+  ! T18a            diverge
+      1c1
+      < T18a|26 Court St, Boston, MA 02108|POINT(-71.05885 42.35911)|6
+      ---
+      > T18a|26 Court Sq, Boston, MA 02108|POINT(-71.05918 42.35833)|18
+  ! T18b            diverge
+      1c1
+      < T18b|26 Court St, Boston, MA 02108|POINT(-71.05885 42.35911)|1
+      ---
+      > T18b|26 Court St, Boston, MA 02108|POINT(-71.05916 42.3591)|2
+  ! T2              diverge
+      1c1
+      < T2|75 State St, Boston, MA 02109|POINT(-71.0557 42.35908)|0
+      ---
+      > T2|75 State St, Boston, MA 02109|POINT(-71.05559 42.359)|0
+  ! T3              diverge
+      1c1
+      < T3|100 Federal St, Boston, MA 02110|POINT(-71.05631 42.35477)|1
+      ---
+      > T3|100 Federal St, Boston, MA 02110|POINT(-71.05619 42.35478)|2
+  ! T4              diverge
+      1c1
+      < T4|529 Main St, Boston, MA 02129|POINT(-71.07187 42.38351)|0
+      ---
+      > T4|529 Main St, Boston, MA 02129|POINT(-71.07177 42.38357)|0
+  ! T5              diverge
+      1c1
+      < T5|75 State St, Boston, MA 02109|POINT(-71.0557 42.35908)|0
+      ---
+      > T5|75 State St, Boston, MA 02109|POINT(-71.05559 42.359)|0
+  ! T6              diverge
+      1,2c1,2
+      < T6|100 Federal St, Boston, MA 02110|POINT(-71.05631 42.35477)|1
+      < T6|98 Federal Ct, Boston, MA 02110|POINT(-71.05672 42.35413)|14
+      ---
+      > T6|100 Federal Ct, Boston, MA 02110|POINT(-71.05671 42.35453)|9
+      > T6|100 Federal St, Boston, MA 02110|POINT(-71.05619 42.35478)|2
+  ! T7              diverge
+      1c1
+      < T7|529 Main St, Boston, MA 02129|POINT(-71.07187 42.38351)|0
+      ---
+      > T7|529 Main St, Boston, MA 02129|POINT(-71.07177 42.38357)|0
+  ! T8              diverge
+      1c1
+      < T8|75 State St, Boston, MA 02109|POINT(-71.0557 42.35908)|0
+      ---
+      > T8|75 State St, Boston, MA 02109|POINT(-71.05559 42.359)|0
+  ! T9              diverge
+      1,2c1,2
+      < T9|100 Federal St, Boston, MA 02110|POINT(-71.05631 42.35477)|1
+      < T9|98 Federal Ct, Boston, MA 02110|POINT(-71.05672 42.35413)|14
+      ---
+      > T9|100 Federal Ct, Boston, MA 02110|POINT(-71.05671 42.35453)|9
+      > T9|100 Federal St, Boston, MA 02110|POINT(-71.05619 42.35478)|2
+
+Summary: 0 match | 23 diverge | 35 missing
+Total expected test IDs: 58

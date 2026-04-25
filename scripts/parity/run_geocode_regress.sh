@@ -111,19 +111,28 @@ CREATE OR REPLACE MACRO pprint_addy(a) AS (
         '\\s+', ' ', 'g')
 );
 
+-- DuckDB rejects correlated columns inside the geocode() macro's
+-- internal LIMIT. Workaround: ask for up to 50 candidates (largest
+-- max_n in PG's test set) and trim per-test via ROW_NUMBER below.
 WITH inputs AS (
     SELECT * FROM read_csv('$INPUTS', header=true, auto_detect=true)
+),
+geocoded AS (
+    SELECT inputs.test_id, inputs.max_n, g.addy, g.geom, g.rating,
+           ROW_NUMBER() OVER (PARTITION BY inputs.test_id ORDER BY g.rating) AS rn
+    FROM inputs
+    CROSS JOIN LATERAL tiger.geocode(tiger.from_pagc(raw), 50, NULL, 'none') AS g
 )
 SELECT
-    inputs.test_id || '|' ||
-    pprint_addy(g.addy) || '|' ||
+    test_id || '|' ||
+    pprint_addy(addy) || '|' ||
     'POINT(' ||
-        ROUND(ST_X(g.geom), 5)::VARCHAR || ' ' ||
-        ROUND(ST_Y(g.geom), 5)::VARCHAR ||
+        ROUND(ST_X(geom), 5)::VARCHAR || ' ' ||
+        ROUND(ST_Y(geom), 5)::VARCHAR ||
     ')|' ||
-    g.rating::VARCHAR
-FROM inputs
-CROSS JOIN LATERAL tiger.geocode(tiger.from_pagc(raw), max_n) AS g
+    rating::VARCHAR
+FROM geocoded
+WHERE rn <= max_n
 ORDER BY test_id, rating;
 EOF
 
@@ -148,8 +157,8 @@ n_diverge=0
 n_missing=0
 
 for id in $ids_expected; do
-    exp_rows=$(grep "^${id}|" "$EXPECTED_BY_ID" | sort)
-    act_rows=$(grep "^${id}|" "$ACTUAL_BY_ID"   | sort)
+    exp_rows=$(grep "^${id}|" "$EXPECTED_BY_ID" | sort || true)
+    act_rows=$(grep "^${id}|" "$ACTUAL_BY_ID"   | sort || true)
     if [[ -z "$act_rows" ]]; then
         printf "  ✗ %-15s MISSING (test was not run by harness)\n" "$id"
         n_missing=$((n_missing + 1))
@@ -158,7 +167,7 @@ for id in $ids_expected; do
         n_match=$((n_match + 1))
     else
         printf "  ! %-15s diverge\n" "$id"
-        diff <(echo "$exp_rows") <(echo "$act_rows") | sed 's/^/      /'
+        diff <(echo "$exp_rows") <(echo "$act_rows") 2>/dev/null | sed 's/^/      /' || true
         n_diverge=$((n_diverge + 1))
     fi
 done

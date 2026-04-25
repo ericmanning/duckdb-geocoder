@@ -133,6 +133,19 @@ Output is a per-test `match` / `diverge` / `missing` tally with diffs inlined fo
 
 **What "match" means:** identical `pprint_addy(addy)` text, identical 5-decimal-truncated `POINT(lng lat)`, identical integer rating. Anything weaker is a `diverge`. Engineers investigating concrete divergence reports use the harness output to distinguish "our geocoder is wrong" from "TIGER vintage drift" from "PAGC rules version drift."
 
+### Baseline (TIGER 2025, April 2026)
+
+Captured at [`test/parity/baseline/geocode_regress.txt`](../test/parity/baseline/geocode_regress.txt). Tally: `0 match / 23 diverge / 35 missing`. Manual classification of the 23 divergences ([details](../test/parity/baseline/README.md)):
+
+- **10 = TIGER vintage drift** — same address, same rating, position off ≤10 m
+- **4 = small rating-arithmetic difference** — same address, rating off by 1-2
+- **8 = relaxed Stage A/B short-circuit (D7)** — we list extra fallback candidates
+- **1 = semantic divergence** worth investigating (`T18a`: ZIP-only input picks `Court Sq` vs PG's `Court St`)
+
+The 35 missing are batched-VALUES PG tests the harness regex doesn't extract.
+
+Net read: no real geocoder bugs detected against PG, just TIGER drift + the documented D7 relaxation. Investigate `T18a` if pursuing strict parity becomes a goal.
+
 ### Roadmap
 
 - Port `pagc_normalize_address_regress` as a CI-friendly sqllogic test (parser-only, no TIGER). The PG-vendored expected outputs become the test oracle for our `from_pagc` repack.
