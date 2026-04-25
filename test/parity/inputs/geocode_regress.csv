@@ -1,0 +1,54 @@
+test_id,raw,max_n,is_batched
+T1,"529 Main Street, Boston, MA 02129",1,0
+T2,"75 State Street, Boston, MA 02109",1,0
+T3,"100 Federal Street, Boston, MA 02109",1,0
+T4,"529 Main Street, Boston, MA 02129",10,0
+T5,"75 State Street, Boston, MA 02109",10,0
+T6,"100 Federal Street, Boston,MA 02109",10,0
+T7,"529 Main Street, Boston, MA 02129",20,0
+T8,"75 State Street, Boston, MA 02109",20,0
+T9,"100 Federal Street, Boston, MA 02109",20,0
+T10,"530 Main Street, Boston MA, 02129",1,0
+T11,"76 State Street, Boston MA, 02109",1,0
+T12,"101 Federal Street, Boston, MA",20,0
+#TB1,"24 School Street, Boston, MA 02108",1,1
+#TB1,"20 School Street, Boston, MA 02109",1,1
+T13,"101 Federal Street, Boston MA",20,0
+T14,"101 Federal Street, Boston MA",1,0
+T15,"101 Fedaral Street, Boston, MA",1,0
+T16,"101 Fedaral Street, Boston, MA",50,0
+T17,"77 Massachusetts Avenue, Cambridge, MA 02139",1,0
+T18a,"26 Court Street, 02109",1,0
+T18b,"26 Court Street,Boston,02109",1,0
+#1087a,"75 State Street, Boston, MA 02110",3,0
+#1087b,"75 State Street, Boston, MA",3,0
+#1087c,"75 State Street, Boston, MA 02109",1,0
+#1073a,"212 3rd Ave N, MINNEAPOLIS, MN 553404",2,1
+#1073b,"212 3rd Ave N, MINNEAPOLIS, MN 55401-",2,0
+#1076a,"16725 Co Rd 24, Plymouth, MN 55447",10,1
+#1076b,"16725 County Road 24, Plymouth, MN 55447",1,1
+#1076c,"13800 County Hwy 9, Andover, MN 55304",1,1
+#1076d,"13800 9, Andover, MN 55304",1,1
+#1076e,"3900 Route 6, Eastham, Massachusetts 02642",4,1
+#1076f,"1940 County Road C W, Roseville, MN 55113",3,1
+#1076g,"15709 Rockford Road, Plymouth, MN 55447",10,1
+#1076h,"300 Rt 3A, Hingham, MA",3,1
+#1074a,"8525 COTTAGE WOOD TERR, Blaine, MN 55434",10,1
+#1074b,"8525 COTTAGEWOOD TERR, Blaine, MN 55434",10,1
+#1112a,"8401 W 35W Service Dr NE, Blaine, MN 55449",2,1
+#1112b,"8401 35W, Blaine, MN 55449",1,1
+#1112c,"8401 35W West, Blaine, MN 55449",1,1
+#1112d,"8401 West 35W, Blaine, MN 55449",1,1
+#1112e,"8401 W 35W, Blaine, MN 55449",1,1
+#1113a,"8040 OLD CEDAR AVE S, BLOOMINGTON, MN 55425",2,1
+#1113b,"8040 CEDAR AVE S, BLOOMINGTON, MN 55425",2,1
+#1113c,"17405 Old Rockford Rd, Plymouth, MN 55446",2,1
+#1113d,"17405 Rockford Rd, Plymouth, MN 55446",2,1
+#1113e,"198 OLD CONSTANCE BLVD, ANDOVER, MN 55304",2,1
+#1113f,"198 CONSTANCE BLVD, ANDOVER, MN 55304",2,1
+#1145a,"4051 27th Ave S Minneapolis MN 55405",2,1
+#1145b,"3625 18th Ave S Minneapolis MN 55406",2,1
+#1145c,"4057 10th Ave S Minneapolis MN 55406",2,1
+#1145d,"8512 141 St Ct Apple Valley MN 55124",2,1
+#1145e,"103 36th St W Minneapolis MN 55409",10,1
+#2899,"22 Minnow Ln, Westbrook, CT 06498",1,0

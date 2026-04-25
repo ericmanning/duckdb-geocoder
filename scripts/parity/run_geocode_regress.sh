@@ -34,7 +34,7 @@ REPO_ROOT="$(pwd)"
 DUCKDB_BIN="${DUCKDB_BIN:-$REPO_ROOT/build/release/duckdb}"
 REF_DB="${1:-}"
 EXPECTED="$REPO_ROOT/test/parity/upstream/geocode_regress"
-INPUT_SQL="$REPO_ROOT/test/parity/upstream/geocode_regress.sql"
+INPUTS="$REPO_ROOT/test/parity/inputs/geocode_regress.csv"
 ACTUAL=/tmp/parity_geocode_actual.txt
 
 if [[ -z "$REF_DB" ]]; then
@@ -50,40 +50,13 @@ if [[ ! -f "$REF_DB" ]]; then
     echo "ERROR: reference DB not found: $REF_DB" >&2
     exit 2
 fi
-if [[ ! -f "$EXPECTED" ]] || [[ ! -f "$INPUT_SQL" ]]; then
-    echo "ERROR: vendored PG files missing under test/parity/upstream/" >&2
+if [[ ! -f "$EXPECTED" ]] || [[ ! -f "$INPUTS" ]]; then
+    echo "ERROR: parity files missing — expected $EXPECTED and $INPUTS" >&2
     exit 2
 fi
-
-# Extract (test_id, raw_address, max_n) tuples from PG's geocode_regress.sql.
-# PG queries take many shapes:
-#   SELECT 'T1', ... FROM geocode('529 Main Street, Boston, MA 02129',1);
-#   SELECT 'T4', ... FROM geocode('529 Main Street, Boston, MA 02129');                  -- default max_n
-#   SELECT '#1070a' As ticket, ... FROM geocode('100 Federal Street, MA',3, ...);        -- with restrict_geom
-#   SELECT 'TB1' As ticket, pprint_addy((g).addy) ... FROM (SELECT geocode(target,1) ...  -- batched VALUES
-# We grep the simple 'T*' / '#*' shapes and skip the more exotic ones —
-# the script reports which test IDs were skipped so the user knows.
-echo "Extracting test cases from $INPUT_SQL ..."
-INPUTS=/tmp/parity_geocode_inputs.csv
-{
-    echo "test_id,raw,max_n"
-    # Match: SELECT '<id>' [As ticket], ... FROM geocode('<addr>', <n>?);
-    # We deliberately don't try to parse the batched VALUES forms —
-    # those (TB1, #1073a, #1076*, etc.) are skipped. Coverage of the
-    # first 25 standard tests is enough to detect baseline divergence.
-    grep -nE "FROM geocode\('[^']+'" "$INPUT_SQL" \
-        | grep -vE "FROM \(SELECT geocode" \
-        | grep -vE "geocode\(target" \
-        | sed -nE "s/^([0-9]+):.*'([^']+)'[^']*FROM geocode\('([^']+)'(,\s*([0-9]+))?[^()]*\).*/\2|\3|\5/p" \
-        | awk -F'|' '{n=$3; if (n=="") n=10; printf "%s,\"%s\",%s\n", $1, $2, n}'
-} > "$INPUTS"
 
 n_inputs=$(($(wc -l < "$INPUTS") - 1))
-echo "  $n_inputs test cases extracted (others skipped — see harness comments)"
-if (( n_inputs == 0 )); then
-    echo "ERROR: no testable inputs extracted; harness regex may be out of date" >&2
-    exit 2
-fi
+echo "Loaded $n_inputs test cases from $INPUTS"
 
 # Run our geocoder against each test case, output in PG's pipe-delimited format.
 # PG's pprint_addy(addy) format: "<num> <pre_dir> <street_name> <street_type>, <city>, <state> <zip>"
@@ -114,26 +87,28 @@ CREATE OR REPLACE MACRO pprint_addy(a) AS (
 -- DuckDB rejects correlated columns inside the geocode() macro's
 -- internal LIMIT. Workaround: ask for up to 50 candidates (largest
 -- max_n in PG's test set) and trim per-test via ROW_NUMBER below.
+-- Output shape mirrors PG's expected file:
+--   simple tests:   <id>|<address>|<point>|<rating>      (4 fields)
+--   batched tests:  <id>|<address>|<target>|<point>|<rating>  (5 fields)
 WITH inputs AS (
     SELECT * FROM read_csv('$INPUTS', header=true, auto_detect=true)
 ),
 geocoded AS (
-    SELECT inputs.test_id, inputs.max_n, g.addy, g.geom, g.rating,
-           ROW_NUMBER() OVER (PARTITION BY inputs.test_id ORDER BY g.rating) AS rn
+    SELECT inputs.test_id, inputs.raw AS target, inputs.max_n,
+           inputs.is_batched, g.addy, g.geom, g.rating,
+           ROW_NUMBER() OVER (PARTITION BY inputs.test_id, inputs.raw ORDER BY g.rating) AS rn
     FROM inputs
     CROSS JOIN LATERAL tiger.geocode(tiger.from_pagc(raw), 50, NULL, 'none') AS g
 )
 SELECT
-    test_id || '|' ||
-    pprint_addy(addy) || '|' ||
-    'POINT(' ||
-        ROUND(ST_X(geom), 5)::VARCHAR || ' ' ||
-        ROUND(ST_Y(geom), 5)::VARCHAR ||
-    ')|' ||
-    rating::VARCHAR
+    test_id || '|' || pprint_addy(addy)
+        || CASE WHEN is_batched = 1 THEN '|' || target ELSE '' END
+        || '|POINT(' || ROUND(ST_X(geom), 5)::VARCHAR || ' '
+                     || ROUND(ST_Y(geom), 5)::VARCHAR || ')|'
+        || rating::VARCHAR
 FROM geocoded
 WHERE rn <= max_n
-ORDER BY test_id, rating;
+ORDER BY test_id, target, rating;
 EOF
 
 echo "  wrote $(wc -l < "$ACTUAL" | tr -d ' ') output rows to $ACTUAL"
