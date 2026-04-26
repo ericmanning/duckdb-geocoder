@@ -1,9 +1,20 @@
--- The 8-field public input contract for geocode().
+-- The 9-field public input contract for geocode().
 -- See geocode_flow.md §14 for the full format contract.
-CREATE TYPE IF NOT EXISTS @TIGER@.geocode_input AS STRUCT(
+--
+-- `internal` is the unit/suite/apt number — PAGC's `unit` field, with the
+-- leading '#' stripped. Matches PG's `norm_addy.internal`. Captured so
+-- compound addresses like "8512 141 St Ct" (where 8512 is a unit, not a
+-- house number) round-trip with the unit info preserved.
+--
+-- CREATE OR REPLACE TYPE re-creates if the schema differs (DuckDB allows
+-- this for STRUCT types). On upgrade from a 0.x DB this widens the type
+-- in place; existing geocode_input usages without `internal` will fail
+-- the type cast — callers building structs need to add `internal := NULL`.
+CREATE OR REPLACE TYPE @TIGER@.geocode_input AS STRUCT(
     address      INTEGER,
     street_name  VARCHAR,
     street_type  VARCHAR,
+    internal     VARCHAR,
     pre_dir      VARCHAR,
     post_dir     VARCHAR,
     location     VARCHAR,

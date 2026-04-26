@@ -116,6 +116,7 @@ CREATE OR REPLACE MACRO @TIGER@.reverse_geocode(pt, max_results) AS TABLE (
             address      := hn,
             street_name  := NULL::VARCHAR,
             street_type  := NULL::VARCHAR,
+            internal     := NULL::VARCHAR,
             pre_dir      := NULL::VARCHAR,
             post_dir     := NULL::VARCHAR,
             location     := (SELECT place_name FROM place_hit),

@@ -38,6 +38,17 @@ CREATE OR REPLACE MACRO @TIGER@.from_pagc(raw_text) AS (
                            CASE WHEN sa.r.suftype IS NULL
                                  AND @TIGER@._is_street_type_word(sa.r.city)
                                 THEN sa.r.city END)),
+        -- internal: PAGC's unit field, '#'-stripped + whitespace-collapsed.
+        -- Matches PG's pagc_normalize_address.sql:49 transformation:
+        --   regexp_replace(replace(unit, '#', ''), '([0-9]+)\s+([A-Za-z]){0,1}', '\1\2')
+        -- Captures unit/suite/apt numbers (e.g. "# 8512" → "8512").
+        internal     := NULLIF(
+                           trim(regexp_replace(
+                                regexp_replace(
+                                    COALESCE(sa.r.unit, ''),
+                                    '#', '', 'g'),
+                                '([0-9]+)\s+([A-Za-z]?)', '\1\2', 'g')),
+                           ''),
         pre_dir      := @TIGER@.canon_dir(sa.r.predir),
         post_dir     := @TIGER@.canon_dir(sa.r.sufdir),
         location     := CASE

@@ -127,6 +127,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_intersection(
             address      := TRY_CAST(hn AS INTEGER),
             street_name  := r1_name,
             street_type  := COALESCE(suftypabrv, pretypabrv),
+            internal     := NULL::VARCHAR,
             pre_dir      := predirabrv,
             post_dir     := sufdirabrv,
             location     := in_city,

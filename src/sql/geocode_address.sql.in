@@ -44,6 +44,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
             inp['address']      AS address,
             inp['street_name']  AS street_name,
             inp['street_type']  AS street_type,
+            inp['internal']     AS internal,
             inp['pre_dir']      AS pre_dir,
             inp['post_dir']     AS post_dir,
             inp['location']     AS location,
@@ -89,7 +90,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                p.window_zips, p.street_name AS p_street_name,
                p.street_type AS p_street_type, p.zip AS p_zip,
                p.pre_dir AS p_pre_dir, p.post_dir AS p_post_dir,
-               p.location AS p_location, p.address AS p_address
+               p.location AS p_location, p.address AS p_address, p.internal AS p_internal
         FROM @TIGER@.featnames f JOIN p
              ON f.statefp = p.statefp
             AND f.name_lower = p.street_name_lower
@@ -100,7 +101,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
                f.pretypabrv, f.sufdirabrv, f.prequalabr,
                p.window_zips, p.street_name, p.street_type, p.zip,
-               p.pre_dir, p.post_dir, p.location, p.address
+               p.pre_dir, p.post_dir, p.location, p.address, p.internal
         FROM @TIGER@.featnames f JOIN p
              ON f.statefp = p.statefp
             AND f.fullname_norm = p.fullname_norm_input
@@ -111,7 +112,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
                f.pretypabrv, f.sufdirabrv, f.prequalabr,
                p.window_zips, p.street_name, p.street_type, p.zip,
-               p.pre_dir, p.post_dir, p.location, p.address
+               p.pre_dir, p.post_dir, p.location, p.address, p.internal
         FROM @TIGER@.featnames f, p
         WHERE f.statefp = p.statefp
           AND p.street_name IS NOT NULL
@@ -126,7 +127,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
                f.pretypabrv, f.sufdirabrv, f.prequalabr,
                p.window_zips, p.street_name, p.street_type, p.zip,
-               p.pre_dir, p.post_dir, p.location, p.address
+               p.pre_dir, p.post_dir, p.location, p.address, p.internal
         FROM @TIGER@.featnames f, p
         WHERE f.statefp = p.statefp
           AND p.street_name IS NOT NULL
@@ -144,7 +145,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
                f.pretypabrv, f.sufdirabrv, f.prequalabr,
                p.window_zips, p.street_name, p.street_type, p.zip,
-               p.pre_dir, p.post_dir, p.location, p.address
+               p.pre_dir, p.post_dir, p.location, p.address, p.internal
         FROM @TIGER@.featnames f JOIN p
              ON f.statefp = p.statefp
             AND f.name_soundex = p.street_name_soundex
@@ -156,7 +157,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
                f.pretypabrv, f.sufdirabrv, f.prequalabr,
                p.window_zips, p.street_name, p.street_type, p.zip,
-               p.pre_dir, p.post_dir, p.location, p.address
+               p.pre_dir, p.post_dir, p.location, p.address, p.internal
         FROM @TIGER@.featnames f, p
         WHERE f.statefp = p.statefp
           AND p.street_name IS NOT NULL
@@ -174,7 +175,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
             a.fromhn, a.tohn, a.side, a.zip AS a_zip,
             e.tlid AS e_tlid, e.statefp AS e_statefp, e.countyfp AS e_countyfp,
             e.tfidl, e.tfidr, e.mtfcc AS e_mtfcc, e.the_geom AS edge_geom,
-            f.p_address, f.p_location, f.p_pre_dir, f.p_post_dir,
+            f.p_address, f.p_location, f.p_pre_dir, f.p_post_dir, f.p_internal,
             f.p_street_name, f.p_street_type, f.p_zip, f.window_zips
         FROM name_match_tlids f
         JOIN @TIGER@.addr  a ON a.tlid = f.tlid AND a.statefp = f.statefp
@@ -220,6 +221,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
             st.stusps           AS state_abbrev,
             ff.p_address        AS p_address,
             ff.p_location       AS p_location,
+            ff.p_internal       AS p_internal,
             @TIGER@.rate_attributes(
                 ff.p_pre_dir, ff.predirabrv,
                 ff.p_street_name, ff.name,
@@ -298,6 +300,10 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                                   ELSE f_name
                                 END,
                 street_type  := COALESCE(f_suftype, f_pretype),
+                -- internal (unit/suite) round-trips from input — TIGER edges
+                -- don't carry unit info, so we pass through whatever PAGC
+                -- captured. Matches PG: addy.internal := parsed.internal.
+                internal     := p_internal,
                 pre_dir      := f_predir,
                 post_dir     := f_sufdir,
                 location     := COALESCE(place_name, cousub_name, county_name, p_location),

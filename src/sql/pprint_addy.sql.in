@@ -30,6 +30,10 @@ CREATE OR REPLACE MACRO @TIGER@.pprint_addy(a) AS (
             || COALESCE(' ' || a.post_dir, '')
         )
         || CASE WHEN a.address IS NOT NULL OR a.street_name IS NOT NULL THEN ', ' ELSE '' END
+        -- Internal (unit/suite) renders between street and location, matching
+        -- PG's pprint_addy.sql:33-34 ordering.
+        || COALESCE(a.internal, '')
+        || CASE WHEN a.internal IS NOT NULL THEN ', ' ELSE '' END
         || COALESCE(a.location, '')
         || CASE WHEN a.location IS NOT NULL THEN ', ' ELSE '' END
         || COALESCE(a.state_abbrev || ' ', '')
