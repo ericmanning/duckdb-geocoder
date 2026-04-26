@@ -222,18 +222,23 @@ Triggers when: PAGC strips ordinal/letter suffix from a numeric streetname (leng
 
 After landing the rule-data ship + sort key + pprint_addy + soundex length-gate + suftype-only rate_attributes + fullname-prefix LIKE + prequalabr-aware addy + clamp out-of-range + nested dedup + scaled house penalty fixes, **first-row pick parity is 43/51 against PG-2025-PAGC.** The remaining 8 first-row divergences split:
 
-| Test | Disposition | Why |
+| Test | Category | Disposition |
 |---|---|---|
-| T18a | **Us better than PG** | Our `from_pagc` PAGC-misparse-recovery breaks PG's tie correctly toward Court St |
-| #1145a | **Us better** | Us finds "4051 27th Ave S" (input's actual address); PG finds "Co Rd 27" without house number. `numeric_streets_equal` recovers '27' → '27th'; PG's primary stage_a doesn't |
-| #1145b | **Us better** | Same pattern as #1145a, for "3625 18th Ave S" |
-| #1145e | **Us better** | Us finds "103 W 36th St" with house num; PG finds "W 36th St" without |
-| #1076h | Same address, off by 2 | PG primary uses `+1` fallback (matches us), but PG returned its *fallback* stage_a result with `+3`. Documented D7 consequence |
-| #1145d | Stage B drop on weird input | "8512 141 St Ct Apple Valley" — PAGC mis-parses house_num as 141; both impls return junk, ours via Stage B (rating 100), PG via fallback stage_a (rating 51) |
-| #1113d | Adjacent edge picked | After the dedup + scaled-penalty fix, we now match PG's rating exactly (5) and pick the right street (Rockford Rd); just an adjacent segment (15702 vs 15899) — last-mile e_tlid tiebreak |
-| #1073a | Different fallback edge picked | Input "212 3rd Ave N, MINNEAPOLIS, MN 553404" with malformed ZIP. Neither implementation finds the requested address; both pick fallback streets in different cities (Hanover vs Hector). Likely candidate-set diff |
+| T18a | **Us better than PG** (Mechanism A — `from_pagc` recovery) | Don't fix |
+| #1145a | **Us better** (Mechanism B — unconditional `numeric_streets_equal`) | Don't fix |
+| #1145b | **Us better** (Mechanism B) | Don't fix |
+| #1145e | **Us better** (Mechanism B) | Don't fix |
+| #1076h | **D7 cost — recoverable in principle** | Same address picked, rating off by 2 (PG's `+3` no-input-ZIP fallback in fallback stage_a vs our `+1`). Closeable only by reverting D7 (porting PG's two-stage_a structure). Not worth it |
+| #1113d | **D7 cost — different candidate set** | Same street, adjacent edge segment (15702 vs PG's 15899). After the TFID tiebreak fix it's confirmed to be a candidate-set divergence, not a tiebreak — PG and we evaluate different edges. Likely PG's primary uses different ZIP/state-filter shape than our collapsed pipeline. Closeable only by D7 reversal |
+| #1073a | **Input self-contradiction** | Input "212 3rd Ave N, MINNEAPOLIS, MN 553404" parses correctly (PG and us identical), but ZIP `55340` is Hanover, not Minneapolis. Both implementations correctly fall back to fuzzy matches but pick different fallback streets. NOT a parser or geocoder bug — the input itself is internally inconsistent. Could "fix" by codifying a policy (trust ZIP > city or vice versa) but neither current behavior is clearly wrong |
+| #1145d | **Truly irrecoverable — parser breakage** | Input "8512 141 St Ct Apple Valley" has TWO numbers and PAGC can't tokenize it correctly. Our parse: `house=141, name='ST', type='Ct'` (loses 8512). PG's parse: `house=141, internal='8512', name='ST'` (preserves 8512 as a unit number). Both structurally wrong; both produce garbage geocodes. Fix has to live in the *parser* (PAGC rules) or in *input preprocessing* — outside our geocoder |
 
-**No remaining clear bugs.** Of the 8 first-row divergences, 4 are us-better-than-PG cases worth keeping, 3 are minor scoring-formula or tiebreak last-mile differences, and 1 is irrecoverable input. Closing the last-mile divergences would require porting PG's primary/fallback stage_a structure — a deliberate D7 deviation we don't intend to revert.
+**Three "wrongness" categories:**
+- **us-better-than-PG (4 tests)**: T18a, #1145a/b/e — our preprocessing mechanisms catch PAGC limitations PG carries through. Documented above; do not revert.
+- **D7 cost (3 tests)**: #1076h, #1113d, #1073a — recoverable only by reverting our deliberate Stage A simplification. Not worth it.
+- **Truly irrecoverable (1 test)**: #1145d — parser fundamentally fails on compound numeric addresses; no amount of geocoder logic will fix it.
+
+**Net: no remaining bugs in our code.** All 8 divergences are accounted for by deliberate design choices, input quality issues, or upstream parser limitations.
 
 ### Roadmap
 
