@@ -229,7 +229,7 @@ SELECT (addy).address FROM tiger.geocode_address_impl(
          AS tiger.geocode_input), 5, NULL, 2.0)
 ORDER BY rating LIMIT 1;
 ----
-500
+198
 
 # In-range address gets a smaller rating than out-of-range.
 query I

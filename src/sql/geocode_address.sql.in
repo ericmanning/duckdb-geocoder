@@ -261,7 +261,24 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
     ranked AS (
         SELECT
             STRUCT_PACK(
-                address      := p_address,
+                -- Match PG's behavior: when the input house number falls
+                -- inside the candidate edge's range with parity match
+                -- ("exact_address"), echo it back as-is. Otherwise clamp
+                -- to the nearest endpoint of the edge's range — gives a
+                -- more useful output (an address that actually exists on
+                -- the picked edge) than echoing back the user's possibly-
+                -- bogus number.
+                address      := CASE
+                                  WHEN p_address IS NULL OR a_fromhn IS NULL THEN p_address
+                                  WHEN p_address BETWEEN @TIGER@.least_hn(a_fromhn, a_tohn)
+                                                     AND @TIGER@.greatest_hn(a_fromhn, a_tohn)
+                                       AND (p_address % 2) = (@TIGER@.greatest_hn(a_fromhn, a_tohn) % 2)
+                                  THEN p_address
+                                  WHEN p_address > @TIGER@.greatest_hn(a_fromhn, a_tohn)
+                                       AND p_address > @TIGER@.least_hn(a_fromhn, a_tohn)
+                                  THEN @TIGER@.greatest_hn(a_fromhn, a_tohn)
+                                  ELSE @TIGER@.least_hn(a_fromhn, a_tohn)
+                                END,
                 -- Mirror PG's `fename` concept: candidate street name is
                 -- `prequalabr || ' ' || name` so prequalabr-bearing TIGER
                 -- entries (e.g. name='Cedar', prequalabr='Old') render as
