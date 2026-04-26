@@ -200,6 +200,24 @@ The remaining surface-level divergences (T6, T12, T13, T16 multi-row outputs) re
 
 The full PG-2025-PAGC oracle is the new parity baseline; the original vendored file is retained as historical reference (PG's built-in normalizer + ~2010-era TIGER) but should not be used for new parity work.
 
+### Documented improvements over PG (deliberate divergences)
+
+Two specific mechanisms in our pipeline produce *better* results than PG-with-PAGC on certain inputs. Both are intentional; **don't remove them in any "match PG bit-for-bit" cleanup**.
+
+**Mechanism A — `from_pagc` post-PAGC validation** (resolves T18a-class).
+
+PG's [`pagc_normalize_address`](../scripts/parity/pg_compare/tiger_geocoder/src/pagc_normalize/pagc_normalize_address.sql) is a thin COALESCE wrapper around two PAGC parsers — no validation, no recovery. Whatever PAGC says, PG accepts. For inputs with no city before the ZIP (e.g. `"26 Court Street, 02109"`), PAGC misparses `city='STREET'`; PG inflates the rating by paying `lev('STREET','BOSTON') ≈ 6` against every Boston candidate.
+
+Our [`from_pagc`](../src/sql/from_pagc.sql.in) detects when both parsers agree the "city" is one of a hardcoded list of street-type words, infers `street_type` from that word, and nulls `location`. Triggers when: input has no recognizable city before the ZIP AND the trailing word is a street-type abbreviation.
+
+**Mechanism B — `numeric_streets_equal` always on in candidate-finding** (resolves #1145a/b/e-class).
+
+PAGC strips ordinal suffixes: `"27th"` → name=`'27'`, `"36th"` → `'36'`, `"18th"` → `'18'`. PG's primary stage_a uses ONLY exact `f.name = $2` for short streetnames (length ≤ 5), so it can't match TIGER's `name='27th'` from input `'27'`. PG has a `numeric_streets_equal` clause but only in its **fallback** stage_a, which runs only if primary's best rating ≥ 30. For `#1145a`, PG primary finds `Co Rd 27` at rating 27 (under threshold) → never tries fallback → never finds 27th Ave S.
+
+Our [`name_match_tlids`](../src/sql/geocode_address.sql.in) always runs the `numeric_streets_equal` branch (a consequence of D7's collapsed primary/fallback). So we find both `name='27'` AND `name='27th'` candidates and pick the one that scores best.
+
+Triggers when: PAGC strips ordinal/letter suffix from a numeric streetname (length ≤ 5 result) AND TIGER's name retains the suffix AND PG primary's best alternate would rate < 30.
+
 ### Post-investigation status (April 2026)
 
 After landing the rule-data ship + sort key + pprint_addy + soundex length-gate + suftype-only rate_attributes + fullname-prefix LIKE + prequalabr-aware addy + clamp out-of-range + nested dedup + scaled house penalty fixes, **first-row pick parity is 43/51 against PG-2025-PAGC.** The remaining 8 first-row divergences split:

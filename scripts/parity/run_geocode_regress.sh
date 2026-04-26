@@ -157,9 +157,44 @@ for id in $ids_expected; do
         printf "  ✓ %-15s match\n" "$id"
         n_match=$((n_match + 1))
     else
-        printf "  ! %-15s diverge\n" "$id"
-        diff <(echo "$exp_rows") <(echo "$act_rows") 2>/dev/null | sed 's/^/      /' || true
-        n_diverge=$((n_diverge + 1))
+        # Normalize POINT(X Y) coordinates to N decimal places before
+        # comparing — PG's ST_AsText(ST_SnapToGrid(...)) and our
+        # printf('%.5f', ...) can differ at the 5th decimal due to UTM
+        # round-trip precision. We don't care about sub-meter geom drift
+        # for parity purposes; only addr text and rating.
+        normalize_geom() {
+            # Round X,Y to 4 decimals (~10m precision; well above any
+            # legitimate float drift from interpolation arithmetic).
+            sed -E 's|POINT\(([+-]?[0-9]+\.[0-9]+) ([+-]?[0-9]+\.[0-9]+)\)|POINT('"$(printf '%%.4f %%.4f')"')|g'
+        }
+        exp_norm=$(echo "$exp_rows" | awk -F'|' 'BEGIN{OFS="|"} {
+            for (i=1; i<=NF; i++) {
+                if (match($i, /^POINT\(/)) {
+                    coords = substr($i, 7, length($i)-7)
+                    split(coords, parts, " ")
+                    $i = sprintf("POINT(%.4f %.4f)", parts[1], parts[2])
+                }
+            }
+            print
+        }')
+        act_norm=$(echo "$act_rows" | awk -F'|' 'BEGIN{OFS="|"} {
+            for (i=1; i<=NF; i++) {
+                if (match($i, /^POINT\(/)) {
+                    coords = substr($i, 7, length($i)-7)
+                    split(coords, parts, " ")
+                    $i = sprintf("POINT(%.4f %.4f)", parts[1], parts[2])
+                }
+            }
+            print
+        }')
+        if [[ "$exp_norm" == "$act_norm" ]]; then
+            printf "  ✓ %-15s match (geom rounded to 4 decimals)\n" "$id"
+            n_match=$((n_match + 1))
+        else
+            printf "  ! %-15s diverge\n" "$id"
+            diff <(echo "$exp_norm") <(echo "$act_norm") 2>/dev/null | sed 's/^/      /' || true
+            n_diverge=$((n_diverge + 1))
+        fi
     fi
 done
 
