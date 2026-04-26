@@ -67,7 +67,15 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
             soundex(inp['street_name'])     AS street_name_soundex,
             @TIGER@.normalize_street_name(
                 COALESCE(inp['street_name'], '') || ' ' || COALESCE(inp['street_type'], '')
-            )                               AS fullname_norm_input
+            )                               AS fullname_norm_input,
+            -- Prefix pattern used by the fullname-LIKE branch below; mirrors
+            -- PG's primary stage_a "lower(fullname) LIKE (predir||' '||name||'%')"
+            -- so candidates whose TIGER fullname carries an extra prequalabr
+            -- or sufdir slot (e.g. "Old Cedar Ave S" when input is "OLD CEDAR")
+            -- are still found.
+            @TIGER@.normalize_street_name(
+                COALESCE(inp['pre_dir'] || ' ', '') || COALESCE(inp['street_name'], '')
+            )                               AS fullname_prefix_input
     ),
     -- Pre-filter featnames to matching tlids. Each branch is an equi-join
     -- (or a prefix range) that DuckDB can hash/sort-merge cheaply, instead
@@ -109,6 +117,21 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
           AND p.street_name IS NOT NULL
           AND length(p.street_name) > 5
           AND f.name_lower LIKE p.street_name_lower || '%'
+
+        UNION ALL
+        -- Fullname prefix LIKE — catches TIGER fullnames that carry trailing
+        -- prequalabr/sufdir tokens not present in the input (e.g. parsed
+        -- "OLD CEDAR" matches TIGER fullname "Old Cedar Ave S"). Matches
+        -- PG's primary stage_a clause; length>5 gate matches PG's behavior.
+        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
+               f.pretypabrv, f.sufdirabrv, f.prequalabr,
+               p.window_zips, p.street_name, p.street_type, p.zip,
+               p.pre_dir, p.post_dir, p.location, p.address
+        FROM @TIGER@.featnames f, p
+        WHERE f.statefp = p.statefp
+          AND p.street_name IS NOT NULL
+          AND length(p.street_name) > 5
+          AND f.fullname_norm LIKE p.fullname_prefix_input || '%'
 
         UNION ALL
         -- Soundex fallback — equijoin on precomputed name_soundex.
@@ -239,7 +262,15 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         SELECT
             STRUCT_PACK(
                 address      := p_address,
-                street_name  := f_name,
+                -- Mirror PG's `fename` concept: candidate street name is
+                -- `prequalabr || ' ' || name` so prequalabr-bearing TIGER
+                -- entries (e.g. name='Cedar', prequalabr='Old') render as
+                -- "Old Cedar" rather than just "Cedar".
+                street_name  := CASE
+                                  WHEN f_prequalabr IS NOT NULL
+                                  THEN f_prequalabr || ' ' || f_name
+                                  ELSE f_name
+                                END,
                 street_type  := COALESCE(f_suftype, f_pretype),
                 pre_dir      := f_predir,
                 post_dir     := f_sufdir,
