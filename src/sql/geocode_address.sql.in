@@ -16,18 +16,28 @@
 -- Stage A produces rating in the [0, 99] band for address matches.
 -- Ordered by rating ascending, truncated to max_results.
 --
+-- Two-pass structure (Option C from docs/d7-revisit.md):
+--   Pass A: current always-on pipeline. Length-gated soundex/prefix
+--           branches; +1 no-input-ZIP fallback; window_zips from input ZIP.
+--           Preserves the us-better-than-PG mechanisms (T18a, #1145a/b/e).
+--   Pass B: ungated soundex/prefix; +3 no-input-ZIP fallback; wider
+--           zip filter (input window ∪ city-derived zips). Materializes
+--           only when Pass A's best rating is weak (≥ 30 or 0 rows) —
+--           the `gate` CTE is empty otherwise, so Pass B's joins
+--           short-circuit. Closes #1076h, #1145d, partially #1073a.
+--
 -- Implementation notes:
 --   * DuckDB can't correlate a struct macro parameter reliably into nested
 --     subqueries, so we unpack `inp` into a CTE `p` using bracket notation
 --     (inp['field']) and reference p.field throughout.
 --   * Candidate filtering is pushed down in two stages:
---     (i) `name_match_tlids` pre-filters featnames to just matching tlids
---         (by exact name, soundex, prefix, numeric-street, or normalized
---         fullname). Cuts ~126K featnames to ~tens in the common case.
---     (ii) `candidates` does the full join only over those tlids, with the
---          faces-side join split into L/R UNION ALL branches (DuckDB can't
---          hash-join on (A AND L) OR (B AND R) efficiently — it degenerates
---          to a cartesian product).
+--     (i) `name_match_tlids_a` / `_b` pre-filter featnames to matching
+--         tlids (by exact name, soundex, prefix, numeric-street, or
+--         normalized fullname). Cuts ~126K featnames to ~tens.
+--     (ii) `candidates_a` / `_b` do the full join only over those tlids,
+--          with the faces-side join split into L/R UNION ALL branches
+--          (DuckDB can't hash-join on (A AND L) OR (B AND R) efficiently
+--          — it degenerates to a cartesian product).
 --   * block/tract/blkgrp GEOIDs come from edge_containment (Phase 6); when
 --     that table is empty all three GEOID columns are NULL and
 --     containment_guaranteed is false.
@@ -61,6 +71,21 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
             CASE WHEN inp['zip'] IS NULL THEN NULL::VARCHAR[]
                  ELSE @TIGER@.zip_range(inp['zip'], -2, 2)
             END AS window_zips,
+            -- Pass B's wider ZIP set: input window ∪ city-derived ZIPs.
+            -- When city/ZIP disagree (#1073a-class), city-derived ZIPs are
+            -- where the match actually lives. NULL when no city is given.
+            CASE WHEN inp['location'] IS NOT NULL THEN
+                (SELECT list(DISTINCT zip ORDER BY zip)
+                 FROM @TIGER@.zip_lookup_base zlb
+                 WHERE zlb.statefp = COALESCE(
+                           (SELECT statefp FROM @TIGER@.state_lookup
+                            WHERE inp['state_abbrev'] IS NOT NULL
+                              AND abbrev = inp['state_abbrev'] LIMIT 1),
+                           (SELECT statefp FROM @TIGER@.zip_lookup_base
+                            WHERE inp['zip'] IS NOT NULL AND zip = inp['zip'] LIMIT 1))
+                   AND lower(zlb.city) LIKE lower(inp['location']) || '%')
+                 ELSE NULL::VARCHAR[]
+            END AS city_zips,
             -- Precomputed match keys so the UNION ALL branches below
             -- hash-join directly instead of the planner failing to hoist
             -- soundex()/lower()/normalize_street_name() into the join key.
@@ -78,16 +103,21 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                 COALESCE(inp['pre_dir'] || ' ', '') || COALESCE(inp['street_name'], '')
             )                               AS fullname_prefix_input
     ),
-    -- Pre-filter featnames to matching tlids. Each branch is an equi-join
-    -- (or a prefix range) that DuckDB can hash/sort-merge cheaply, instead
-    -- of an OR-predicate that degenerates to a cartesian product. UNION ALL
-    -- is fine — downstream `ranked` dedups by (name, type, side, ...).
-    name_match_tlids AS (
+    -- =========================================================================
+    -- Pass A: current always-on candidate pipeline (length-gated branches).
+    -- =========================================================================
+    name_match_tlids_a AS (
         -- Exact name (case-insensitive) — equijoin on precomputed keys.
+        -- name_lower/name_soundex carried so the no-input-ZIP discriminator
+        -- below can evaluate PG primary's filter shape per row without
+        -- recomputing soundex(f.name)/lower(f.name) inline.
         SELECT f.tlid, f.statefp,
-               f.name, f.fullname, f.predirabrv, f.suftypabrv, f.pretypabrv,
+               f.name, f.name_lower, f.name_soundex,
+               f.fullname, f.predirabrv, f.suftypabrv, f.pretypabrv,
                f.sufdirabrv, f.prequalabr,
                p.window_zips, p.street_name AS p_street_name,
+               p.street_name_lower AS p_street_name_lower,
+               p.street_name_soundex AS p_street_name_soundex,
                p.street_type AS p_street_type, p.zip AS p_zip,
                p.pre_dir AS p_pre_dir, p.post_dir AS p_post_dir,
                p.location AS p_location, p.address AS p_address, p.internal AS p_internal
@@ -97,10 +127,11 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         WHERE p.street_name IS NOT NULL
 
         UNION ALL
-        -- Normalized fullname match — equijoin on precomputed keys.
-        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
+        SELECT f.tlid, f.statefp, f.name, f.name_lower, f.name_soundex,
+               f.fullname, f.predirabrv, f.suftypabrv,
                f.pretypabrv, f.sufdirabrv, f.prequalabr,
-               p.window_zips, p.street_name, p.street_type, p.zip,
+               p.window_zips, p.street_name, p.street_name_lower, p.street_name_soundex,
+               p.street_type, p.zip,
                p.pre_dir, p.post_dir, p.location, p.address, p.internal
         FROM @TIGER@.featnames f JOIN p
              ON f.statefp = p.statefp
@@ -108,10 +139,11 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         WHERE p.street_name IS NOT NULL
 
         UNION ALL
-        -- Prefix match for long names (no equi-hash; sequential within state).
-        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
+        SELECT f.tlid, f.statefp, f.name, f.name_lower, f.name_soundex,
+               f.fullname, f.predirabrv, f.suftypabrv,
                f.pretypabrv, f.sufdirabrv, f.prequalabr,
-               p.window_zips, p.street_name, p.street_type, p.zip,
+               p.window_zips, p.street_name, p.street_name_lower, p.street_name_soundex,
+               p.street_type, p.zip,
                p.pre_dir, p.post_dir, p.location, p.address, p.internal
         FROM @TIGER@.featnames f, p
         WHERE f.statefp = p.statefp
@@ -120,13 +152,11 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
           AND f.name_lower LIKE p.street_name_lower || '%'
 
         UNION ALL
-        -- Fullname prefix LIKE — catches TIGER fullnames that carry trailing
-        -- prequalabr/sufdir tokens not present in the input (e.g. parsed
-        -- "OLD CEDAR" matches TIGER fullname "Old Cedar Ave S"). Matches
-        -- PG's primary stage_a clause; length>5 gate matches PG's behavior.
-        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
+        SELECT f.tlid, f.statefp, f.name, f.name_lower, f.name_soundex,
+               f.fullname, f.predirabrv, f.suftypabrv,
                f.pretypabrv, f.sufdirabrv, f.prequalabr,
-               p.window_zips, p.street_name, p.street_type, p.zip,
+               p.window_zips, p.street_name, p.street_name_lower, p.street_name_soundex,
+               p.street_type, p.zip,
                p.pre_dir, p.post_dir, p.location, p.address, p.internal
         FROM @TIGER@.featnames f, p
         WHERE f.statefp = p.statefp
@@ -135,16 +165,11 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
           AND f.fullname_norm LIKE p.fullname_prefix_input || '%'
 
         UNION ALL
-        -- Soundex fallback — equijoin on precomputed name_soundex.
-        -- Length-gated to match PG's primary stage_a behavior (only uses
-        -- soundex when streetName > 5 chars). Short streetNames are common
-        -- digit-stems like "35", "101", "9" — soundex of any digit string
-        -- is uniformly '0000', so without the gate this branch matches every
-        -- digit-named street in the state and floods the candidate set with
-        -- spurious matches that outrank the real one.
-        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
+        SELECT f.tlid, f.statefp, f.name, f.name_lower, f.name_soundex,
+               f.fullname, f.predirabrv, f.suftypabrv,
                f.pretypabrv, f.sufdirabrv, f.prequalabr,
-               p.window_zips, p.street_name, p.street_type, p.zip,
+               p.window_zips, p.street_name, p.street_name_lower, p.street_name_soundex,
+               p.street_type, p.zip,
                p.pre_dir, p.post_dir, p.location, p.address, p.internal
         FROM @TIGER@.featnames f JOIN p
              ON f.statefp = p.statefp
@@ -153,31 +178,29 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
           AND length(p.street_name) > 5
 
         UNION ALL
-        -- Numeric-street equivalence (15th ≡ 15rd) — expression-based.
-        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
+        SELECT f.tlid, f.statefp, f.name, f.name_lower, f.name_soundex,
+               f.fullname, f.predirabrv, f.suftypabrv,
                f.pretypabrv, f.sufdirabrv, f.prequalabr,
-               p.window_zips, p.street_name, p.street_type, p.zip,
+               p.window_zips, p.street_name, p.street_name_lower, p.street_name_soundex,
+               p.street_type, p.zip,
                p.pre_dir, p.post_dir, p.location, p.address, p.internal
         FROM @TIGER@.featnames f, p
         WHERE f.statefp = p.statefp
           AND p.street_name IS NOT NULL
           AND @TIGER@.numeric_streets_equal(f.name, p.street_name)
     ),
-    -- Materialize the base join (featnames filter + addr + edges). These are
-    -- cheap once name_match_tlids has narrowed featnames. p_* columns carry
-    -- per-input parameters (address, location, etc.) forward without
-    -- re-joining to `p` inside an inner subquery, which would decorrelate
-    -- under LATERAL batch calls.
-    fae AS (
+    fae_a AS (
         SELECT
-            f.name, f.fullname, f.predirabrv, f.suftypabrv, f.pretypabrv,
+            f.name, f.name_lower, f.name_soundex,
+            f.fullname, f.predirabrv, f.suftypabrv, f.pretypabrv,
             f.sufdirabrv, f.prequalabr,
             a.fromhn, a.tohn, a.side, a.zip AS a_zip,
             e.tlid AS e_tlid, e.statefp AS e_statefp, e.countyfp AS e_countyfp,
             e.tfidl, e.tfidr, e.mtfcc AS e_mtfcc, e.the_geom AS edge_geom,
             f.p_address, f.p_location, f.p_pre_dir, f.p_post_dir, f.p_internal,
-            f.p_street_name, f.p_street_type, f.p_zip, f.window_zips
-        FROM name_match_tlids f
+            f.p_street_name, f.p_street_name_lower, f.p_street_name_soundex,
+            f.p_street_type, f.p_zip, f.window_zips
+        FROM name_match_tlids_a f
         JOIN @TIGER@.addr  a ON a.tlid = f.tlid AND a.statefp = f.statefp
         JOIN @TIGER@.edges e ON e.tlid = f.tlid AND e.statefp = f.statefp
         WHERE e.mtfcc LIKE 'S%'
@@ -185,19 +208,18 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
           AND (f.p_zip IS NULL
                OR a.zip IN (SELECT UNNEST(f.window_zips)))
     ),
-    -- Split the faces join by side so DuckDB can use hash joins on each branch.
-    fae_faces AS (
+    fae_faces_a AS (
         SELECT fae.*, fc.tfid AS fc_tfid, fc.placefp, fc.cousubfp
-        FROM fae JOIN @TIGER@.faces fc
+        FROM fae_a fae JOIN @TIGER@.faces fc
              ON fc.statefp = fae.e_statefp AND fc.tfid = fae.tfidl
         WHERE fae.side = 'L'
         UNION ALL
         SELECT fae.*, fc.tfid AS fc_tfid, fc.placefp, fc.cousubfp
-        FROM fae JOIN @TIGER@.faces fc
+        FROM fae_a fae JOIN @TIGER@.faces fc
              ON fc.statefp = fae.e_statefp AND fc.tfid = fae.tfidr
         WHERE fae.side = 'R'
     ),
-    candidates AS (
+    candidates_a AS (
         SELECT
             ff.name             AS f_name,
             ff.fullname         AS f_fullname,
@@ -225,15 +247,6 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
             @TIGER@.rate_attributes(
                 ff.p_pre_dir, ff.predirabrv,
                 ff.p_street_name, ff.name,
-                -- Match PG: rate_attributes compares input street_type
-                -- against the candidate's suftypabrv only — NOT a COALESCE
-                -- of suftypabrv/pretypabrv. The slot encoding is meaningful
-                -- (highway-style "Co Rd" lives in pretypabrv; ordinary "St"
-                -- lives in suftypabrv); a slot mismatch indicates the
-                -- parser put the type in a different position than TIGER
-                -- stores it, which is real signal. Output addy struct
-                -- still uses COALESCE(suftype, pretype) below — only
-                -- scoring changes.
                 ff.p_street_type, ff.suftypabrv,
                 ff.p_post_dir, ff.sufdirabrv,
                 ff.prequalabr
@@ -243,17 +256,31 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                 WHEN ff.p_address BETWEEN @TIGER@.least_hn(ff.fromhn, ff.tohn) AND @TIGER@.greatest_hn(ff.fromhn, ff.tohn)
                      AND (ff.p_address % 2) = (@TIGER@.greatest_hn(ff.fromhn, ff.tohn) % 2) THEN 0
                 WHEN ff.p_address BETWEEN @TIGER@.least_hn(ff.fromhn, ff.tohn) AND @TIGER@.greatest_hn(ff.fromhn, ff.tohn) THEN 2
-                -- Out-of-range: PG's scaled penalty (5..10) prefers
-                -- candidates whose range is closer to the input house num.
-                -- Without this our flat +5 ties all out-of-range candidates
-                -- and the dedup tiebreak (e_tlid) picks the "wrong" edge.
                 ELSE ((1.0 - (
                             LEAST(ff.p_address, @TIGER@.least_hn(ff.fromhn, ff.tohn))::DOUBLE
                             / GREATEST(1, GREATEST(ff.p_address, @TIGER@.greatest_hn(ff.fromhn, ff.tohn)))
                       )) * 5)::INTEGER + 5
               END
+            -- No-input-ZIP fallback constant. PG primary uses +1; PG fallback uses +3.
+            -- Port PG primary's name filter verbatim as a per-row predicate: a row is
+            -- "primary-shaped" iff PG primary would have matched it. PG primary's filter
+            -- (geocode_address.sql:110) is:
+            --   length($2) > 5: lower(f.fullname) LIKE (predir||' '||name||'%')
+            --                   OR lower(f.name) = lower($2)
+            --                   OR soundex(f.name) = soundex($2)
+            --   length($2) ≤ 5: lower(f.name) = lower($2)
+            -- Rows that match Pass A only via Mechanism B (numeric_streets_equal),
+            -- fullname_norm exact, or name-prefix LIKE that don't satisfy any of PG
+            -- primary's three branches get +3 (PG would only have caught them in
+            -- fallback). #1076h: name='3', input='3A', length 2, no branch hits → +3.
             + CASE
-                WHEN ff.p_zip IS NULL THEN 1
+                WHEN ff.p_zip IS NULL THEN
+                    CASE WHEN ff.name_lower = ff.p_street_name_lower
+                              OR (length(ff.p_street_name) > 5 AND (
+                                    lower(ff.fullname) LIKE COALESCE(lower(ff.p_pre_dir) || ' ', '') || ff.p_street_name_lower || '%'
+                                    OR ff.name_soundex = ff.p_street_name_soundex))
+                         THEN 1 ELSE 3
+                    END
                 WHEN ff.a_zip IS NULL THEN 0
                 ELSE LEAST(@TIGER@.diff_zip(ff.p_zip, ff.a_zip) * zip_penalty, 20 * zip_penalty)::INTEGER
               END
@@ -263,22 +290,15 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                 WHEN cs.name IS NOT NULL THEN @TIGER@.levenshtein_ignore_case(ff.p_location, cs.name)
                 ELSE 5
               END AS rating
-        FROM fae_faces ff
+        FROM fae_faces_a ff
         LEFT JOIN @TIGER@.place  pl ON pl.statefp = ff.e_statefp AND pl.placefp  = ff.placefp
         LEFT JOIN @TIGER@.cousub cs ON cs.statefp = ff.e_statefp AND cs.cousubfp = ff.cousubfp
         LEFT JOIN @TIGER@.county ct ON ct.statefp = ff.e_statefp AND ct.countyfp = ff.e_countyfp
         JOIN      @TIGER@.state  st ON st.statefp = ff.e_statefp
     ),
-    ranked AS (
+    ranked_a AS (
         SELECT
             STRUCT_PACK(
-                -- Match PG's behavior: when the input house number falls
-                -- inside the candidate edge's range with parity match
-                -- ("exact_address"), echo it back as-is. Otherwise clamp
-                -- to the nearest endpoint of the edge's range — gives a
-                -- more useful output (an address that actually exists on
-                -- the picked edge) than echoing back the user's possibly-
-                -- bogus number.
                 address      := CASE
                                   WHEN p_address IS NULL OR a_fromhn IS NULL THEN p_address
                                   WHEN p_address BETWEEN @TIGER@.least_hn(a_fromhn, a_tohn)
@@ -290,19 +310,12 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                                   THEN @TIGER@.greatest_hn(a_fromhn, a_tohn)
                                   ELSE @TIGER@.least_hn(a_fromhn, a_tohn)
                                 END,
-                -- Mirror PG's `fename` concept: candidate street name is
-                -- `prequalabr || ' ' || name` so prequalabr-bearing TIGER
-                -- entries (e.g. name='Cedar', prequalabr='Old') render as
-                -- "Old Cedar" rather than just "Cedar".
                 street_name  := CASE
                                   WHEN f_prequalabr IS NOT NULL
                                   THEN f_prequalabr || ' ' || f_name
                                   ELSE f_name
                                 END,
                 street_type  := COALESCE(f_suftype, f_pretype),
-                -- internal (unit/suite) round-trips from input — TIGER edges
-                -- don't carry unit info, so we pass through whatever PAGC
-                -- captured. Matches PG: addy.internal := parsed.internal.
                 internal     := p_internal,
                 pre_dir      := f_predir,
                 post_dir     := f_sufdir,
@@ -324,30 +337,248 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                 ORDER BY rating, a_fromhn, f_tfidr, f_tfidl DESC
             ) AS dedup_rn,
             f_tfidr, f_tfidl
-        FROM candidates c
+        FROM candidates_a c
         LEFT JOIN @TIGER@.edge_containment ec
                ON ec.statefp = c.fc_statefp AND ec.tlid = c.e_tlid
     ),
-    -- Apply the dedup filter BEFORE the global rating ROW_NUMBER. Doing
-    -- both ROW_NUMBERs in parallel and then AND-filtering produced an
-    -- empty result whenever the globally-lowest-rated rows were duplicates
-    -- (dedup_rn != 1) within their own partitions — the WHERE clause
-    -- dropped everything because no row satisfied (dedup_rn=1 AND
-    -- rating_rn <= max_results) simultaneously. Nesting fixes that.
-    --
-    -- Secondary sort uses TIGER's tfidr/tfidl (PG's exact tiebreak — see
-    -- geocode_address.sql:175 `ORDER BY 10, 11 DESC` which positions
-    -- correspond to tfidr, tfidl). More principled than X/Y geom coords
-    -- (which would introduce a directional bias when many candidates
-    -- tied on rating) and matches PG's pick on rating-tied candidates.
-    deduped AS (
+    deduped_a AS (
         SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed,
-               ROW_NUMBER() OVER (ORDER BY rating, f_tfidr, f_tfidl DESC) AS rating_rn
-        FROM ranked
+               f_tfidr, f_tfidl
+        FROM ranked_a
         WHERE dedup_rn = 1
+    ),
+    -- =========================================================================
+    -- Gate: 1 row if Pass A returned no rows, else empty. Pass B's
+    -- name_match cross-joins this; when empty, Pass B's joins materialize
+    -- 0 rows and short-circuit.
+    --
+    -- Conservative threshold: only fire Pass B when Pass A is *empty*.
+    -- A higher threshold (e.g. min_rating ≥ 30, mirroring PG's
+    -- `IF var_bestrating < 30 THEN RETURN`) would close #1076h and
+    -- #1073a but regresses #1112d/e — Pass B's looser soundex pulls in
+    -- junk candidates (Co Rd 37 via soundex('35')='0000') that beat
+    -- Pass A's correct-but-rating-34 W 35W match. PG avoids this
+    -- because its fallback name filter is *also* gated on
+    -- zip_info.exact — when the input ZIP matches the input city, PG
+    -- fallback uses exact+numeric matching only (no soundex). We don't
+    -- yet implement that bifurcation, so we keep the conservative gate.
+    -- =========================================================================
+    pass_a_summary AS (
+        SELECT count(*) AS n_rows, MIN(rating) AS min_r FROM deduped_a
+    ),
+    gate AS (
+        -- PG-style gate: fire fallback if best rating ≥ 30 or no rows.
+        SELECT 1 AS go FROM pass_a_summary WHERE n_rows = 0 OR min_r >= 30
+    ),
+    -- =========================================================================
+    -- Pass B: looser candidate pipeline. Soundex/prefix branches drop the
+    -- length>5 gate; ZIP filter widens to (window_zips ∪ city_zips); the
+    -- no-input-ZIP fallback is +3 (matches PG fallback stage_a).
+    -- All branches CROSS JOIN gate so they materialize 0 rows when Pass A
+    -- is sufficient.
+    -- =========================================================================
+    name_match_tlids_b AS (
+        -- Soundex (no length gate) — the main thing Pass A misses for short
+        -- streetnames like 'ST' or '3RD' that PG fallback finds.
+        SELECT f.tlid, f.statefp,
+               f.name, f.fullname, f.predirabrv, f.suftypabrv, f.pretypabrv,
+               f.sufdirabrv, f.prequalabr,
+               COALESCE(p.window_zips, []::VARCHAR[]) || COALESCE(p.city_zips, []::VARCHAR[]) AS window_zips,
+               p.street_name AS p_street_name,
+               p.street_type AS p_street_type, p.zip AS p_zip,
+               p.pre_dir AS p_pre_dir, p.post_dir AS p_post_dir,
+               p.location AS p_location, p.address AS p_address, p.internal AS p_internal
+        FROM @TIGER@.featnames f JOIN p
+             ON f.statefp = p.statefp
+            AND f.name_soundex = p.street_name_soundex
+        CROSS JOIN gate
+        WHERE p.street_name IS NOT NULL
+
+        UNION ALL
+        -- Name prefix LIKE (no length gate).
+        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
+               f.pretypabrv, f.sufdirabrv, f.prequalabr,
+               COALESCE(p.window_zips, []::VARCHAR[]) || COALESCE(p.city_zips, []::VARCHAR[]),
+               p.street_name, p.street_type, p.zip,
+               p.pre_dir, p.post_dir, p.location, p.address, p.internal
+        FROM @TIGER@.featnames f, p, gate
+        WHERE f.statefp = p.statefp
+          AND p.street_name IS NOT NULL
+          AND f.name_lower LIKE p.street_name_lower || '%'
+
+        UNION ALL
+        -- Fullname-prefix LIKE (no length gate).
+        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
+               f.pretypabrv, f.sufdirabrv, f.prequalabr,
+               COALESCE(p.window_zips, []::VARCHAR[]) || COALESCE(p.city_zips, []::VARCHAR[]),
+               p.street_name, p.street_type, p.zip,
+               p.pre_dir, p.post_dir, p.location, p.address, p.internal
+        FROM @TIGER@.featnames f, p, gate
+        WHERE f.statefp = p.statefp
+          AND p.street_name IS NOT NULL
+          AND f.fullname_norm LIKE p.fullname_prefix_input || '%'
+    ),
+    fae_b AS (
+        SELECT
+            f.name, f.fullname, f.predirabrv, f.suftypabrv, f.pretypabrv,
+            f.sufdirabrv, f.prequalabr,
+            a.fromhn, a.tohn, a.side, a.zip AS a_zip,
+            e.tlid AS e_tlid, e.statefp AS e_statefp, e.countyfp AS e_countyfp,
+            e.tfidl, e.tfidr, e.mtfcc AS e_mtfcc, e.the_geom AS edge_geom,
+            f.p_address, f.p_location, f.p_pre_dir, f.p_post_dir, f.p_internal,
+            f.p_street_name, f.p_street_type, f.p_zip, f.window_zips
+        FROM name_match_tlids_b f
+        JOIN @TIGER@.addr  a ON a.tlid = f.tlid AND a.statefp = f.statefp
+        JOIN @TIGER@.edges e ON e.tlid = f.tlid AND e.statefp = f.statefp
+        WHERE e.mtfcc LIKE 'S%'
+          AND (restrict_geom_4269 IS NULL OR ST_Intersects(e.the_geom, restrict_geom_4269))
+          AND (f.p_zip IS NULL
+               OR a.zip IN (SELECT UNNEST(f.window_zips)))
+    ),
+    fae_faces_b AS (
+        SELECT fae.*, fc.tfid AS fc_tfid, fc.placefp, fc.cousubfp
+        FROM fae_b fae JOIN @TIGER@.faces fc
+             ON fc.statefp = fae.e_statefp AND fc.tfid = fae.tfidl
+        WHERE fae.side = 'L'
+        UNION ALL
+        SELECT fae.*, fc.tfid AS fc_tfid, fc.placefp, fc.cousubfp
+        FROM fae_b fae JOIN @TIGER@.faces fc
+             ON fc.statefp = fae.e_statefp AND fc.tfid = fae.tfidr
+        WHERE fae.side = 'R'
+    ),
+    candidates_b AS (
+        SELECT
+            ff.name             AS f_name,
+            ff.fullname         AS f_fullname,
+            ff.predirabrv       AS f_predir,
+            ff.suftypabrv       AS f_suftype,
+            ff.pretypabrv       AS f_pretype,
+            ff.sufdirabrv       AS f_sufdir,
+            ff.prequalabr       AS f_prequalabr,
+            ff.fromhn           AS a_fromhn,
+            ff.tohn             AS a_tohn,
+            ff.side             AS a_side,
+            ff.a_zip            AS a_zip,
+            ff.edge_geom        AS edge_geom,
+            ff.e_tlid           AS e_tlid,
+            ff.tfidl            AS f_tfidl,
+            ff.tfidr            AS f_tfidr,
+            ff.e_statefp        AS fc_statefp,
+            pl.name             AS place_name,
+            cs.name             AS cousub_name,
+            ct.name             AS county_name,
+            st.stusps           AS state_abbrev,
+            ff.p_address        AS p_address,
+            ff.p_location       AS p_location,
+            ff.p_internal       AS p_internal,
+            @TIGER@.rate_attributes(
+                ff.p_pre_dir, ff.predirabrv,
+                ff.p_street_name, ff.name,
+                ff.p_street_type, ff.suftypabrv,
+                ff.p_post_dir, ff.sufdirabrv,
+                ff.prequalabr
+            )
+            + CASE
+                WHEN ff.p_address IS NULL OR ff.fromhn IS NULL THEN 20
+                WHEN ff.p_address BETWEEN @TIGER@.least_hn(ff.fromhn, ff.tohn) AND @TIGER@.greatest_hn(ff.fromhn, ff.tohn)
+                     AND (ff.p_address % 2) = (@TIGER@.greatest_hn(ff.fromhn, ff.tohn) % 2) THEN 0
+                WHEN ff.p_address BETWEEN @TIGER@.least_hn(ff.fromhn, ff.tohn) AND @TIGER@.greatest_hn(ff.fromhn, ff.tohn) THEN 2
+                ELSE ((1.0 - (
+                            LEAST(ff.p_address, @TIGER@.least_hn(ff.fromhn, ff.tohn))::DOUBLE
+                            / GREATEST(1, GREATEST(ff.p_address, @TIGER@.greatest_hn(ff.fromhn, ff.tohn)))
+                      )) * 5)::INTEGER + 5
+              END
+            -- Pass B's no-input-ZIP fallback: +3 (PG fallback stage_a's value).
+            + CASE
+                WHEN ff.p_zip IS NULL THEN 3
+                WHEN ff.a_zip IS NULL THEN 0
+                ELSE LEAST(@TIGER@.diff_zip(ff.p_zip, ff.a_zip) * zip_penalty, 20 * zip_penalty)::INTEGER
+              END
+            + CASE
+                WHEN ff.p_location IS NULL THEN 5
+                WHEN pl.name IS NOT NULL THEN @TIGER@.levenshtein_ignore_case(ff.p_location, pl.name)
+                WHEN cs.name IS NOT NULL THEN @TIGER@.levenshtein_ignore_case(ff.p_location, cs.name)
+                ELSE 5
+              END AS rating
+        FROM fae_faces_b ff
+        LEFT JOIN @TIGER@.place  pl ON pl.statefp = ff.e_statefp AND pl.placefp  = ff.placefp
+        LEFT JOIN @TIGER@.cousub cs ON cs.statefp = ff.e_statefp AND cs.cousubfp = ff.cousubfp
+        LEFT JOIN @TIGER@.county ct ON ct.statefp = ff.e_statefp AND ct.countyfp = ff.e_countyfp
+        JOIN      @TIGER@.state  st ON st.statefp = ff.e_statefp
+    ),
+    ranked_b AS (
+        SELECT
+            STRUCT_PACK(
+                address      := CASE
+                                  WHEN p_address IS NULL OR a_fromhn IS NULL THEN p_address
+                                  WHEN p_address BETWEEN @TIGER@.least_hn(a_fromhn, a_tohn)
+                                                     AND @TIGER@.greatest_hn(a_fromhn, a_tohn)
+                                       AND (p_address % 2) = (@TIGER@.greatest_hn(a_fromhn, a_tohn) % 2)
+                                  THEN p_address
+                                  WHEN p_address > @TIGER@.greatest_hn(a_fromhn, a_tohn)
+                                       AND p_address > @TIGER@.least_hn(a_fromhn, a_tohn)
+                                  THEN @TIGER@.greatest_hn(a_fromhn, a_tohn)
+                                  ELSE @TIGER@.least_hn(a_fromhn, a_tohn)
+                                END,
+                street_name  := CASE
+                                  WHEN f_prequalabr IS NOT NULL
+                                  THEN f_prequalabr || ' ' || f_name
+                                  ELSE f_name
+                                END,
+                street_type  := COALESCE(f_suftype, f_pretype),
+                internal     := p_internal,
+                pre_dir      := f_predir,
+                post_dir     := f_sufdir,
+                location     := COALESCE(place_name, cousub_name, county_name, p_location),
+                state_abbrev := state_abbrev,
+                zip          := a_zip
+            )::@TIGER@.geocode_input AS addy,
+            @TIGER@.interpolate_from_address(p_address, a_fromhn, a_tohn, edge_geom, a_side, 10) AS geom,
+            rating,
+            CASE a_side WHEN 'L' THEN ec.block_geoid_l  ELSE ec.block_geoid_r  END AS block_geoid,
+            CASE a_side WHEN 'L' THEN ec.tract_geoid_l  ELSE ec.tract_geoid_r  END AS tract_geoid,
+            CASE a_side WHEN 'L' THEN ec.blkgrp_geoid_l ELSE ec.blkgrp_geoid_r END AS blkgrp_geoid,
+            COALESCE(
+                CASE a_side WHEN 'L' THEN ec.guaranteed_l ELSE ec.guaranteed_r END,
+                false
+            ) AS containment_guaranteed,
+            ROW_NUMBER() OVER (
+                PARTITION BY f_name, COALESCE(f_suftype, f_pretype), f_sufdir, place_name, state_abbrev, a_zip
+                ORDER BY rating, a_fromhn, f_tfidr, f_tfidl DESC
+            ) AS dedup_rn,
+            f_tfidr, f_tfidl
+        FROM candidates_b c
+        LEFT JOIN @TIGER@.edge_containment ec
+               ON ec.statefp = c.fc_statefp AND ec.tlid = c.e_tlid
+    ),
+    deduped_b AS (
+        SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed,
+               f_tfidr, f_tfidl
+        FROM ranked_b
+        WHERE dedup_rn = 1
+    ),
+    -- =========================================================================
+    -- Combine Pass A and Pass B; final dedup over the union to drop rows that
+    -- appear in both passes (Pass B may contribute the same edge as Pass A
+    -- via a different name-match branch). Sort by rating, then PG-style TFID.
+    -- =========================================================================
+    combined AS (
+        SELECT * FROM deduped_a
+        UNION ALL
+        SELECT * FROM deduped_b
+    ),
+    final_deduped AS (
+        SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed,
+               ROW_NUMBER() OVER (
+                   PARTITION BY (addy).street_name, (addy).street_type, (addy).post_dir,
+                                (addy).location, (addy).state_abbrev, (addy).zip
+                   ORDER BY rating, f_tfidr, f_tfidl DESC
+               ) AS final_dedup_rn,
+               ROW_NUMBER() OVER (ORDER BY rating, f_tfidr, f_tfidl DESC) AS rating_rn
+        FROM combined
     )
     SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
-    FROM deduped
-    WHERE rating_rn <= max_results
+    FROM final_deduped
+    WHERE final_dedup_rn = 1 AND rating_rn <= max_results
     ORDER BY rating, rating_rn
 );
