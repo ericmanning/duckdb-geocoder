@@ -200,6 +200,23 @@ The remaining surface-level divergences (T6, T12, T13, T16 multi-row outputs) re
 
 The full PG-2025-PAGC oracle is the new parity baseline; the original vendored file is retained as historical reference (PG's built-in normalizer + ~2010-era TIGER) but should not be used for new parity work.
 
+### Post-investigation status (April 2026)
+
+After landing the rule-data ship + sort key + pprint_addy + soundex length-gate + suftype-only rate_attributes + fullname-prefix LIKE + prequalabr-aware addy + clamp out-of-range + nested dedup + scaled house penalty fixes, **first-row pick parity is 43/51 against PG-2025-PAGC.** The remaining 8 first-row divergences split:
+
+| Test | Disposition | Why |
+|---|---|---|
+| T18a | **Us better than PG** | Our `from_pagc` PAGC-misparse-recovery breaks PG's tie correctly toward Court St |
+| #1145a | **Us better** | Us finds "4051 27th Ave S" (input's actual address); PG finds "Co Rd 27" without house number. `numeric_streets_equal` recovers '27' → '27th'; PG's primary stage_a doesn't |
+| #1145b | **Us better** | Same pattern as #1145a, for "3625 18th Ave S" |
+| #1145e | **Us better** | Us finds "103 W 36th St" with house num; PG finds "W 36th St" without |
+| #1076h | Same address, off by 2 | PG primary uses `+1` fallback (matches us), but PG returned its *fallback* stage_a result with `+3`. Documented D7 consequence |
+| #1145d | Stage B drop on weird input | "8512 141 St Ct Apple Valley" — PAGC mis-parses house_num as 141; both impls return junk, ours via Stage B (rating 100), PG via fallback stage_a (rating 51) |
+| #1113d | Adjacent edge picked | After the dedup + scaled-penalty fix, we now match PG's rating exactly (5) and pick the right street (Rockford Rd); just an adjacent segment (15702 vs 15899) — last-mile e_tlid tiebreak |
+| #1073a | Different fallback edge picked | Input "212 3rd Ave N, MINNEAPOLIS, MN 553404" with malformed ZIP. Neither implementation finds the requested address; both pick fallback streets in different cities (Hanover vs Hector). Likely candidate-set diff |
+
+**No remaining clear bugs.** Of the 8 first-row divergences, 4 are us-better-than-PG cases worth keeping, 3 are minor scoring-formula or tiebreak last-mile differences, and 1 is irrecoverable input. Closing the last-mile divergences would require porting PG's primary/fallback stage_a structure — a deliberate D7 deviation we don't intend to revert.
+
 ### Roadmap
 
 - Port `pagc_normalize_address_regress` as a CI-friendly sqllogic test (parser-only, no TIGER). The PG-vendored expected outputs become the test oracle for our `from_pagc` repack.
