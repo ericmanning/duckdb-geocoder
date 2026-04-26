@@ -112,6 +112,12 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
 
         UNION ALL
         -- Soundex fallback — equijoin on precomputed name_soundex.
+        -- Length-gated to match PG's primary stage_a behavior (only uses
+        -- soundex when streetName > 5 chars). Short streetNames are common
+        -- digit-stems like "35", "101", "9" — soundex of any digit string
+        -- is uniformly '0000', so without the gate this branch matches every
+        -- digit-named street in the state and floods the candidate set with
+        -- spurious matches that outrank the real one.
         SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
                f.pretypabrv, f.sufdirabrv, f.prequalabr,
                p.window_zips, p.street_name, p.street_type, p.zip,
@@ -120,6 +126,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
              ON f.statefp = p.statefp
             AND f.name_soundex = p.street_name_soundex
         WHERE p.street_name IS NOT NULL
+          AND length(p.street_name) > 5
 
         UNION ALL
         -- Numeric-street equivalence (15th ≡ 15rd) — expression-based.
@@ -191,7 +198,16 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
             @TIGER@.rate_attributes(
                 ff.p_pre_dir, ff.predirabrv,
                 ff.p_street_name, ff.name,
-                ff.p_street_type, COALESCE(ff.suftypabrv, ff.pretypabrv),
+                -- Match PG: rate_attributes compares input street_type
+                -- against the candidate's suftypabrv only — NOT a COALESCE
+                -- of suftypabrv/pretypabrv. The slot encoding is meaningful
+                -- (highway-style "Co Rd" lives in pretypabrv; ordinary "St"
+                -- lives in suftypabrv); a slot mismatch indicates the
+                -- parser put the type in a different position than TIGER
+                -- stores it, which is real signal. Output addy struct
+                -- still uses COALESCE(suftype, pretype) below — only
+                -- scoring changes.
+                ff.p_street_type, ff.suftypabrv,
                 ff.p_post_dir, ff.sufdirabrv,
                 ff.prequalabr
             )
