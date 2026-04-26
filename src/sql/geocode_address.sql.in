@@ -239,7 +239,14 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                 WHEN ff.p_address BETWEEN @TIGER@.least_hn(ff.fromhn, ff.tohn) AND @TIGER@.greatest_hn(ff.fromhn, ff.tohn)
                      AND (ff.p_address % 2) = (@TIGER@.greatest_hn(ff.fromhn, ff.tohn) % 2) THEN 0
                 WHEN ff.p_address BETWEEN @TIGER@.least_hn(ff.fromhn, ff.tohn) AND @TIGER@.greatest_hn(ff.fromhn, ff.tohn) THEN 2
-                ELSE 5
+                -- Out-of-range: PG's scaled penalty (5..10) prefers
+                -- candidates whose range is closer to the input house num.
+                -- Without this our flat +5 ties all out-of-range candidates
+                -- and the dedup tiebreak (e_tlid) picks the "wrong" edge.
+                ELSE ((1.0 - (
+                            LEAST(ff.p_address, @TIGER@.least_hn(ff.fromhn, ff.tohn))::DOUBLE
+                            / GREATEST(1, GREATEST(ff.p_address, @TIGER@.greatest_hn(ff.fromhn, ff.tohn)))
+                      )) * 5)::INTEGER + 5
               END
             + CASE
                 WHEN ff.p_zip IS NULL THEN 1
@@ -308,18 +315,29 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                 PARTITION BY f_name, COALESCE(f_suftype, f_pretype), f_sufdir, place_name, state_abbrev, a_zip
                 ORDER BY rating, a_fromhn, e_tlid
             ) AS dedup_rn,
-            -- Secondary sort key e_tlid mirrors PG's tfidr/tfidl tiebreak (PG
-            -- breaks rating ties by TIGER face IDs; tlid is the most stable
-            -- equivalent we expose in our pipeline). DuckDB's planner doesn't
-            -- preserve insertion order across windows, so without this ties
-            -- shuffle non-deterministically across runs.
-            ROW_NUMBER() OVER (ORDER BY rating, e_tlid) AS rating_rn
+            e_tlid
         FROM candidates c
         LEFT JOIN @TIGER@.edge_containment ec
                ON ec.statefp = c.fc_statefp AND ec.tlid = c.e_tlid
+    ),
+    -- Apply the dedup filter BEFORE the global rating ROW_NUMBER. Doing
+    -- both ROW_NUMBERs in parallel and then AND-filtering produced an
+    -- empty result whenever the globally-lowest-rated rows were duplicates
+    -- (dedup_rn != 1) within their own partitions — the WHERE clause
+    -- dropped everything because no row satisfied (dedup_rn=1 AND
+    -- rating_rn <= max_results) simultaneously. Nesting fixes that.
+    -- Secondary sort key e_tlid mirrors PG's tfidr/tfidl tiebreak (PG
+    -- breaks rating ties by TIGER face IDs; tlid is the most stable
+    -- equivalent we expose). DuckDB's planner doesn't preserve insertion
+    -- order across windows, so without this ties shuffle across runs.
+    deduped AS (
+        SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed,
+               ROW_NUMBER() OVER (ORDER BY rating, e_tlid) AS rating_rn
+        FROM ranked
+        WHERE dedup_rn = 1
     )
     SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
-    FROM ranked
-    WHERE dedup_rn = 1 AND rating_rn <= max_results
+    FROM deduped
+    WHERE rating_rn <= max_results
     ORDER BY rating, rating_rn
 );
