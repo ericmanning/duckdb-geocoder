@@ -451,34 +451,16 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         WHERE dedup_rn = 1
     ),
     -- =========================================================================
-    -- Gate: 1 row if Pass A returned no rows, else empty. Pass B's
-    -- name_match cross-joins this; when empty, Pass B's joins materialize
-    -- 0 rows and short-circuit.
-    --
-    -- Conservative threshold: only fire Pass B when Pass A is *empty*.
-    -- A higher threshold (e.g. min_rating ≥ 30, mirroring PG's
-    -- `IF var_bestrating < 30 THEN RETURN`) would close #1076h and
-    -- #1073a but regresses #1112d/e — Pass B's looser soundex pulls in
-    -- junk candidates (Co Rd 37 via soundex('35')='0000') that beat
-    -- Pass A's correct-but-rating-34 W 35W match. PG avoids this
-    -- because its fallback name filter is *also* gated on
-    -- zip_info.exact — when the input ZIP matches the input city, PG
-    -- fallback uses exact+numeric matching only (no soundex). We don't
-    -- yet implement that bifurcation, so we keep the conservative gate.
+    -- Gate: PG-style. Fires when Pass A is "weak" (0 rows OR best rating ≥ 30),
+    -- mirroring PG's `IF var_bestrating < 30 THEN RETURN` short-circuit
+    -- (geocode_address.sql:244). Pass B's name_match cross-joins this; when
+    -- empty, Pass B's joins materialize 0 rows.
     -- =========================================================================
     pass_a_summary AS (
         SELECT count(*) AS n_rows, MIN(rating) AS min_r FROM deduped_a
     ),
     gate AS (
-        -- PG-style gate: fire fallback if Pass A is weak. Two conditions
-        -- (PG's IF var_bestrating < 30 → RETURN check at geocode_address.sql:244):
-        --   * n_rows = 0  → Pass A found nothing; PG iterates fallback shapes
-        --   * min_r ≥ 30  → best Pass A rating is "fallback territory"; PG continues
-        -- Carry pass_a_empty as a column so Pass B's loose branches can
-        -- distinguish "PG iter 1 (strict, exact=TRUE) was empty too" from
-        -- "iter 1 returned rows but PG kept iterating exact=FALSE shapes."
-        SELECT 1 AS go, pass_a_summary.n_rows = 0 AS pass_a_empty
-        FROM pass_a_summary WHERE n_rows = 0 OR min_r >= 30
+        SELECT 1 AS go FROM pass_a_summary WHERE n_rows = 0 OR min_r >= 30
     ),
     -- =========================================================================
     -- Pass B: looser candidate pipeline. Soundex/prefix branches drop the
@@ -488,18 +470,23 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
     -- is sufficient.
     -- =========================================================================
     name_match_tlids_b AS (
-        -- Pass B's loose branches mirror PG fallback's exact=FALSE iterations
-        -- (geocode_address.sql:356): soundex OR length-gated fullname-LIKE
-        -- OR numeric_streets_equal. PG runs these only when iter 1
-        -- (exact=TRUE strict) didn't accumulate enough rows. We approximate
-        -- that with `(NOT p.zip_info_exact OR gate.pass_a_empty)`:
-        --   * NOT zip_info_exact: input has no valid ZIP → PG's iter 1
-        --     (zip_state.zip = $2) returns 0 rows → iter 2+ (exact=FALSE,
-        --     loose) fires. Our Pass A already runs with city_zips here,
-        --     so this is the standard "no input ZIP" path.
-        --   * gate.pass_a_empty: Pass A returned 0 rows, meaning PG's
-        --     primary + iter 1 of fallback (both strict-shaped) also
-        --     would have returned 0. PG iterates to exact=FALSE shapes;
+        -- Pass B mirrors PG fallback's exact=FALSE iterations (iter 2-5 in
+        -- geocode_address.sql:309-372): soundex / name-prefix LIKE / fullname-
+        -- prefix LIKE name filters with the city-derived ZIP set unioned in.
+        -- Fires whenever the gate fires (Pass A is weak): no further
+        -- predicate-based bifurcation needed because:
+        --   1. The PG-faithful rating formulas (LEAST diff_zip/lev_zip ZIP
+        --      penalty + LEAST place/cs/co city penalty) push loose-match
+        --      candidates to higher (worse) ratings than primary-shaped
+        --      matches when input has a known good zip — they don't
+        --      displace Pass A's correct match.
+        --   2. The from_pagc parser fix (recombine numeric-suffix street
+        --      names like '35W' that PAGC over-splits into name='35' +
+        --      sufdir='W') prevents the soundex('35')='0000' digit-stem
+        --      flood that would otherwise make `Co Rd 37` beat `35W Svc`
+        --      for #1112d/e-class inputs.
+        -- See: docs/d7-revisit.md and the from_pagc.sql.in CASE that
+        -- merges numeric streetnames with their adjacent direction tokens.
         --     we fire Pass B's loose branches with the wider city_zips.
         --     Closes #1145d: street_name='ST' length 2 doesn't trigger
         --     Pass A's length-gated soundex; Pass B's ungated soundex
@@ -520,9 +507,8 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         FROM @TIGER@.featnames f JOIN p
              ON f.statefp = p.statefp
             AND f.name_soundex = p.street_name_soundex
-        CROSS JOIN gate g
+        CROSS JOIN gate
         WHERE p.street_name IS NOT NULL
-          AND (NOT p.zip_info_exact OR g.pass_a_empty)
 
         UNION ALL
         -- Name prefix LIKE (no length gate).
@@ -531,10 +517,9 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                COALESCE(p.window_zips, []::VARCHAR[]) || COALESCE(p.city_zips, []::VARCHAR[]),
                p.street_name, p.street_type, p.zip,
                p.pre_dir, p.post_dir, p.location, p.address, p.internal
-        FROM @TIGER@.featnames f, p, gate g
+        FROM @TIGER@.featnames f, p, gate
         WHERE f.statefp = p.statefp
           AND p.street_name IS NOT NULL
-          AND (NOT p.zip_info_exact OR g.pass_a_empty)
           AND f.name_lower LIKE p.street_name_lower || '%'
 
         UNION ALL
@@ -544,10 +529,9 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                COALESCE(p.window_zips, []::VARCHAR[]) || COALESCE(p.city_zips, []::VARCHAR[]),
                p.street_name, p.street_type, p.zip,
                p.pre_dir, p.post_dir, p.location, p.address, p.internal
-        FROM @TIGER@.featnames f, p, gate g
+        FROM @TIGER@.featnames f, p, gate
         WHERE f.statefp = p.statefp
           AND p.street_name IS NOT NULL
-          AND (NOT p.zip_info_exact OR g.pass_a_empty)
           AND f.fullname_norm LIKE p.fullname_prefix_input || '%'
     ),
     fae_b AS (

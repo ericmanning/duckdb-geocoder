@@ -32,7 +32,33 @@ CREATE OR REPLACE MACRO @TIGER@._is_street_type_word(s) AS (
 CREATE OR REPLACE MACRO @TIGER@.from_pagc(raw_text) AS (
     SELECT STRUCT_PACK(
         address      := TRY_CAST(regexp_extract(sa.r.house_num, '\d+') AS INTEGER),
-        street_name  := NULLIF(trim(sa.r.name), ''),
+        -- Recombine compound numeric-suffix streetnames that PAGC over-split.
+        -- For input "8401 West 35W", PAGC parses streetname='35', sufdir='W',
+        -- treating the trailing 'W' on '35W' as a separate postdir token. PG's
+        -- PAGC (different rule data) keeps '35W' intact. The split breaks
+        -- soundex matching: soundex('35')='0000' collides with all digit-stem
+        -- streets ('Co Rd 37', 'US Hwy 10', ...) and they pull rank in fallback;
+        -- soundex('35W')='W000' only matches '35W' itself.
+        --
+        -- Detect the over-split by checking whether the raw input contains the
+        -- streetname+sufdir concatenation as an unspaced token. If so, merge
+        -- them: street_name='35W', post_dir=NULL. Same logic for pre_dir
+        -- (handles inputs like "8401 N5W ..."). Conservative: only fires when
+        -- streetname is purely digits and the dir is a single letter.
+        street_name  := CASE
+                           WHEN regexp_matches(sa.r.name, '^\d+$')
+                            AND sa.r.sufdir IN ('W','E','N','S')
+                            AND regexp_matches(raw_text,
+                                    '(^|\s)' || sa.r.name || sa.r.sufdir || '(\s|,|$)')
+                           THEN sa.r.name || sa.r.sufdir
+                           WHEN regexp_matches(sa.r.name, '^\d+$')
+                            AND sa.r.predir IN ('W','E','N','S')
+                            AND sa.r.sufdir IS NULL
+                            AND regexp_matches(raw_text,
+                                    '(^|\s)' || sa.r.name || sa.r.predir || '(\s|,|$)')
+                           THEN sa.r.name || sa.r.predir
+                           ELSE NULLIF(trim(sa.r.name), '')
+                        END,
         street_type  := @TIGER@.canon_street_type(COALESCE(
                            sa.r.suftype, sa.r.pretype,
                            CASE WHEN sa.r.suftype IS NULL
@@ -49,8 +75,23 @@ CREATE OR REPLACE MACRO @TIGER@.from_pagc(raw_text) AS (
                                     '#', '', 'g'),
                                 '([0-9]+)\s+([A-Za-z]?)', '\1\2', 'g')),
                            ''),
-        pre_dir      := @TIGER@.canon_dir(sa.r.predir),
-        post_dir     := @TIGER@.canon_dir(sa.r.sufdir),
+        pre_dir      := CASE
+                           WHEN regexp_matches(sa.r.name, '^\d+$')
+                            AND sa.r.predir IN ('W','E','N','S')
+                            AND sa.r.sufdir IS NULL
+                            AND regexp_matches(raw_text,
+                                    '(^|\s)' || sa.r.name || sa.r.predir || '(\s|,|$)')
+                           THEN NULL  -- subsumed into street_name
+                           ELSE @TIGER@.canon_dir(sa.r.predir)
+                        END,
+        post_dir     := CASE
+                           WHEN regexp_matches(sa.r.name, '^\d+$')
+                            AND sa.r.sufdir IN ('W','E','N','S')
+                            AND regexp_matches(raw_text,
+                                    '(^|\s)' || sa.r.name || sa.r.sufdir || '(\s|,|$)')
+                           THEN NULL  -- subsumed into street_name
+                           ELSE @TIGER@.canon_dir(sa.r.sufdir)
+                        END,
         location     := CASE
                            WHEN @TIGER@._is_street_type_word(sa.r.city)
                             AND @TIGER@._is_street_type_word(pa.r.city)
