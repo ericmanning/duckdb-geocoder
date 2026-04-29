@@ -68,9 +68,36 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                  WHERE inp['zip'] IS NOT NULL AND zlb.zip = inp['zip']
                  LIMIT 1)
             ) AS statefp,
-            CASE WHEN inp['zip'] IS NULL THEN NULL::VARCHAR[]
-                 ELSE @TIGER@.zip_range(inp['zip'], -2, 2)
-            END AS window_zips,
+            -- Pass A's effective ZIP filter, ported from PG primary's
+            -- zip_info computation (geocode_address.sql:50-88):
+            --   * input ZIP given AND length(streetName) > 7 → ±2 window
+            --   * input ZIP given AND length(streetName) ≤ 7 → ±1 window
+            --     (narrower for short/numeric names to avoid false positives)
+            --   * no input ZIP but city given → city-derived ZIPs
+            --     (PG: "If zip_info.zip IS NULL ... include all for the location")
+            --   * neither → NULL (no ZIP filter; Pass A returns name-matches anywhere)
+            -- Without the city fallback, Pass A returned State Rte 3 candidates
+            -- from anywhere in MA for input "300 Rt 3A, Hingham, MA", and the
+            -- Arlington/Quincy candidates beat Hingham's State Rte 3 on rating
+            -- (in-range house number) → wrong row-2 vs PG (#1076h).
+            COALESCE(
+                CASE WHEN inp['zip'] IS NULL THEN NULL::VARCHAR[]
+                     WHEN length(inp['street_name']) > 7
+                          THEN @TIGER@.zip_range(inp['zip'], -2, 2)
+                     ELSE @TIGER@.zip_range(inp['zip'], -1, 1)
+                END,
+                CASE WHEN inp['location'] IS NULL THEN NULL::VARCHAR[]
+                     ELSE (SELECT list(DISTINCT zip ORDER BY zip)
+                           FROM @TIGER@.zip_lookup_base zlb
+                           WHERE zlb.statefp = COALESCE(
+                                     (SELECT statefp FROM @TIGER@.state_lookup
+                                      WHERE inp['state_abbrev'] IS NOT NULL
+                                        AND abbrev = inp['state_abbrev'] LIMIT 1),
+                                     (SELECT statefp FROM @TIGER@.zip_lookup_base
+                                      WHERE inp['zip'] IS NOT NULL AND zip = inp['zip'] LIMIT 1))
+                             AND lower(zlb.city) LIKE lower(inp['location']) || '%')
+                END
+            ) AS window_zips,
             -- PG's zip_info.exact flag: TRUE when input ZIP maps to a real
             -- state via zip_state (PG's first iteration of fallback zip_info
             -- UNION returns exact=TRUE iff `zip_state.zip = $input_zip`).
@@ -219,7 +246,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         JOIN @TIGER@.edges e ON e.tlid = f.tlid AND e.statefp = f.statefp
         WHERE e.mtfcc LIKE 'S%'
           AND (restrict_geom_4269 IS NULL OR ST_Intersects(e.the_geom, restrict_geom_4269))
-          AND (f.p_zip IS NULL
+          AND (f.window_zips IS NULL
                OR a.zip IN (SELECT UNNEST(f.window_zips)))
     ),
     fae_faces_a AS (
@@ -258,6 +285,19 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
             ff.p_address        AS p_address,
             ff.p_location       AS p_location,
             ff.p_internal       AS p_internal,
+            -- "Primary-shaped" predicate: TRUE iff PG primary's name filter
+            -- (geocode_address.sql:110) would have matched this row:
+            --   length>5 → exact_name OR fullname-LIKE-with-predir OR soundex_eq
+            --   length≤5 → exact_name only
+            -- Used twice below: (a) the no-input-ZIP rating constant (+1 for
+            -- primary-shape, +3 for fallback-shape — PG fallback's value), and
+            -- (b) the address rendering in ranked_a (PG primary clamps to the
+            -- nearest range endpoint, PG fallback NULLs the address).
+            (   ff.name_lower = ff.p_street_name_lower
+             OR (length(ff.p_street_name) > 5 AND (
+                       lower(ff.fullname) LIKE COALESCE(lower(ff.p_pre_dir) || ' ', '') || ff.p_street_name_lower || '%'
+                    OR ff.name_soundex = ff.p_street_name_soundex))
+            )                   AS via_primary,
             @TIGER@.rate_attributes(
                 ff.p_pre_dir, ff.predirabrv,
                 ff.p_street_name, ff.name,
@@ -275,18 +315,10 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                             / GREATEST(1, GREATEST(ff.p_address, @TIGER@.greatest_hn(ff.fromhn, ff.tohn)))
                       )) * 5)::INTEGER + 5
               END
-            -- No-input-ZIP fallback constant. PG primary uses +1; PG fallback uses +3.
-            -- Port PG primary's name filter verbatim as a per-row predicate: a row is
-            -- "primary-shaped" iff PG primary would have matched it. PG primary's filter
-            -- (geocode_address.sql:110) is:
-            --   length($2) > 5: lower(f.fullname) LIKE (predir||' '||name||'%')
-            --                   OR lower(f.name) = lower($2)
-            --                   OR soundex(f.name) = soundex($2)
-            --   length($2) ≤ 5: lower(f.name) = lower($2)
-            -- Rows that match Pass A only via Mechanism B (numeric_streets_equal),
-            -- fullname_norm exact, or name-prefix LIKE that don't satisfy any of PG
-            -- primary's three branches get +3 (PG would only have caught them in
-            -- fallback). #1076h: name='3', input='3A', length 2, no branch hits → +3.
+            -- No-input-ZIP rating constant: PG primary +1, PG fallback +3.
+            -- Uses the same `via_primary` predicate above (#1076h: streetName='3A'
+            -- length 2, featname name='3' → not primary-shaped → +3 → rating 18
+            -- matches PG).
             + CASE
                 WHEN ff.p_zip IS NULL THEN
                     CASE WHEN ff.name_lower = ff.p_street_name_lower
@@ -319,6 +351,12 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                                                      AND @TIGER@.greatest_hn(a_fromhn, a_tohn)
                                        AND (p_address % 2) = (@TIGER@.greatest_hn(a_fromhn, a_tohn) % 2)
                                   THEN p_address
+                                  -- Out-of-range: PG primary clamps to nearest endpoint
+                                  -- (geocode_address.sql:207); PG fallback NULLs it
+                                  -- (geocode_address.sql:397). Discriminate per row via
+                                  -- via_primary (set in candidates_a from PG primary's
+                                  -- name filter). Closes #1076h row-2 rendering.
+                                  WHEN NOT via_primary THEN NULL
                                   WHEN p_address > @TIGER@.greatest_hn(a_fromhn, a_tohn)
                                        AND p_address > @TIGER@.least_hn(a_fromhn, a_tohn)
                                   THEN @TIGER@.greatest_hn(a_fromhn, a_tohn)
@@ -537,16 +575,16 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
     ranked_b AS (
         SELECT
             STRUCT_PACK(
+                -- Pass B is the fallback path; PG fallback NULLs the address
+                -- when the input house number is not in range
+                -- (geocode_address.sql:397).
                 address      := CASE
                                   WHEN p_address IS NULL OR a_fromhn IS NULL THEN p_address
                                   WHEN p_address BETWEEN @TIGER@.least_hn(a_fromhn, a_tohn)
                                                      AND @TIGER@.greatest_hn(a_fromhn, a_tohn)
                                        AND (p_address % 2) = (@TIGER@.greatest_hn(a_fromhn, a_tohn) % 2)
                                   THEN p_address
-                                  WHEN p_address > @TIGER@.greatest_hn(a_fromhn, a_tohn)
-                                       AND p_address > @TIGER@.least_hn(a_fromhn, a_tohn)
-                                  THEN @TIGER@.greatest_hn(a_fromhn, a_tohn)
-                                  ELSE @TIGER@.least_hn(a_fromhn, a_tohn)
+                                  ELSE NULL
                                 END,
                 street_name  := CASE
                                   WHEN f_prequalabr IS NOT NULL
