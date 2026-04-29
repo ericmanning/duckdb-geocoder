@@ -71,6 +71,20 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
             CASE WHEN inp['zip'] IS NULL THEN NULL::VARCHAR[]
                  ELSE @TIGER@.zip_range(inp['zip'], -2, 2)
             END AS window_zips,
+            -- PG's zip_info.exact flag: TRUE when input ZIP maps to a real
+            -- state via zip_state (PG's first iteration of fallback zip_info
+            -- UNION returns exact=TRUE iff `zip_state.zip = $input_zip`).
+            -- When exact, PG fallback uses a STRICT name filter (exact_name
+            -- OR prequalabr-trim OR numeric_streets_equal); when NOT exact
+            -- (no input ZIP / unknown ZIP / city-derived ZIPs), PG fallback
+            -- uses a LOOSE name filter (soundex OR length-gated fullname-LIKE
+            -- OR numeric_streets_equal). Bifurcating Pass B's filter on this
+            -- flag prevents Pass B's ungated soundex from matching things
+            -- like soundex('35')='0000' to other digit-stem streets when
+            -- the input has a known ZIP (#1112d/e regression guard).
+            (inp['zip'] IS NOT NULL
+             AND EXISTS (SELECT 1 FROM @TIGER@.zip_state zs
+                         WHERE zs.zip = inp['zip'])) AS zip_info_exact,
             -- Pass B's wider ZIP set: input window ∪ city-derived ZIPs.
             -- When city/ZIP disagree (#1073a-class), city-derived ZIPs are
             -- where the match actually lives. NULL when no city is given.
@@ -378,6 +392,17 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
     -- is sufficient.
     -- =========================================================================
     name_match_tlids_b AS (
+        -- Pass B's loose branches are gated on `NOT p.zip_info_exact` to mirror
+        -- PG's bifurcated fallback name filter (geocode_address.sql:354-357):
+        --   exact=TRUE  → strict (exact_name OR prequalabr-trim OR numeric_streets_equal)
+        --   exact=FALSE → loose  (soundex OR length-gated fullname-LIKE OR numeric_streets_equal)
+        -- When zip_info_exact=TRUE, Pass A's exact_name + fullname_norm exact +
+        -- numeric_streets_equal already cover PG's strict filter, so Pass B's
+        -- loose branches contribute nothing — gating them off prevents the
+        -- soundex('35')='0000' flood (#1112d/e regression guard) without
+        -- losing parity. When zip_info_exact=FALSE (no/unknown ZIP, or
+        -- city-derived ZIPs), Pass B's loose branches fire as before.
+        --
         -- Soundex (no length gate) — the main thing Pass A misses for short
         -- streetnames like 'ST' or '3RD' that PG fallback finds.
         SELECT f.tlid, f.statefp,
@@ -393,6 +418,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
             AND f.name_soundex = p.street_name_soundex
         CROSS JOIN gate
         WHERE p.street_name IS NOT NULL
+          AND NOT p.zip_info_exact
 
         UNION ALL
         -- Name prefix LIKE (no length gate).
@@ -404,6 +430,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         FROM @TIGER@.featnames f, p, gate
         WHERE f.statefp = p.statefp
           AND p.street_name IS NOT NULL
+          AND NOT p.zip_info_exact
           AND f.name_lower LIKE p.street_name_lower || '%'
 
         UNION ALL
@@ -416,6 +443,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         FROM @TIGER@.featnames f, p, gate
         WHERE f.statefp = p.statefp
           AND p.street_name IS NOT NULL
+          AND NOT p.zip_info_exact
           AND f.fullname_norm LIKE p.fullname_prefix_input || '%'
     ),
     fae_b AS (
