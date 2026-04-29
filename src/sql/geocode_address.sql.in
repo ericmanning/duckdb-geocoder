@@ -285,18 +285,26 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
             ff.p_address        AS p_address,
             ff.p_location       AS p_location,
             ff.p_internal       AS p_internal,
-            -- "Primary-shaped" predicate: TRUE iff PG primary's name filter
-            -- (geocode_address.sql:110) would have matched this row:
-            --   length>5 → exact_name OR fullname-LIKE-with-predir OR soundex_eq
-            --   length≤5 → exact_name only
-            -- Used twice below: (a) the no-input-ZIP rating constant (+1 for
-            -- primary-shape, +3 for fallback-shape — PG fallback's value), and
-            -- (b) the address rendering in ranked_a (PG primary clamps to the
-            -- nearest range endpoint, PG fallback NULLs the address).
-            (   ff.name_lower = ff.p_street_name_lower
-             OR (length(ff.p_street_name) > 5 AND (
-                       lower(ff.fullname) LIKE COALESCE(lower(ff.p_pre_dir) || ' ', '') || ff.p_street_name_lower || '%'
-                    OR ff.name_soundex = ff.p_street_name_soundex))
+            -- "Primary-shaped" predicate: TRUE iff PG primary would have
+            -- emitted this row. Two conditions:
+            --   1. Name filter (geocode_address.sql:110):
+            --        length>5 → exact_name OR fullname-LIKE-with-predir OR soundex_eq
+            --        length≤5 → exact_name only
+            --   2. Place is non-null. PG primary INNER JOINs tiger.place
+            --      (geocode_address.sql:167), so rows whose face has NULL
+            --      placefp (common in unincorporated CDPs that map to a
+            --      cousub/county) don't appear in primary — only PG fallback
+            --      catches them. Without this conjunct we'd misapply primary's
+            --      place-only city formula to NULL-place rows and emit
+            --      city_penalty=5 instead of fallback's lev-to-cousub=0.
+            -- Used three places below: (a) no-input-ZIP rating constant,
+            -- (b) ZIP penalty formula, (c) city penalty formula. Also used
+            -- in ranked_a's address rendering (clamp vs NULL).
+            (   pl.name IS NOT NULL
+             AND (ff.name_lower = ff.p_street_name_lower
+                  OR (length(ff.p_street_name) > 5 AND (
+                            lower(ff.fullname) LIKE COALESCE(lower(ff.p_pre_dir) || ' ', '') || ff.p_street_name_lower || '%'
+                         OR ff.name_soundex = ff.p_street_name_soundex)))
             )                   AS via_primary,
             @TIGER@.rate_attributes(
                 ff.p_pre_dir, ff.predirabrv,
@@ -315,26 +323,69 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                             / GREATEST(1, GREATEST(ff.p_address, @TIGER@.greatest_hn(ff.fromhn, ff.tohn)))
                       )) * 5)::INTEGER + 5
               END
-            -- No-input-ZIP rating constant: PG primary +1, PG fallback +3.
-            -- Uses the same `via_primary` predicate above (#1076h: streetName='3A'
-            -- length 2, featname name='3' → not primary-shaped → +3 → rating 18
-            -- matches PG).
+            -- ZIP penalty: PG primary uses `LEAST(diff_zip, 20) * penalty`
+            -- (geocode_address.sql:125); PG fallback uses
+            -- `LEAST(diff_zip * penalty, lev_zip * penalty)`
+            -- (geocode_address.sql:320), which lets near-prefix ZIPs (lev=3
+            -- → penalty 6) score better than they would under the primary's
+            -- numeric-distance formula (213 capped at 20 → penalty 40).
+            -- Discriminate per row via_primary. Closes #1145d-class scoring
+            -- where input ZIP is in a different numeric range from the
+            -- candidate's ZIP but their digit prefixes are close.
+            -- The no-input-ZIP constant (+1 vs +3) uses the same predicate.
+            -- Note: the inline predicates duplicate via_primary's body because
+            -- a column alias defined in the same SELECT can't be referenced
+            -- in sibling expressions without a wrapping subquery. Kept verbatim.
             + CASE
                 WHEN ff.p_zip IS NULL THEN
-                    CASE WHEN ff.name_lower = ff.p_street_name_lower
-                              OR (length(ff.p_street_name) > 5 AND (
-                                    lower(ff.fullname) LIKE COALESCE(lower(ff.p_pre_dir) || ' ', '') || ff.p_street_name_lower || '%'
-                                    OR ff.name_soundex = ff.p_street_name_soundex))
+                    CASE WHEN pl.name IS NOT NULL
+                              AND (ff.name_lower = ff.p_street_name_lower
+                                   OR (length(ff.p_street_name) > 5 AND (
+                                         lower(ff.fullname) LIKE COALESCE(lower(ff.p_pre_dir) || ' ', '') || ff.p_street_name_lower || '%'
+                                         OR ff.name_soundex = ff.p_street_name_soundex)))
                          THEN 1 ELSE 3
                     END
                 WHEN ff.a_zip IS NULL THEN 0
-                ELSE LEAST(@TIGER@.diff_zip(ff.p_zip, ff.a_zip) * zip_penalty, 20 * zip_penalty)::INTEGER
+                WHEN pl.name IS NOT NULL
+                     AND (ff.name_lower = ff.p_street_name_lower
+                          OR (length(ff.p_street_name) > 5 AND (
+                                lower(ff.fullname) LIKE COALESCE(lower(ff.p_pre_dir) || ' ', '') || ff.p_street_name_lower || '%'
+                                OR ff.name_soundex = ff.p_street_name_soundex)))
+                THEN -- via_primary: PG primary's formula
+                    LEAST(@TIGER@.diff_zip(ff.p_zip, ff.a_zip) * zip_penalty, 20 * zip_penalty)::INTEGER
+                ELSE -- fallback-shaped: PG fallback's formula
+                    LEAST(
+                        (@TIGER@.diff_zip(ff.p_zip, ff.a_zip) * zip_penalty)::INTEGER,
+                        (@TIGER@.levenshtein_ignore_case(ff.p_zip, ff.a_zip) * zip_penalty)::INTEGER
+                    )
               END
+            -- City penalty: PG primary uses `lev(input, place) or 5`
+            -- (geocode_address.sql:127); PG fallback uses
+            -- `LEAST(lev(input, COALESCE(p, cs, zip.city, co)),
+            --        lev(input, COALESCE(cs, co))) or 5`
+            -- (geocode_address.sql:322). The fallback formula picks the
+            -- best lev across multiple location sources instead of only
+            -- using place — important when place is NULL on the matched
+            -- face (common in unincorporated areas) and the cousub or
+            -- county provides the actual city match.
             + CASE
                 WHEN ff.p_location IS NULL THEN 5
-                WHEN pl.name IS NOT NULL THEN @TIGER@.levenshtein_ignore_case(ff.p_location, pl.name)
-                WHEN cs.name IS NOT NULL THEN @TIGER@.levenshtein_ignore_case(ff.p_location, cs.name)
-                ELSE 5
+                WHEN pl.name IS NOT NULL
+                     AND (ff.name_lower = ff.p_street_name_lower
+                          OR (length(ff.p_street_name) > 5 AND (
+                                lower(ff.fullname) LIKE COALESCE(lower(ff.p_pre_dir) || ' ', '') || ff.p_street_name_lower || '%'
+                                OR ff.name_soundex = ff.p_street_name_soundex)))
+                THEN -- via_primary: PG primary's place-only formula
+                    COALESCE(@TIGER@.levenshtein_ignore_case(ff.p_location, pl.name), 5)
+                ELSE -- fallback-shaped: PG fallback's LEAST formula
+                    COALESCE(LEAST(
+                        @TIGER@.levenshtein_ignore_case(
+                            ff.p_location,
+                            COALESCE(pl.name, cs.name, ct.name)),
+                        @TIGER@.levenshtein_ignore_case(
+                            ff.p_location,
+                            COALESCE(cs.name, ct.name))
+                    ), 5)
               END AS rating
         FROM fae_faces_a ff
         LEFT JOIN @TIGER@.place  pl ON pl.statefp = ff.e_statefp AND pl.placefp  = ff.placefp
@@ -419,8 +470,15 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         SELECT count(*) AS n_rows, MIN(rating) AS min_r FROM deduped_a
     ),
     gate AS (
-        -- PG-style gate: fire fallback if best rating ≥ 30 or no rows.
-        SELECT 1 AS go FROM pass_a_summary WHERE n_rows = 0 OR min_r >= 30
+        -- PG-style gate: fire fallback if Pass A is weak. Two conditions
+        -- (PG's IF var_bestrating < 30 → RETURN check at geocode_address.sql:244):
+        --   * n_rows = 0  → Pass A found nothing; PG iterates fallback shapes
+        --   * min_r ≥ 30  → best Pass A rating is "fallback territory"; PG continues
+        -- Carry pass_a_empty as a column so Pass B's loose branches can
+        -- distinguish "PG iter 1 (strict, exact=TRUE) was empty too" from
+        -- "iter 1 returned rows but PG kept iterating exact=FALSE shapes."
+        SELECT 1 AS go, pass_a_summary.n_rows = 0 AS pass_a_empty
+        FROM pass_a_summary WHERE n_rows = 0 OR min_r >= 30
     ),
     -- =========================================================================
     -- Pass B: looser candidate pipeline. Soundex/prefix branches drop the
@@ -430,19 +488,27 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
     -- is sufficient.
     -- =========================================================================
     name_match_tlids_b AS (
-        -- Pass B's loose branches are gated on `NOT p.zip_info_exact` to mirror
-        -- PG's bifurcated fallback name filter (geocode_address.sql:354-357):
-        --   exact=TRUE  → strict (exact_name OR prequalabr-trim OR numeric_streets_equal)
-        --   exact=FALSE → loose  (soundex OR length-gated fullname-LIKE OR numeric_streets_equal)
-        -- When zip_info_exact=TRUE, Pass A's exact_name + fullname_norm exact +
-        -- numeric_streets_equal already cover PG's strict filter, so Pass B's
-        -- loose branches contribute nothing — gating them off prevents the
-        -- soundex('35')='0000' flood (#1112d/e regression guard) without
-        -- losing parity. When zip_info_exact=FALSE (no/unknown ZIP, or
-        -- city-derived ZIPs), Pass B's loose branches fire as before.
+        -- Pass B's loose branches mirror PG fallback's exact=FALSE iterations
+        -- (geocode_address.sql:356): soundex OR length-gated fullname-LIKE
+        -- OR numeric_streets_equal. PG runs these only when iter 1
+        -- (exact=TRUE strict) didn't accumulate enough rows. We approximate
+        -- that with `(NOT p.zip_info_exact OR gate.pass_a_empty)`:
+        --   * NOT zip_info_exact: input has no valid ZIP → PG's iter 1
+        --     (zip_state.zip = $2) returns 0 rows → iter 2+ (exact=FALSE,
+        --     loose) fires. Our Pass A already runs with city_zips here,
+        --     so this is the standard "no input ZIP" path.
+        --   * gate.pass_a_empty: Pass A returned 0 rows, meaning PG's
+        --     primary + iter 1 of fallback (both strict-shaped) also
+        --     would have returned 0. PG iterates to exact=FALSE shapes;
+        --     we fire Pass B's loose branches with the wider city_zips.
+        --     Closes #1145d: street_name='ST' length 2 doesn't trigger
+        --     Pass A's length-gated soundex; Pass B's ungated soundex
+        --     matches '121st' (soundex('ST')='S300'=soundex('121st')).
+        -- The combined predicate prevents #1112d/e regression: those have
+        -- valid ZIPs (zip_info_exact=TRUE) AND Pass A returns rows
+        -- (pass_a_empty=FALSE) → Pass B doesn't fire, no Co Rd 37 flood.
         --
-        -- Soundex (no length gate) — the main thing Pass A misses for short
-        -- streetnames like 'ST' or '3RD' that PG fallback finds.
+        -- Soundex (no length gate).
         SELECT f.tlid, f.statefp,
                f.name, f.fullname, f.predirabrv, f.suftypabrv, f.pretypabrv,
                f.sufdirabrv, f.prequalabr,
@@ -454,9 +520,9 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         FROM @TIGER@.featnames f JOIN p
              ON f.statefp = p.statefp
             AND f.name_soundex = p.street_name_soundex
-        CROSS JOIN gate
+        CROSS JOIN gate g
         WHERE p.street_name IS NOT NULL
-          AND NOT p.zip_info_exact
+          AND (NOT p.zip_info_exact OR g.pass_a_empty)
 
         UNION ALL
         -- Name prefix LIKE (no length gate).
@@ -465,10 +531,10 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                COALESCE(p.window_zips, []::VARCHAR[]) || COALESCE(p.city_zips, []::VARCHAR[]),
                p.street_name, p.street_type, p.zip,
                p.pre_dir, p.post_dir, p.location, p.address, p.internal
-        FROM @TIGER@.featnames f, p, gate
+        FROM @TIGER@.featnames f, p, gate g
         WHERE f.statefp = p.statefp
           AND p.street_name IS NOT NULL
-          AND NOT p.zip_info_exact
+          AND (NOT p.zip_info_exact OR g.pass_a_empty)
           AND f.name_lower LIKE p.street_name_lower || '%'
 
         UNION ALL
@@ -478,10 +544,10 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                COALESCE(p.window_zips, []::VARCHAR[]) || COALESCE(p.city_zips, []::VARCHAR[]),
                p.street_name, p.street_type, p.zip,
                p.pre_dir, p.post_dir, p.location, p.address, p.internal
-        FROM @TIGER@.featnames f, p, gate
+        FROM @TIGER@.featnames f, p, gate g
         WHERE f.statefp = p.statefp
           AND p.street_name IS NOT NULL
-          AND NOT p.zip_info_exact
+          AND (NOT p.zip_info_exact OR g.pass_a_empty)
           AND f.fullname_norm LIKE p.fullname_prefix_input || '%'
     ),
     fae_b AS (
@@ -554,17 +620,26 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                             / GREATEST(1, GREATEST(ff.p_address, @TIGER@.greatest_hn(ff.fromhn, ff.tohn)))
                       )) * 5)::INTEGER + 5
               END
-            -- Pass B's no-input-ZIP fallback: +3 (PG fallback stage_a's value).
+            -- Pass B is the fallback path: use PG fallback's rating formulas
+            -- (geocode_address.sql:320,322) directly, no via_primary discrimination.
             + CASE
                 WHEN ff.p_zip IS NULL THEN 3
                 WHEN ff.a_zip IS NULL THEN 0
-                ELSE LEAST(@TIGER@.diff_zip(ff.p_zip, ff.a_zip) * zip_penalty, 20 * zip_penalty)::INTEGER
+                ELSE LEAST(
+                    (@TIGER@.diff_zip(ff.p_zip, ff.a_zip) * zip_penalty)::INTEGER,
+                    (@TIGER@.levenshtein_ignore_case(ff.p_zip, ff.a_zip) * zip_penalty)::INTEGER
+                )
               END
             + CASE
                 WHEN ff.p_location IS NULL THEN 5
-                WHEN pl.name IS NOT NULL THEN @TIGER@.levenshtein_ignore_case(ff.p_location, pl.name)
-                WHEN cs.name IS NOT NULL THEN @TIGER@.levenshtein_ignore_case(ff.p_location, cs.name)
-                ELSE 5
+                ELSE COALESCE(LEAST(
+                    @TIGER@.levenshtein_ignore_case(
+                        ff.p_location,
+                        COALESCE(pl.name, cs.name, ct.name)),
+                    @TIGER@.levenshtein_ignore_case(
+                        ff.p_location,
+                        COALESCE(cs.name, ct.name))
+                ), 5)
               END AS rating
         FROM fae_faces_b ff
         LEFT JOIN @TIGER@.place  pl ON pl.statefp = ff.e_statefp AND pl.placefp  = ff.placefp
