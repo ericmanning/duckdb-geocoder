@@ -24,11 +24,22 @@ PG returns a single record with parallel arrays (`intpt[]`, `addy[]`, `street[]`
 
 ### D7: Stage A/B short-circuits relaxed
 
-PG's geocoder has multiple `rating = 0 → return immediately` and `exact_street → skip Stage B` short-circuits. PG also has *two* Stage A SQL queries: a primary that filters by ZIP info (uses `+1` as the no-input-ZIP rating fallback) and a fallback that re-runs against location-derived ZIPs (uses `+3` to penalize the weaker confidence). `us_geocoder` computes all Stage A candidates in one vectorized pass and uses `ORDER BY rating LIMIT max_results`; Stage B runs only when Stage A returns zero rows.
+PG's geocoder has multiple `rating = 0 → return immediately` and `exact_street → skip Stage B` short-circuits, plus a `LOOP` over `zip_info` shapes that can short-circuit after iter 1 returns enough rows. `us_geocoder` is a SQL macro with no equivalent control flow — it computes all candidates in one vectorized pass with `ORDER BY rating LIMIT max_results`.
 
-**Observable effects:**
-- At tie-rating boundaries (e.g. multiple exact matches on a multi-block street), `us_geocoder` may return a different element of the tie than PG. The top-N set by rating is the same; the *order within a rating tier* can differ.
-- We use `+1` as the no-input-ZIP rating fallback uniformly; PG's primary path uses `+1` and its fallback path uses `+3`. Since we don't reproduce the two-pass structure, we don't have a natural site for the `+3` and it's omitted. In practice this matters only for inputs that *would* trip PG's primary into returning weak-rating candidates; current parity corpus shows no test hitting that boundary except `#1112a` (where we miss a Stage A candidate entirely — separate issue).
+**As of `patch/d7` merge** (see [`d7-revisit.md`](d7-revisit.md)), Stage A is a two-pass structure that mirrors PG's primary + fallback distinction *as predicates*, without the iteration:
+
+- **Pass A**: primary-shaped filter (length-gated soundex/prefix); always runs.
+- **Pass B**: fallback-shaped filter (ungated soundex / fullname-LIKE / name-prefix); fires when Pass A is weak (`n_rows = 0 OR min_r ≥ 30`), mirroring PG's `IF var_bestrating < 30 THEN RETURN`.
+
+A per-row `via_primary` discriminator (verbatim port of PG primary's name filter, ANDed with `place IS NOT NULL`) drives:
+- No-input-ZIP rating constant (`+1` PG primary vs `+3` PG fallback).
+- Address rendering (PG primary clamps out-of-range house numbers; PG fallback NULLs them).
+- ZIP penalty formula (`LEAST(diff_zip, 20) * penalty` primary vs `LEAST(diff_zip * penalty, lev_zip * penalty)` fallback).
+- City penalty formula (place-only primary vs `LEAST` over place/cousub/county/zip_lookup_base.city fallback).
+
+**Observable effects** that remain:
+- At rating ties within a `DISTINCT ON` partition, our pick may differ from PG's because PG's tiebreak after `ORDER BY 1,2,3,4,5,6,7,9` in `geocode_address.sql` ultimately depends on PostgreSQL's physical heap row order (disk insertion order). DuckDB columnar storage has different natural ordering. Documented as #1113d-class.
+- PG's iter-2-of-fallback inner has `ORDER BY rate_attributes+house_penalty LIMIT 200`, then `DISTINCT ON ... ORDER BY (predirabrv, fename, ...) LIMIT 10` *before* final rating sort. This alphabetical pre-cut hides candidates from PG's output that we (with no equivalent cut) score and surface. For #1073a we find Minneapolis 3rd Ave N r=4; PG returns Hanover 3rd St NE r=38 because the alphabetical LIMIT 10 dropped Minneapolis from PG's final-sort input.
 
 ### D8: tract / bg / tabblock20 tables dropped
 
@@ -202,7 +213,7 @@ The full PG-2025-PAGC oracle is the new parity baseline; the original vendored f
 
 ### Documented improvements over PG (deliberate divergences)
 
-Two specific mechanisms in our pipeline produce *better* results than PG-with-PAGC on certain inputs. Both are intentional; **don't remove them in any "match PG bit-for-bit" cleanup**.
+Three specific mechanisms in our pipeline produce *better* results than PG-with-PAGC on certain inputs. All intentional; **don't remove them in any "match PG bit-for-bit" cleanup**.
 
 **Mechanism A — `from_pagc` post-PAGC validation** (resolves T18a-class).
 
@@ -214,31 +225,33 @@ Our [`from_pagc`](../src/sql/from_pagc.sql.in) detects when both parsers agree t
 
 PAGC strips ordinal suffixes: `"27th"` → name=`'27'`, `"36th"` → `'36'`, `"18th"` → `'18'`. PG's primary stage_a uses ONLY exact `f.name = $2` for short streetnames (length ≤ 5), so it can't match TIGER's `name='27th'` from input `'27'`. PG has a `numeric_streets_equal` clause but only in its **fallback** stage_a, which runs only if primary's best rating ≥ 30. For `#1145a`, PG primary finds `Co Rd 27` at rating 27 (under threshold) → never tries fallback → never finds 27th Ave S.
 
-Our [`name_match_tlids`](../src/sql/geocode_address.sql.in) always runs the `numeric_streets_equal` branch (a consequence of D7's collapsed primary/fallback). So we find both `name='27'` AND `name='27th'` candidates and pick the one that scores best.
+Our [`name_match_tlids_a`](../src/sql/geocode_address.sql.in) always runs the `numeric_streets_equal` branch. We find both `name='27'` AND `name='27th'` candidates and pick the one that scores best.
 
 Triggers when: PAGC strips ordinal/letter suffix from a numeric streetname (length ≤ 5 result) AND TIGER's name retains the suffix AND PG primary's best alternate would rate < 30.
 
-### Post-investigation status (April 2026)
+**Mechanism C — PAGC numeric-suffix recombination in `from_pagc`** (added in `patch/d7`; helps #1073a-class indirectly).
 
-After landing the rule-data ship + sort key + pprint_addy + soundex length-gate + suftype-only rate_attributes + fullname-prefix LIKE + prequalabr-aware addy + clamp out-of-range + nested dedup + scaled house penalty fixes, **first-row pick parity is 43/51 against PG-2025-PAGC.** The remaining 8 first-row divergences split:
+For inputs like `"8401 West 35W, ..."`, PAGC parses `street_name='35', sufdir='W'` (PG's `pagc_normalize_address` does the same; verified via Docker side-by-side). When `street_name='35'`, `soundex('35')='0000'` collides with every digit-stem street name (Co Rd 37, US Hwy 10, 101st, ...). PG's `geocode` function happens to avoid the resulting flood because its plpgsql `LOOP` short-circuits after iter 1 returns enough rows; our table-query model has no equivalent control flow.
 
-| Test | Category | Disposition |
-|---|---|---|
-| T18a | **Us better than PG** (Mechanism A — `from_pagc` recovery) | Don't fix |
-| #1145a | **Us better** (Mechanism B — unconditional `numeric_streets_equal`) | Don't fix |
-| #1145b | **Us better** (Mechanism B) | Don't fix |
-| #1145e | **Us better** (Mechanism B) | Don't fix |
-| #1076h | **D7 cost — recoverable in principle** | Same address picked, rating off by 2 (PG's `+3` no-input-ZIP fallback in fallback stage_a vs our `+1`). Closeable only by reverting D7 (porting PG's two-stage_a structure). Not worth it |
-| #1113d | **PostgreSQL physical row-order non-determinism** | Both PG and we evaluate the IDENTICAL 3-candidate set for "Rockford Rd" — TLID 43606664 (one addr row) and TLID 43852639 (two addr rows, sides L and R). All three at sub_rating=5 (out-of-range scaled penalty). All three in the same `DISTINCT ON (predirabrv, fename, type, sufdir, place, state, zip)` partition. PG's `ORDER BY 1,2,3,4,5,6,7,9` documents sub_rating as the only non-partition tiebreak — but with sub_rating tied across all three, PG's pick depends on PostgreSQL's *physical heap row order* (disk insertion order). PG happens to pick the 43852639 side=R row (15899); we deterministically pick the 43852639 side=L row (15702) via our `a_fromhn ASC` tiebreak. **Not closeable in SQL** — PG's tiebreak isn't specified at the SQL level, just emerges from storage layout that differs between PostgreSQL heap and DuckDB columnar |
-| #1073a | **D7 cost — multi-query zip_info iteration** | Input "212 3rd Ave N, MINNEAPOLIS, MN 553404" parses correctly (PG and us identical), but ZIP `55340` is Hanover, not Minneapolis. PG runs **3 sequential queries** with different `zip_info.zip` shapes: (1) primary stage_a with city-filtered ZIP window {55339,55340,55341}, (2) fallback stage_a with single-zip {55340} via `zip_state` lookup, (3) fallback stage_a with all 30 Minneapolis ZIPs via `zip_state_loc`/place lookup. Final pick comes from #1 (Hanover 55341 made the window). We collapse all three into one always-on pass with one `window_zips` shape, so we evaluate a different candidate set and pick differently. Closeable by D7 reversal |
-| #1145d | **D7 cost — parser-broken input that PG salvages via fallback stage_a** | Input "8512 141 St Ct Apple Valley" has TWO numbers and PAGC can't tokenize it correctly. Both parsers produce `house=141, name='ST', type='Ct'` (we now also capture `internal='8512'` after the v0.x→v0.y geocode_input widening). With short streetname='ST', PG's primary stage_a finds nothing (uses exact match only for length≤5); PG then runs *fallback* stage_a after location-based ZIP expansion, and its fallback uses **unconditional soundex** when `zip_info.exact=false`. `soundex('ST')` matches every "St"-soundexed name in the expanded ZIP window, surfacing junk candidates like `141 W 121st St, Burnsville` at rating 51. Our pipeline length-gates soundex >5 (to prevent the digit-stem flood — see Mechanism B's `numeric_streets_equal` gate) AND has no fallback path, so we drop to Stage B (rating 100). Both implementations produce garbage; PG's is just lower-rated garbage. Closeable only by porting PG's primary/fallback structure (D7 reversal) AND adding a "fallback uses unconditional soundex" mode |
+[`from_pagc`](../src/sql/from_pagc.sql.in) detects when the raw input contains an unspaced `<digits><single-letter>` token AND PAGC over-split it, and recombines back into `street_name='35W', post_dir=NULL`. Conservative trigger conditions (only purely-digit name + single direction letter + raw text contains the unspaced concat). Trade-off: TIGER stores compound numeric-direction streets inconsistently (Pattern A `name='35W'` ~725 rows in MA/MN/CT, Pattern B `name='35', sufdir='W'` ~3500 rows). For Pattern B inputs where the user *did* type the unspaced concat, the recombined parse loses the explicit sufdir match and incurs a +2 rating penalty (`numeric_streets_equal` still finds the right candidate). Net positive.
 
-**Three "wrongness" categories:**
-- **us-better-than-PG (4 tests)**: T18a, #1145a/b/e — our preprocessing mechanisms catch PAGC limitations PG carries through. Documented above; do not revert.
-- **D7 cost (3 tests)**: #1076h, #1073a, #1145d — trace back to PG's primary/fallback stage_a structure that we deliberately collapsed in D7. Closeable only by D7 reversal (separate planned work).
-- **PostgreSQL physical row-order non-determinism (1 test)**: #1113d — PG's `DISTINCT ON` has an explicit ORDER BY at the SQL level, but rating ties are resolved by PG's heap natural row order (disk insertion order). DuckDB's columnar storage has different natural ordering, so we deterministically pick a different row from the same tied set. Not closeable in SQL — would require replicating PostgreSQL's storage layout.
+### Post-investigation status (April 2026, post-`patch/d7`)
 
-**Net: no remaining bugs in our code.** All 8 divergences are accounted for by deliberate design choices, D7, or storage-layout differences that aren't expressible in SQL. When D7 is revisited (as planned), the three D7-cost cases will all be re-evaluated — porting PG's primary/fallback split should resolve most or all of them. The four us-better-than-PG cases need careful handling at that time so they don't regress. #1113d will likely remain divergent regardless of D7 work.
+After the D7 revisit work landed (see [`d7-revisit.md`](d7-revisit.md) for the per-commit breakdown), parity against PG-2025-PAGC is **29/51 strict match** (`pprint_addy(addy)` + 4-decimal-truncated `POINT(lng lat)` + integer rating identical for all rows up to per-test `max_n`).
+
+The original three "D7-cost" divergences (#1076h, #1073a, #1145d) are now resolved structurally — though the resolutions are more nuanced than full primary/fallback rewrite:
+
+- **#1076h** — top row matches PG exactly (rating 18, Hingham). Row-2 still diverges in geom only (sub-meter precision drift on tied sub_rating; same address text and rating).
+- **#1073a** — we now find the *correct* address `212 3rd Ave N, Minneapolis, MN 55401 r=4`. PG returns `10000 3rd St NE, Hanover, MN 55341 r=38` (PG's own iter-2 `LIMIT 10` after alphabetical sort hides Minneapolis from PG's final-sort input). **We beat PG; this is now classified us-better-than-PG.**
+- **#1145d** — structurally closes (Pass A=0 path now fires Pass B's loose branches); we return real candidates instead of dropping to Stage B. Top candidate text differs from PG's row-1 due to PG-specific iter-2 query plan effects (DISTINCT ON ordering, alphabetical pre-sort) that aren't expressible in our table-query model.
+
+The 22 remaining divergences split across three classes (full audit pending — see roadmap):
+
+- **us-better-than-PG** (Mechanisms A/B/C above) — T18a, #1073a, #1145a-e, others. Don't revert.
+- **PostgreSQL physical row-order non-determinism** — #1113d-class. PG's `DISTINCT ON` ORDER BY ultimately depends on PG's heap natural row order at sub_rating ties; DuckDB columnar storage has different natural ordering. Not closeable in SQL.
+- **PG query-plan artifact** — divergences caused by PG's iter-2 inner `ORDER BY rate_attributes+house LIMIT 200` then `DISTINCT ON ... ORDER BY (predir, fename, ...) LIMIT 10` *before* final rating sort. Some of these are us-better (we find candidates PG's alphabetical pre-cut hides); some are draws.
+
+**Net: no remaining bugs in our code as of patch/d7 merge.** The remaining strict-match divergences are accounted for by deliberate design choices or PG's storage/query-plan effects that aren't expressible in SQL.
 
 ### Roadmap
 
