@@ -47,18 +47,31 @@ CREATE OR REPLACE MACRO @TIGER@.interpolate_from_address(
     ),
     frac AS (
         SELECT line, src_crs, a1, a2,
-               CASE WHEN a1 > a2 THEN 1.0 - part_raw ELSE part_raw END AS part
+               -- PG's interpolate_from_address.sql:42-44 sets part=0.5 (edge
+               -- midpoint) when the input house number falls outside the edge's
+               -- range — "we don't know where in the edge it is, so render the
+               -- middle". Our previous CLAMP-to-[0,1] formulation pinned the
+               -- output to the nearer endpoint instead, producing ~30m geom
+               -- drift on out-of-range cases (T12/T13/T16 row-3 "99 Federal
+               -- Ln, Dedham" given input house 101).
+               CASE
+                   WHEN part_dir < 0.0 OR part_dir > 1.0 OR part_dir IS NULL
+                        THEN 0.5
+                   ELSE part_dir
+               END AS part
         FROM (
             SELECT line, src_crs, a1, a2,
-                   CASE
-                       WHEN GREATEST(a1, a2) = LEAST(a1, a2) THEN 0.5
-                       ELSE LEAST(1.0, GREATEST(0.0,
-                            CAST(given_address - LEAST(a1, a2) AS DOUBLE)
-                            / CAST(GREATEST(a1, a2) - LEAST(a1, a2) AS DOUBLE)
-                       ))
-                   END AS part_raw
-            FROM parsed
-            WHERE line IS NOT NULL
+                   CASE WHEN a1 > a2 THEN 1.0 - part_raw ELSE part_raw END AS part_dir
+            FROM (
+                SELECT line, src_crs, a1, a2,
+                       CASE
+                           WHEN GREATEST(a1, a2) = LEAST(a1, a2) THEN 0.5
+                           ELSE CAST(given_address - LEAST(a1, a2) AS DOUBLE)
+                                / CAST(GREATEST(a1, a2) - LEAST(a1, a2) AS DOUBLE)
+                       END AS part_raw
+                FROM parsed
+                WHERE line IS NOT NULL
+            )
         )
     ),
     -- Fast path: no side/offset → interpolate in the native SRID,
@@ -79,19 +92,37 @@ CREATE OR REPLACE MACRO @TIGER@.interpolate_from_address(
         FROM frac
         WHERE in_side IS NOT NULL AND in_side != '' AND in_offset_m IS NOT NULL AND in_offset_m > 0
     ),
+    -- Local-segment azimuth: PG's interpolate_from_address.sql:54-71 picks the
+    -- specific segment of the (possibly multi-vertex) linestring that contains
+    -- the interpolation point and uses that segment's azimuth for the
+    -- perpendicular offset. Using overall start-to-end azimuth produces wrong
+    -- offsets on curved roads (#1076g/#1113f geom drift). Approximate PG's
+    -- segment-finding by computing azimuth between two ST_LineInterpolatePoint
+    -- calls at part ± epsilon — for 2-point lines this collapses to overall
+    -- start-to-end azimuth (no regression on straight edges); for multi-point
+    -- lines it captures the local segment direction. Epsilon=0.001 gives
+    -- 0.1% of line length (typically 5cm–2m for TIGER edges).
+    slow_az AS (
+        SELECT line_utm, utm_crs, src_crs, part,
+               ST_Azimuth(
+                   ST_LineInterpolatePoint(line_utm, GREATEST(0.0, part - 0.001)),
+                   ST_LineInterpolatePoint(line_utm, LEAST(1.0, part + 0.001))
+               ) AS local_az
+        FROM slow_utm
+    ),
     slow_offset AS (
         SELECT
             ST_Transform(
                 ST_Translate(
                     ST_LineInterpolatePoint(line_utm, part),
-                    in_offset_m * sin(ST_Azimuth(ST_StartPoint(line_utm), ST_EndPoint(line_utm))
+                    in_offset_m * sin(local_az
                                       + CASE WHEN upper(in_side) = 'L' THEN -pi()/2 ELSE pi()/2 END),
-                    in_offset_m * cos(ST_Azimuth(ST_StartPoint(line_utm), ST_EndPoint(line_utm))
+                    in_offset_m * cos(local_az
                                       + CASE WHEN upper(in_side) = 'L' THEN -pi()/2 ELSE pi()/2 END)
                 ),
                 utm_crs, src_crs, always_xy := true
             ) AS pt
-        FROM slow_utm
+        FROM slow_az
     )
     SELECT pt FROM fast_center
     UNION ALL
