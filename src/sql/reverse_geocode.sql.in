@@ -60,10 +60,13 @@ CREATE OR REPLACE MACRO @TIGER@.reverse_geocode(pt, max_results) AS TABLE (
           AND c.statefp = state_hit.statefp
         LIMIT 1
     ),
-    -- ZCTAs don't overlap, so the spatial test is sufficient. The statefp
-    -- column on tiger.zcta5 is NULL in v0.1 (per-state clipping deferred —
-    -- see loader_templates.sql.in :nation_zcta5: + geocode_flow.md §14.9),
-    -- so we deliberately don't constrain by state.
+    -- tiger.zcta5 holds two flavours of row: nation-level polygons
+    -- (statefp=NULL) inserted by load_tiger_nation, and per-state-clipped
+    -- polygons (statefp=$STATEFP) inserted by load_tiger_state's
+    -- derived_zcta5_clip step. Both spatially cover the same ground; either
+    -- flavour resolves the ZIP correctly. We don't constrain by statefp so
+    -- points in states that haven't been loaded still resolve via the
+    -- nation rows.
     zip_hit AS (
         SELECT z.zcta5ce AS zip
         FROM @TIGER@.zcta5 z, pt_info

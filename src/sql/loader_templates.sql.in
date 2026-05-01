@@ -118,6 +118,23 @@ WHERE e.statefp = '@STATEFP@'
       WHERE zip = z.zip AND statefp = '@STATEFP@' AND place = pl.name
   );
 
+-- @SECTION:derived_zcta5_clip@
+-- Per-state ZCTA clipping (geocode_flow.md §14.9). The nation_zcta5 INSERT
+-- loads ZCTAs as nation-wide polygons with statefp=NULL; per state load we
+-- ADD clipped rows (one per (state, ZCTA) overlap) with statefp populated
+-- and the_geom = ST_Intersection of nation polygon and state boundary.
+-- Cross-state ZCTAs naturally produce one row per intersecting state, each
+-- carrying that state's slice. The original NULL-statefp nation row stays
+-- in place so reverse_geocode still resolves ZCTAs in unloaded states via
+-- the spatial fallback.
+INSERT INTO @TIGER@.zcta5 (statefp, zcta5ce, the_geom)
+SELECT '@STATEFP@', zr.zcta5ce, ST_Intersection(zr.the_geom, st.the_geom)
+FROM @TIGER@.zcta5 zr
+CROSS JOIN @TIGER@.state st
+WHERE zr.statefp IS NULL
+  AND st.statefp = '@STATEFP@'
+  AND ST_Intersects(zr.the_geom, st.the_geom);
+
 -- @SECTION:derived_edge_containment@
 -- Per-edge-per-side containment precomputation (geocode_flow.md §14.3).
 -- The guaranteed_* flags are the v0.1 single-midpoint approximation:
@@ -191,3 +208,5 @@ DELETE FROM @TIGER@.zip_state        WHERE statefp = '@STATEFP@';
 DELETE FROM @TIGER@.zip_state_loc    WHERE statefp = '@STATEFP@';
 DELETE FROM @TIGER@.zip_lookup_base  WHERE statefp = '@STATEFP@';
 DELETE FROM @TIGER@.edge_containment WHERE statefp = '@STATEFP@';
+-- Per-state-clipped ZCTA rows; nation-level rows (statefp=NULL) survive.
+DELETE FROM @TIGER@.zcta5            WHERE statefp = '@STATEFP@';
