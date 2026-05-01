@@ -84,45 +84,22 @@ LIMIT 1;
 ----
 100	Belt Line
 
-# --- #1461a-period: 'N. Belt Line' (with period) — pre-normalize pattern ---
-# PG's geocode_intersection internally synthesizes a fake address and runs it
-# through normalize_address (geocode_intersection.sql L42-43):
-#     normalize_address('0 ' || roadway1 || ', ' || city || ', ' || state)
-# and uses streetName + streetTypeAbbrev from the parsed result. That strips
-# periods and expands directionals. We don't do this inside the macro (would
-# add a hard runtime dep on us_address_standardizer for every intersection
-# caller), but the test below shows the pattern works at the call site:
-# from_pagc gives us the same parsed components as PG's normalize_address.
+# --- #1461a-period: 'N. Belt Line' (with period) — now matches directly ----
+# geocode_intersection now internally synthesizes a fake address and runs
+# each road through tiger.from_pagc (mirroring PG's L42-43 pattern with
+# normalize_address). The parser strips periods and expands directionals,
+# so the dotted form resolves to the same edges as the no-period form.
 #
-# Caveat discovered against current PG: PG's parser tokenizes 'Belt Line' as
-# name='Belt' + type='Line' (since LINE appears in street_type_lookup), and
-# its matcher then can't find featnames.name='Belt Line'. So current PG
-# itself returns 0 rows for ALL forms of #1461a/b on this synthetic data —
-# the historical expected file (rating=5) was captured before that parser
-# change. Our raw-input matcher with the length>5 LIKE branch is actually
-# more robust on this case.
+# us-better-than-PG note: PG's matcher gates the LIKE branch on
+# length(streetName)>5, which fails when PAGC tokenizes 'Belt Line' into
+# name='BELT'(4)+type='LINE'(4). PG itself returns 0 rows for #1461a/b
+# on this synthetic data — verified against the live PG container. Our
+# matcher adds an extra branch (lower(name) = parsed_streetname+streettype)
+# which catches PAGC's over-split mis-tokenization.
 
-statement ok
-LOAD us_address_standardizer;
-
-# Pre-normalize via from_pagc and reconstruct the matchable streetname.
-# This is what PG does internally (its `var_road_fullname = streetName ||
-# ' ' || streetTypeAbbrev`); doing it at the call site here avoids
-# changing geocode_intersection's runtime deps.
-#
-# road1 'N. Belt Line' → street_name='BELT', street_type='LINE'  → 'BELT LINE'
-# road2 'I- 635'       → street_name='635'  (tagged 'INTERSTATE HIGHWAY' as
-#   type, which doesn't match featname 'I-' prefix; just pass the name).
 query II
 SELECT (addy).address, (addy).street_name
-FROM tiger.geocode_intersection(
-    trim(
-        (tiger.from_pagc('0 N. Belt Line, Coppell, TX 75019'))['street_name']
-        || ' ' ||
-        COALESCE((tiger.from_pagc('0 N. Belt Line, Coppell, TX 75019'))['street_type'], '')
-    ),
-    (tiger.from_pagc('0 I- 635, Coppell, TX 75019'))['street_name'],
-    'TX', 'Coppell', NULL, 1)
+FROM tiger.geocode_intersection('N. Belt Line', 'I- 635', 'TX', 'Coppell', NULL, 1)
 ORDER BY rating
 LIMIT 1;
 ----

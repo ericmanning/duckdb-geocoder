@@ -265,6 +265,8 @@ FROM tiger.geocode_intersection('Benefit', 'Meeting', 'RI', 'Providence', '02903
 
 Returns `(addy, geom, rating)`. Output geom is the shared endpoint of the first road's edge.
 
+**Pre-normalization.** Each road input is internally synthesized into a fake address (`'0 ' || road || ', ' || city || ', ' || state || ' ' || zip`) and parsed via [`tiger.from_pagc`](#tigerfrom_pagcraw_text-varchar--tigergeocode_input), mirroring PG's `normalize_address` step in [PostGIS' geocode_intersection.sql:42-43](https://gitea.osgeo.org/postgis/postgis_tiger_geocoder/src/branch/main/src/geocode/geocode_intersection.sql#L42-L43). This strips periods (`'N. Belt Line'` → `'N BELT LINE'`), expands directionals, and generally reduces input variance. Requires `us_address_standardizer` to be loaded at call time — the extension auto-loads it.
+
 ### `tiger.reverse_geocode(pt GEOMETRY, max_results INT) → TABLE`
 
 Given a point, returns the nearest street candidates.

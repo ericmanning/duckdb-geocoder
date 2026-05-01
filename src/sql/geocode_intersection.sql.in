@@ -1,15 +1,22 @@
 -- geocode_intersection(road1, road2, state, city, zip, max_results) → TABLE
 --
--- Per geocode_flow.md §9: takes plain varchars (no from_pagc adapter);
--- finds edges for both roads then joins on shared TIGER node ID
--- (tnidf/tnidt) to identify intersecting pairs. Output point is the
--- endpoint of road1 at the shared node.
+-- Per geocode_flow.md §9 + PG src/geocode/geocode_intersection.sql L42-L74:
+-- pre-normalizes each road by synthesizing a fake address ('0 ' || road1
+-- || ', ' || city || ', ' || state) and running it through tiger.from_pagc(),
+-- then joins on featnames using both the parsed components and the raw input
+-- (PG's 3-branch matcher). Pre-normalization is what handles period-stripping
+-- ('N. Belt Line' → predir='N', name='BELT'), abbreviation expansion, etc.
+--
+-- Output point is the endpoint of road1 at the shared TIGER node ID.
 --
 -- Rating = levenshtein(place, city) + levenshtein(e1.name, road1)
 --        + levenshtein(e1.fullname, road1_full) + levenshtein(e2.name, road2)
 -- Lower is better. Exact matches → rating 0.
 --
--- Depends on spatial (ST_StartPoint, ST_EndPoint). Registered best-effort.
+-- Runtime deps: spatial (ST_StartPoint, ST_EndPoint), us_address_standardizer
+-- (via tiger.from_pagc — required for the pre-normalize step). Registered
+-- best-effort; if from_pagc isn't resolvable at call time, calls error with
+-- the standard "Function with name from_pagc does not exist" message.
 
 CREATE OR REPLACE MACRO @TIGER@.geocode_intersection(
     road1, road2, in_state, in_city, in_zip, max_results
@@ -32,6 +39,50 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_intersection(
             ELSE NULL
         END AS zw
     ),
+    -- PG L42-43: synthesize '0 <road>, <city>, <state> <zip>' and run it
+    -- through the full normalize_address pipeline. We use from_pagc (PAGC
+    -- parser) which yields the same parsed components on this class of input.
+    parsed_road1 AS (
+        SELECT @TIGER@.from_pagc(
+            '0 ' || COALESCE(road1, '') || ', ' ||
+            COALESCE(in_city, '') || ', ' ||
+            COALESCE(in_state, '') || ' ' ||
+            COALESCE(in_zip, '')
+        ) AS p
+    ),
+    parsed_road2 AS (
+        SELECT @TIGER@.from_pagc(
+            '0 ' || COALESCE(road2, '') || ', ' ||
+            COALESCE(in_city, '') || ', ' ||
+            COALESCE(in_state, '') || ' ' ||
+            COALESCE(in_zip, '')
+        ) AS p
+    ),
+    -- Lookup keys per PG L45-50:
+    --   $2 = streetName lower (exact name match)
+    --   $6 = streetName + ' ' + streetTypeAbbrev lower (LIKE prefix; PG gates
+    --        on length(streetName)>5; we gate on length(fullname)>5 instead
+    --        — PG's gate misses parsed-into-multi-word names like 'Belt Line'
+    --        whose component lengths are <=5, which is why current PG returns
+    --        0 rows for #1461a/b on synthetic data)
+    --   raw input lowered (for normalize_street_name fallback)
+    -- The `name = parsed_fullname` extra branch is us-better-than-PG: it
+    -- handles the case where PAGC over-splits a multi-word name into
+    -- name+type, by trying the rejoined form against featname.name.
+    road1_keys AS (
+        SELECT lower(NULLIF(p['street_name'], ''))                 AS sname,
+               lower(trim(COALESCE(p['street_name'], '') || ' ' ||
+                          COALESCE(p['street_type'], '')))         AS sfull,
+               lower(road1)                                        AS raw_lower
+        FROM parsed_road1
+    ),
+    road2_keys AS (
+        SELECT lower(NULLIF(p['street_name'], ''))                 AS sname,
+               lower(trim(COALESCE(p['street_name'], '') || ' ' ||
+                          COALESCE(p['street_type'], '')))         AS sfull,
+               lower(road2)                                        AS raw_lower
+        FROM parsed_road2
+    ),
     a1 AS (
         SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.pretypabrv,
                f.prequalabr, f.suftypabrv, f.sufdirabrv, ad.side, ad.fromhn, ad.tohn
@@ -40,9 +91,15 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_intersection(
         WHERE f.statefp = (SELECT statefp FROM in_state_fp)
           AND f.mtfcc LIKE 'S%'
           AND (
-                lower(f.name) = lower(road1)
-             OR (length(road1) > 5 AND lower(f.fullname) LIKE lower(road1) || '%')
+                -- raw exact + raw LIKE + raw normalize (existing branches)
+                lower(f.name) = (SELECT raw_lower FROM road1_keys)
+             OR (length(road1) > 5 AND lower(f.fullname) LIKE (SELECT raw_lower FROM road1_keys) || '%')
              OR @TIGER@.normalize_street_name(f.fullname) = @TIGER@.normalize_street_name(road1)
+                -- PG-style parsed branches (L72-73)
+             OR lower(f.name) = (SELECT sname FROM road1_keys)
+             OR lower(f.name) = (SELECT sfull FROM road1_keys)
+             OR (length((SELECT sfull FROM road1_keys)) > 5
+                 AND lower(f.fullname) LIKE (SELECT sfull FROM road1_keys) || '%')
               )
           AND ((SELECT zw FROM zip_window) IS NULL
                OR ad.zip IN (SELECT UNNEST((SELECT zw FROM zip_window))))
@@ -54,9 +111,13 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_intersection(
         WHERE f.statefp = (SELECT statefp FROM in_state_fp)
           AND f.mtfcc LIKE 'S%'
           AND (
-                lower(f.name) = lower(road2)
-             OR (length(road2) > 5 AND lower(f.fullname) LIKE lower(road2) || '%')
+                lower(f.name) = (SELECT raw_lower FROM road2_keys)
+             OR (length(road2) > 5 AND lower(f.fullname) LIKE (SELECT raw_lower FROM road2_keys) || '%')
              OR @TIGER@.normalize_street_name(f.fullname) = @TIGER@.normalize_street_name(road2)
+             OR lower(f.name) = (SELECT sname FROM road2_keys)
+             OR lower(f.name) = (SELECT sfull FROM road2_keys)
+             OR (length((SELECT sfull FROM road2_keys)) > 5
+                 AND lower(f.fullname) LIKE (SELECT sfull FROM road2_keys) || '%')
               )
     ),
     e1 AS (
