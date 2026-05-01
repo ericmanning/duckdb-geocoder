@@ -1,0 +1,132 @@
+# name: test/sql/loader_zcta_clip.test
+# description: Per-state ZCTA clipping invariants (geocode_flow.md §14.9 +
+#   loader_templates.sql.in :derived_zcta5_clip:). The loader runs against
+#   real TIGER zip files so we can't drive it from sqllogictest end-to-end;
+#   instead we replay the same SQL the loader emits over synthetic state +
+#   ZCTA polygons and assert the predicate's behaviour at each case:
+#     1. Nation rows (statefp=NULL) are preserved across state loads.
+#     2. ZCTA fully inside a state → one clipped row in that state.
+#     3. Cross-state ZCTA with positive area in two states → one row per state.
+#     4. Boundary-touch ZCTA (ST_Touches but not interior overlap) → NO row
+#        produced. This is the regression marker for the predicate choice;
+#        a future revert to plain ST_Intersects would silently re-introduce
+#        the zero-area leak.
+#     5. Unload of a state removes its per-state rows but keeps nation rows.
+
+require us_geocoder
+
+statement ok
+LOAD spatial;
+
+statement ok
+LOAD splink_udfs;
+
+# Synthetic states: A (unit square at origin) + B (adjacent east).
+# state_lookup is preseeded with real FIPS codes — use values that don't
+# collide so the test doesn't depend on lookup-table content.
+statement ok
+INSERT INTO tiger.state (statefp, stusps, name, the_geom) VALUES
+    ('99', 'AA', 'A', ST_GeomFromText('POLYGON((0 0, 1 0, 1 1, 0 1, 0 0))')),
+    ('98', 'BB', 'B', ST_GeomFromText('POLYGON((1 0, 2 0, 2 1, 1 1, 1 0))'));
+
+# Synthetic ZCTAs (nation-level, statefp=NULL):
+#   00001 — fully inside A
+#   00002 — straddles A and B (positive 2D overlap with each)
+#   00003 — fully inside B; its western edge x=1 coincides with A's eastern
+#           edge → ST_Intersects(00003, A) = true (boundary contact)
+#                  ST_Touches(00003, A)    = true (no interior overlap)
+statement ok
+INSERT INTO tiger.zcta5 (statefp, zcta5ce, the_geom) VALUES
+    (NULL, '00001', ST_GeomFromText('POLYGON((0.2 0.2, 0.8 0.2, 0.8 0.8, 0.2 0.8, 0.2 0.2))')),
+    (NULL, '00002', ST_GeomFromText('POLYGON((0.5 0.5, 1.5 0.5, 1.5 0.9, 0.5 0.9, 0.5 0.5))')),
+    (NULL, '00003', ST_GeomFromText('POLYGON((1.0 0.2, 1.5 0.2, 1.5 0.8, 1.0 0.8, 1.0 0.2))'));
+
+# Sanity: 00003 ST_Touches A but not B.
+query II
+SELECT
+    ST_Touches(
+        (SELECT the_geom FROM tiger.zcta5 WHERE zcta5ce='00003' AND statefp IS NULL),
+        (SELECT the_geom FROM tiger.state WHERE statefp='99')
+    ),
+    ST_Touches(
+        (SELECT the_geom FROM tiger.zcta5 WHERE zcta5ce='00003' AND statefp IS NULL),
+        (SELECT the_geom FROM tiger.state WHERE statefp='98')
+    );
+----
+true	false
+
+# --- Load state A's ZCTA clip (mirrors derived_zcta5_clip section) ---------
+statement ok
+INSERT INTO tiger.zcta5 (statefp, zcta5ce, the_geom)
+SELECT '99', zr.zcta5ce, ST_Intersection(zr.the_geom, st.the_geom)
+FROM tiger.zcta5 zr CROSS JOIN tiger.state st
+WHERE zr.statefp IS NULL AND st.statefp = '99'
+  AND ST_Intersects(zr.the_geom, st.the_geom)
+  AND NOT ST_Touches(zr.the_geom, st.the_geom);
+
+# Expected A clip: 00001 (fully inside) + 00002 (left half).
+# Boundary-touch 00003 is correctly excluded.
+query II
+SELECT zcta5ce, statefp FROM tiger.zcta5 WHERE statefp='99' ORDER BY zcta5ce;
+----
+00001	99
+00002	99
+
+# --- Load state B's ZCTA clip ---------------------------------------------
+statement ok
+INSERT INTO tiger.zcta5 (statefp, zcta5ce, the_geom)
+SELECT '98', zr.zcta5ce, ST_Intersection(zr.the_geom, st.the_geom)
+FROM tiger.zcta5 zr CROSS JOIN tiger.state st
+WHERE zr.statefp IS NULL AND st.statefp = '98'
+  AND ST_Intersects(zr.the_geom, st.the_geom)
+  AND NOT ST_Touches(zr.the_geom, st.the_geom);
+
+# Expected B clip: 00002 (right half) + 00003 (fully inside).
+# 00001 is correctly excluded (disjoint from B).
+query II
+SELECT zcta5ce, statefp FROM tiger.zcta5 WHERE statefp='98' ORDER BY zcta5ce;
+----
+00002	98
+00003	98
+
+# Cross-state ZCTA 00002 has 3 total rows: 1 nation + 1 A + 1 B
+query I
+SELECT COUNT(*) FROM tiger.zcta5 WHERE zcta5ce='00002';
+----
+3
+
+# All clipped (statefp populated) rows must have positive 2D area.
+# This is the load-bearing invariant the ST_Touches predicate enforces;
+# regressing to plain ST_Intersects would produce zero-area rows here.
+query I
+SELECT COUNT(*) FROM tiger.zcta5 WHERE statefp IS NOT NULL AND ST_Area(the_geom) = 0;
+----
+0
+
+# Nation rows survive both state loads.
+query I
+SELECT COUNT(*) FROM tiger.zcta5 WHERE statefp IS NULL;
+----
+3
+
+# --- Unload state A: per-state rows go, nation rows stay ------------------
+# Mirrors unload_state's `DELETE FROM zcta5 WHERE statefp = '@STATEFP@'`.
+statement ok
+DELETE FROM tiger.zcta5 WHERE statefp = '99';
+
+query I
+SELECT COUNT(*) FROM tiger.zcta5 WHERE statefp='99';
+----
+0
+
+# Nation rows untouched
+query I
+SELECT COUNT(*) FROM tiger.zcta5 WHERE statefp IS NULL;
+----
+3
+
+# State B's rows untouched
+query I
+SELECT COUNT(*) FROM tiger.zcta5 WHERE statefp='98';
+----
+2
