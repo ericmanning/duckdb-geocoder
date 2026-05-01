@@ -100,17 +100,14 @@ WITH inputs AS (
 ),
 geocoded AS (
     SELECT inputs.test_id, inputs.raw AS target, inputs.max_n,
-           inputs.is_batched, g.addy, g.geom, g.rating,
-           -- Secondary sort key: 5-decimal-padded point-string. PG's
-           -- ST_AsText(ST_SnapToGrid(geom, 0.00001)) keeps trailing zeros
-           -- ("42.35900"); DuckDB's ROUND-cast drops them ("42.359"). printf
-           -- forces consistent .5f formatting so byte-comparison succeeds.
-           printf('%.5f', ST_X(g.geom)) || ' ' ||
-               printf('%.5f', ST_Y(g.geom)) AS pt_key,
+           inputs.is_batched, g.addy, g.rating,
+           -- Snap to PG's 5-decimal grid so the tiebreak ORDER BY is stable.
+           tiger.st_snaptogrid(g.geom, 0.00001) AS snapped,
            ROW_NUMBER() OVER (
                PARTITION BY inputs.test_id, inputs.raw
                ORDER BY g.rating,
-                        ROUND(ST_X(g.geom), 5), ROUND(ST_Y(g.geom), 5)
+                        ST_X(tiger.st_snaptogrid(g.geom, 0.00001)),
+                        ST_Y(tiger.st_snaptogrid(g.geom, 0.00001))
            ) AS rn
     FROM inputs
     CROSS JOIN LATERAL tiger.geocode(tiger.from_pagc(raw), 50, NULL, 'none') AS g
@@ -118,11 +115,15 @@ geocoded AS (
 SELECT
     test_id || '|' || tiger.pprint_addy(addy)
         || CASE WHEN is_batched = 1 THEN '|' || target ELSE '' END
-        || '|POINT(' || pt_key || ')|'
+        -- PG renders ST_AsText(ST_SnapToGrid(geom,0.00001)) with trailing
+        -- zeros ("42.35900"); duckdb-spatial's ST_AsText drops them. Use
+        -- printf to force the .5f formatting so byte-comparison succeeds.
+        || '|POINT(' || printf('%.5f', ST_X(snapped)) || ' '
+                     || printf('%.5f', ST_Y(snapped)) || ')|'
         || rating::VARCHAR
 FROM geocoded
 WHERE rn <= max_n
-ORDER BY test_id, target, rating, pt_key;
+ORDER BY test_id, target, rating, ST_X(snapped), ST_Y(snapped);
 EOF
 
 echo "  wrote $(wc -l < "$ACTUAL" | tr -d ' ') output rows to $ACTUAL"
