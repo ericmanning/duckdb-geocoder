@@ -245,7 +245,7 @@ The original three "D7-cost" divergences (#1076h, #1073a, #1145d) are now resolv
 - **#1073a** — we now find the *correct* address `212 3rd Ave N, Minneapolis, MN 55401 r=4`. PG returns `10000 3rd St NE, Hanover, MN 55341 r=38` (PG's own iter-2 `LIMIT 10` after alphabetical sort hides Minneapolis from PG's final-sort input). **We beat PG; this is now classified us-better-than-PG.**
 - **#1145d** — structurally closes (Pass A=0 path now fires Pass B's loose branches); we return real candidates instead of dropping to Stage B. Top candidate text differs from PG's row-1 due to PG-specific iter-2 query plan effects (DISTINCT ON ordering, alphabetical pre-sort) that aren't expressible in our table-query model.
 
-The 17 remaining divergences split across three classes:
+The 17 remaining divergences are written up per-test in [parity-divergences.md](parity-divergences.md). Summary:
 
 | Class | Count | Tests | Disposition |
 |---|---|---|---|
