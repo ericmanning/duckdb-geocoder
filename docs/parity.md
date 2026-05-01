@@ -235,9 +235,9 @@ For inputs like `"8401 West 35W, ..."`, PAGC parses `street_name='35', sufdir='W
 
 [`from_pagc`](../src/sql/from_pagc.sql.in) detects when the raw input contains an unspaced `<digits><single-letter>` token AND PAGC over-split it, and recombines back into `street_name='35W', post_dir=NULL`. Conservative trigger conditions (only purely-digit name + single direction letter + raw text contains the unspaced concat). Trade-off: TIGER stores compound numeric-direction streets inconsistently (Pattern A `name='35W'` ~725 rows in MA/MN/CT, Pattern B `name='35', sufdir='W'` ~3500 rows). For Pattern B inputs where the user *did* type the unspaced concat, the recombined parse loses the explicit sufdir match and incurs a +2 rating penalty (`numeric_streets_equal` still finds the right candidate). Net positive.
 
-### Post-investigation status (April 2026, post-`patch/d7`)
+### Post-investigation status (May 2026, post-`patch/d7` + interpolate audit)
 
-After the D7 revisit work landed (see [`d7-revisit.md`](d7-revisit.md) for the per-commit breakdown), parity against PG-2025-PAGC is **29/51 strict match** (`pprint_addy(addy)` + 4-decimal-truncated `POINT(lng lat)` + integer rating identical for all rows up to per-test `max_n`).
+After the D7 revisit work (see [`d7-revisit.md`](d7-revisit.md)) and a follow-up audit of the remaining divergences that uncovered two `interpolate_from_address` calc bugs (out-of-range house → midpoint not endpoint clamp; local-segment azimuth not overall start-to-end), parity against PG-2025-PAGC is **34/51 strict match** (`pprint_addy(addy)` + 4-decimal-truncated `POINT(lng lat)` + integer rating identical for all rows up to per-test `max_n`).
 
 The original three "D7-cost" divergences (#1076h, #1073a, #1145d) are now resolved structurally — though the resolutions are more nuanced than full primary/fallback rewrite:
 
@@ -245,13 +245,15 @@ The original three "D7-cost" divergences (#1076h, #1073a, #1145d) are now resolv
 - **#1073a** — we now find the *correct* address `212 3rd Ave N, Minneapolis, MN 55401 r=4`. PG returns `10000 3rd St NE, Hanover, MN 55341 r=38` (PG's own iter-2 `LIMIT 10` after alphabetical sort hides Minneapolis from PG's final-sort input). **We beat PG; this is now classified us-better-than-PG.**
 - **#1145d** — structurally closes (Pass A=0 path now fires Pass B's loose branches); we return real candidates instead of dropping to Stage B. Top candidate text differs from PG's row-1 due to PG-specific iter-2 query plan effects (DISTINCT ON ordering, alphabetical pre-sort) that aren't expressible in our table-query model.
 
-The 22 remaining divergences split across three classes (full audit pending — see roadmap):
+The 17 remaining divergences split across three classes:
 
-- **us-better-than-PG** (Mechanisms A/B/C above) — T18a, #1073a, #1145a-e, others. Don't revert.
-- **PostgreSQL physical row-order non-determinism** — #1113d-class. PG's `DISTINCT ON` ORDER BY ultimately depends on PG's heap natural row order at sub_rating ties; DuckDB columnar storage has different natural ordering. Not closeable in SQL.
-- **PG query-plan artifact** — divergences caused by PG's iter-2 inner `ORDER BY rate_attributes+house LIMIT 200` then `DISTINCT ON ... ORDER BY (predir, fename, ...) LIMIT 10` *before* final rating sort. Some of these are us-better (we find candidates PG's alphabetical pre-cut hides); some are draws.
+| Class | Count | Tests | Disposition |
+|---|---|---|---|
+| **A. Us-better-than-PG** | 11 | #1073a, #1073b, #1087b, #1113a, #1113b, #1145a, #1145b, #1145c, #1145d, #1145e, T18a | Mechanisms A/B/C produce correct/better candidates than PG. Several cases (#1073a, #1145a/b/c/e) we find the actually-correct address; PG returns wrong-answer candidates because of its query-plan `LIMIT 10`-before-final-sort artifact. Don't revert. |
+| **B. PG heap row-order tiebreak** | 5 | #1074a, #1074b, #1076a, #1076h, #1113d | At sub_rating ties within a `DISTINCT ON` partition, PG's pick depends on physical heap row insertion order (not specified at the SQL level). DuckDB columnar storage has different natural ordering, so we deterministically pick a different row from the same tied set. House# typically differs by 1 (the L/R-side parity-twin row); geom typically differs by <5m. Not closeable in SQL. |
+| **C. Path-divergence on rating** | 1 | #1076e | PG and we both find the same candidate set, but PG ranks an out-of-range row as fallback-shape (NULL house, fallback formula) while we rank it as primary-shape (clamped house, primary formula). Different rating, same fundamental match. Specific to short streetnames where PG's primary/iter-1-fallback distinction collapses. Not a calc bug; not currently worth a structural fix. |
 
-**Net: no remaining bugs in our code as of patch/d7 merge.** The remaining strict-match divergences are accounted for by deliberate design choices or PG's storage/query-plan effects that aren't expressible in SQL.
+**Audit conclusion (May 2026):** the audit identified and fixed two real `interpolate_from_address` calc bugs (committed). All remaining divergences are accounted for by deliberate design choices, PG-specific storage/query-plan effects, or rating-formula path differences that aren't expressible in SQL.
 
 ### Roadmap
 
