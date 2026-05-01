@@ -58,6 +58,8 @@ CALL load_tiger_states(['RI','MA'], '/data/tiger_2025');
 
 This layout matches what `wget --recursive` / `curl --remote-name` against the Census FTP produces, so it's also what the parallel-fetch recipe below targets. `load_tiger_state[s]` must run after `load_tiger_nation` — the state loader enumerates counties from the `tiger.county` table populated by the nation load. Loading one state (all 5 counties of RI) from the Census CDN takes ~45s over residential broadband; a local source cuts that to ~25s.
 
+If you don't need the census-block / tract / block-group GEOID output columns, pass `build_containment := false` to skip the per-state `edge_containment` precompute (saves ~1–2 min per state). You can populate it later for selected states with `CALL build_edge_containment(['RI','MA'])`.
+
 ## Reference databases (attached catalogs)
 
 The 13 TIGER data tables can live in the current database, in a separate read-write attached catalog, or in a shared read-only attached catalog. The macros always stay local — only the data moves.
