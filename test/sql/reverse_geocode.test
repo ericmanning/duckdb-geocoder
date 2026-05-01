@@ -34,6 +34,20 @@ INSERT INTO tiger.edges (statefp, countyfp, tlid, tfidl, tfidr, tnidf, tnidt, mt
     ('44', '007', 1001, 2001, 2002, 3001, 3002, 'S1400', 'Meeting St',
      ST_GeomFromText('LINESTRING(-71.405 41.826, -71.403 41.826)'), '02903', '02903');
 
+# Face-side narrowing (PG reverse_geocode L107-114) requires at least one
+# faces row in the same statefp+countyfp that contains the query point. The
+# probe point sits north of the edge → tfidl=2001 (left face) wraps it.
+statement ok
+INSERT INTO tiger.faces (statefp, countyfp, tfid, the_geom) VALUES
+    ('44', '007', 2001,
+     ST_GeomFromText('POLYGON((-71.406 41.826, -71.402 41.826, -71.402 41.828, -71.406 41.828, -71.406 41.826))'));
+
+statement ok
+INSERT INTO tiger.featnames (statefp, tlid, fullname, name, suftypabrv, mtfcc,
+                             name_lower, fullname_norm, name_soundex) VALUES
+    ('44', 1001, 'Meeting St', 'Meeting', 'St', 'S1400',
+     'meeting', 'meeting st', soundex('Meeting'));
+
 statement ok
 INSERT INTO tiger.addr (statefp, tlid, fromhn, tohn, side, zip, plus4) VALUES
     ('44', 1001, '100', '198', 'L', '02903', NULL);

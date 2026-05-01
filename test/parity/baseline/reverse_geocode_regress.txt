@@ -1,0 +1,25 @@
+Loaded 8 test points from /Users/ericmm/Documents/GitHub/duckdb-geocoder/test/parity/inputs/reverse_geocode_regress.csv
+Running our reverse_geocoder against /Users/ericmm/pg_parity.duckdb ...
+  wrote 8 output rows to /tmp/parity_reverse_actual.txt
+
+Comparing to PG expected (/Users/ericmm/Documents/GitHub/duckdb-geocoder/test/parity/upstream/reverse_geocode_regress_pg2025):
+
+  ! #1913           diverge
+      1c1
+      < #1913|I- 95, Needham, MA
+      ---
+      > #1913|I- 95, Needham, MA 02494
+  ✓ #2927           match
+  ✓ #3806           match
+  ! T1              diverge
+      1c1
+      < T1|I- 90, Weston, MA
+      ---
+      > T1|I- 90, Weston, MA 02493
+  ✓ T2              match
+  ✓ T3              match
+  ✓ T4              match
+  ✓ T5              match
+
+Summary: 6 match | 2 diverge | 0 missing
+Total expected test IDs: 8

@@ -12,6 +12,18 @@ CREATE OR REPLACE MACRO @TIGER@.utmzone(pt) AS (
      FROM (SELECT ST_Transform(pt, 'EPSG:4269', 'EPSG:4326', always_xy := true) AS g))
 );
 
+-- st_snaptogrid(geom, size) → POINT snapped to a `size`-spaced grid centred
+-- on (0,0). Mirrors PostGIS's two-arg ST_SnapToGrid (https://postgis.net/docs/ST_SnapToGrid.html)
+-- but POINT-only — duckdb-spatial doesn't expose a per-vertex map, and our
+-- callers (currently `reverse_geocode`) only need the point case. Passing a
+-- non-POINT raises "ST_X only supports POINT geometries" at evaluation time.
+CREATE OR REPLACE MACRO @TIGER@.st_snaptogrid(g, size) AS (
+    ST_SetCRS(
+        ST_Point(round(ST_X(g) / size) * size, round(ST_Y(g) / size) * size),
+        COALESCE(ST_CRS(g), 'EPSG:4269')
+    )
+);
+
 -- interpolate_from_address(given_address, in_addr1, in_addr2, in_road, in_side, in_offset_m)
 --
 -- Full port of PG src/geocode/interpolate_from_address.sql.

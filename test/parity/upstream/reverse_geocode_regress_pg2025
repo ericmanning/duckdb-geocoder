@@ -1,0 +1,20 @@
+# PG reverse_geocode_regress canonicalized to <test_id>|<pprint_addy(rank=1)>.
+#
+# This file captures PG's CURRENT output against TIGER 2025 — the actual parity
+# oracle. The historical file (scripts/parity/pg_compare/.../regress/reverse_geocode_regress)
+# was captured against ~2010-era TIGER and drifted: 5 of its 8 cases now resolve
+# to different addresses under PG itself when run against TIGER 2025. We compare
+# us against current-PG, not historical-PG.
+#
+# Captured 2026-05-01 via:
+#   docker exec pgparity psql -U postgres -d parity -tAc "
+#     SET search_path TO tiger, public;
+#     SELECT pprint_addy(addy[1]) FROM reverse_geocode(ST_Point(...));"
+T1|I- 90, Weston, MA
+T2|98 Merriam St, Auburn, MA 01501
+T3|190 Washington St, Boston, MA 02108
+T4|28 Capen St, Medford, MA 02155
+T5|106 Massachusetts Ave, Cambridge, MA 02139
+#1913|I- 95, Needham, MA
+#2927|71 N Washington St, Boston, MA 02114
+#3806|220 3rd Ave N, Minneapolis, MN 55401
