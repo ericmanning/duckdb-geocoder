@@ -119,21 +119,32 @@ WHERE e.statefp = '@STATEFP@'
   );
 
 -- @SECTION:derived_zcta5_clip@
--- Per-state ZCTA clipping (geocode_flow.md §14.9). The nation_zcta5 INSERT
--- loads ZCTAs as nation-wide polygons with statefp=NULL; per state load we
--- ADD clipped rows (one per (state, ZCTA) overlap) with statefp populated
--- and the_geom = ST_Intersection of nation polygon and state boundary.
--- Cross-state ZCTAs naturally produce one row per intersecting state, each
--- carrying that state's slice. The original NULL-statefp nation row stays
--- in place so reverse_geocode still resolves ZCTAs in unloaded states via
--- the spatial fallback.
+-- Per-state ZCTA clipping (geocode_flow.md §14.9). For each ZCTA whose
+-- nation polygon shares interior with this state's polygon, INSERT a row
+-- carrying the within-state slice of the polygon and statefp populated.
+-- USPS ZCTAs legitimately cross state lines (e.g. 03579 Errol NH spilling
+-- into Maine), so cross-state ZCTAs naturally produce one row per
+-- intersecting state, each with that state's clipped polygon.
+--
+-- Predicate is `ST_Intersects AND NOT ST_Touches`. TIGER's polygons are
+-- topologically clean — NH's southern edge IS MA's northern edge — so
+-- ST_Intersects returns true for any NH-side ZCTA touching the MA border
+-- (boundary contact counts as intersection). ST_Touches is precisely
+-- "share boundary but no interior," so subtracting it from ST_Intersects
+-- gives "interior overlap" — exactly the cases that produce a non-degenerate
+-- 2D clip. Cleaner than filtering ST_Area > 0 after the fact, and skips
+-- the ST_Intersection compute for boundary-only touches entirely.
+--
+-- The original NULL-statefp nation row stays in place so reverse_geocode
+-- still resolves ZCTAs in unloaded states via the spatial fallback.
 INSERT INTO @TIGER@.zcta5 (statefp, zcta5ce, the_geom)
 SELECT '@STATEFP@', zr.zcta5ce, ST_Intersection(zr.the_geom, st.the_geom)
 FROM @TIGER@.zcta5 zr
 CROSS JOIN @TIGER@.state st
 WHERE zr.statefp IS NULL
   AND st.statefp = '@STATEFP@'
-  AND ST_Intersects(zr.the_geom, st.the_geom);
+  AND ST_Intersects(zr.the_geom, st.the_geom)
+  AND NOT ST_Touches(zr.the_geom, st.the_geom);
 
 -- @SECTION:derived_edge_containment@
 -- Per-edge-per-side containment precomputation (geocode_flow.md §14.3).

@@ -610,7 +610,8 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind,
 	// Build per-state derived tables. edge_containment is expensive
 	// (ST_Within on ~150K rows) so it runs last; the zip_* tables are
 	// pure INSERT…SELECT and finish in milliseconds. zcta5_clip is also
-	// fast (one ST_Intersection per ZCTA touching the state, ~30-300 rows).
+	// fast (one ST_Intersection per ZCTA touching the state, ~30-300 rows
+	// after the area>0 filter rejects zero-area touch artifacts).
 	std::vector<const char *> derived = {
 	    "derived_zip_state",
 	    "derived_zip_state_loc",
