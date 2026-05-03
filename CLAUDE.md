@@ -73,6 +73,19 @@ Benchmarked on NJ (21 counties, 86 zips, ~800K edges) in April 2026. Details in 
 
 **Three strategies attempted, all reverted:** parallel HTTP prefetch (commit-1 attempt), parallel INSERT-to-shared (commit-2 attempt), parallel CTAS-into-scratch + merge (commit-3 attempt). Pattern is clear: **no application-layer parallelism strategy at our code layer beats serial loading at NJ scale on this hardware.**
 
+**May 2026 GDB/GPKG hybrid investigation** (`feature/gdb` branch, deleted): explored using TIGER GeoPackage / Geodatabase formats published by Census ([TGRGDB25](https://www2.census.gov/geo/tiger/TGRGDB25/) / [TGRGPKG25](https://www2.census.gov/geo/tiger/TGRGPKG25/)). Per-state GDB bundles edges + place + cousub + blocks in 1 zip vs the shapefile distribution's 4-zip-per-county fan-out. Pitched as ~50% fewer HTTP requests for state loads.
+
+  Findings (all empirical):
+
+  - **Per-state edges All_Lines layer has the parsed name fields and TNIDF/TNIDT** that we need (verified via `ogrinfo` + sample reads). PREDIR/SUFTYP/etc. are stored as numeric MAF/TIGER codes, not abbrevs — the PDF doc says "Expanded text" but that's wrong; they're codes. Need a code→abbrev lookup table to use them.
+  - **GDB has no `faces` layer** at all (any flavour: per-state, nationgeo, substategeo). The TFID join key our `edge_containment` SQL uses is gone. Tried replacing with `ST_Within(midpoint_offset, Block20.geom)` spatial join — works on RI (0.4 s) but **takes >17 minutes on NJ alone** before being killed. DuckDB's planner produces `BLOCKWISE_NL_JOIN` for `ST_Intersects` in joins regardless of RTree presence (only filter-pushdown uses RTree). NJ-scale spatial join is not viable.
+  - **GDB has no `featnames` table** with multiple alt-name rows per TLID (shapefile featnames is N:1). Lost data.
+  - **`/vsicurl/` does HTTP Range requests on FileGDB** (verified — small layer reads are <0.5s vs 2.2s full curl), unlike its shapefile behaviour. So multi-layer reads from one zip don't pay full-zip-per-layer cost.
+  - **Hybrid benchmarked** (GDB for big files + shapefile for `faces`+`featnames`+`addr` parity, with national `addr.gdb` for per-segment addr ranges): NJ + nation **1.43→1.87 GB DB**, **305→348 s wall** (14% slower), **824→1,336 MB downloaded** (62% more). Per-state ingest essentially tied (300 vs 293 s). All overhead is in the 38 M-row `addr.gdb` staging step that only amortizes at >10-state loads.
+  - **Even with patches, parity isn't achieved.** GDB `All_Lines` returns `MULTILINESTRING` while shapefile EDGES returns `LINESTRING`; `All_Lines` includes hydro/rails/legal alongside roads (52K extra NJ rows we'd need to filter out via `ROADFLG/MTFCC`); `edges.countyfp` derived via spatial test differs on 6,279 boundary-spanning edges.
+
+  Net: **slower, bigger, and not byte-identical**. Branch deleted. Don't repeat unless the use case shifts to multi-state-wide loads where the addr.gdb amortisation plus 50% HTTP-request reduction outweighs the perf and parity costs.
+
 **The only remaining path to >3× loader speedup** is option 2: pre-built Parquet distribution. Bypasses shapefile-parse *and* INSERT-write *and* all the parallelism dead-ends.
 
 **Where the real wins are:** removing work, not parallelizing it. `edge_containment` precompute is ~1–2 min per state and many users don't need GEOIDs — making it opt-out is the one remaining in-process lever that actually moves the needle.
