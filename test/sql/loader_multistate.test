@@ -1,5 +1,7 @@
 # name: test/sql/loader_multistate.test
 # description: load_tiger_state[s] + load_tiger_all_states — binder-level checks.
+# group: [sql]
+
 #              We don't actually fetch/read TIGER shapefiles here (that requires
 #              fixtures on disk); we just verify the bind paths, argument
 #              handling, and error messages.

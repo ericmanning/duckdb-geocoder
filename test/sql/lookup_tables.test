@@ -1,5 +1,6 @@
 # name: test/sql/lookup_tables.test
 # description: lookup seed tables are populated at extension load
+# group: [sql]
 
 require us_geocoder
 

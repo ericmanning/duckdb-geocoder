@@ -1,5 +1,7 @@
 # name: test/sql/parity_stress.test
 # description: Stress-class regression coverage. Synthetic fixtures covering
+# group: [sql]
+
 #              the rating-formula corners spec D13 calls out: numeric
 #              streets, prequalabr discount, short names, highway spacing,
 #              ZIP window tolerance, house-number parity / out-of-range,

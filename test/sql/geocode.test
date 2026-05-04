@@ -1,5 +1,6 @@
 # name: test/sql/geocode.test
 # description: public geocode() wrapper — combines Stage A + B + containment filter
+# group: [sql]
 
 require us_geocoder
 

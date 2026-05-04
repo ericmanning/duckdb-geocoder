@@ -1,5 +1,7 @@
 # name: test/sql/set_tiger_reference.test
 # description: Mode 3 — schema in current DB / attached read-write DB / attached read-only DB.
+# group: [sql]
+
 #              Covers install_tiger_schema, set_tiger_reference, and the view-vs-table swap.
 
 require us_geocoder

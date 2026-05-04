@@ -1,5 +1,6 @@
 # name: test/sql/canon_macros.test
 # description: canon_* macros canonicalize geocode_input fields
+# group: [sql]
 
 require us_geocoder
 

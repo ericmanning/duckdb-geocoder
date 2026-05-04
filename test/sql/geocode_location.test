@@ -1,5 +1,6 @@
 # name: test/sql/geocode_location.test
 # description: Stage B (location-only) fallback macro against hand-crafted fixtures
+# group: [sql]
 
 require us_geocoder
 

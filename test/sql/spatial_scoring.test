@@ -1,5 +1,6 @@
 # name: test/sql/spatial_scoring.test
 # description: spatial scoring primitives (utmzone, interpolate_from_address)
+# group: [sql]
 
 require us_geocoder
 

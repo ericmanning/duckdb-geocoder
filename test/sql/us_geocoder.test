@@ -1,5 +1,6 @@
 # name: test/sql/us_geocoder.test
 # description: us_geocoder smoke test — extension loads and exposes a version
+# group: [sql]
 
 statement error
 SELECT us_geocoder_version();

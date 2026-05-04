@@ -43,7 +43,7 @@ static std::string ExtractSection(const std::string &all, const std::string &nam
 }
 
 static std::string RenderTemplate(const std::string &section,
-                                   const std::vector<std::pair<std::string, std::string>> &subs) {
+                                  const std::vector<std::pair<std::string, std::string>> &subs) {
 	return ApplySubstitutions(section, subs);
 }
 
@@ -77,7 +77,10 @@ struct LoaderBindData : public FunctionData {
 
 	// For load_tiger_state / load_tiger_states / load_tiger_all_states:
 	// one entry per state to load, resolved at bind time.
-	struct StatePlan { std::string abbrev; std::string fips; };
+	struct StatePlan {
+		std::string abbrev;
+		std::string fips;
+	};
 	std::vector<StatePlan> states;
 
 	// Whether to compute tiger.edge_containment inline at the end of each
@@ -102,9 +105,8 @@ public:
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<LoaderBindData>();
-		return func_schema == other.func_schema && data_location == other.data_location &&
-		       source == other.source && year == other.year &&
-		       states.size() == other.states.size();
+		return func_schema == other.func_schema && data_location == other.data_location && source == other.source &&
+		       year == other.year && states.size() == other.states.size();
 	}
 };
 
@@ -152,8 +154,7 @@ static std::string ZeroPad(const std::string &s, size_t width) {
 // https://www2.census.gov/geo/tiger/TIGER<year>/ — exactly what `wget -r`
 // or a manual download-by-directory script produces. There is no flat
 // layout in v0.1; put the zips under STATE/, EDGES/, etc. directories.
-static std::string BuildVsiPath(const std::string &source, const std::string &subdir,
-                                const std::string &zip_base,
+static std::string BuildVsiPath(const std::string &source, const std::string &subdir, const std::string &zip_base,
                                 const std::string &inner_ext = "shp") {
 	const bool is_http = source.rfind("http://", 0) == 0 || source.rfind("https://", 0) == 0;
 	std::string src = source;
@@ -251,8 +252,7 @@ static std::string CensusUrl(int year) {
 // populate the bind data. `source_input_index` is the positional slot that
 // accepts the source string on this overload (-1 to disable positional).
 // source is also accepted via the `source` named parameter.
-static void ApplyYearSourceTarget(LoaderBindData &bind, const TableFunctionBindInput &input,
-                                   int source_input_index) {
+static void ApplyYearSourceTarget(LoaderBindData &bind, const TableFunctionBindInput &input, int source_input_index) {
 	auto year_it = input.named_parameters.find("year");
 	if (year_it != input.named_parameters.end() && !year_it->second.IsNull()) {
 		bind.year = year_it->second.GetValue<int32_t>();
@@ -260,8 +260,7 @@ static void ApplyYearSourceTarget(LoaderBindData &bind, const TableFunctionBindI
 	ApplyTargetParams(bind, input);
 	bool found_source = false;
 	if (source_input_index >= 0 && static_cast<int>(input.inputs.size()) > source_input_index &&
-	    !input.inputs[source_input_index].IsNull() &&
-	    !StringValue::Get(input.inputs[source_input_index]).empty()) {
+	    !input.inputs[source_input_index].IsNull() && !StringValue::Get(input.inputs[source_input_index]).empty()) {
 		bind.source = StringValue::Get(input.inputs[source_input_index]);
 		found_source = true;
 	}
@@ -301,8 +300,7 @@ static std::string LookupStateFips(Connection &conn, const std::string &schema, 
 // =====================================================================
 
 static unique_ptr<FunctionData> LoadTigerNationBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types,
-                                                     vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("step");
 	return_types.emplace_back(LogicalType::BIGINT);
@@ -336,9 +334,9 @@ static void DoLoadNation(ClientContext &context, const LoaderBindData &bind, std
 		const char *zip_base_fmt; // e.g. "tl_<year>_us_state"
 	};
 	const NationStep steps[] = {
-	    {"nation_state",  "STATE",    "tl_YEAR_us_state"},
-	    {"nation_county", "COUNTY",   "tl_YEAR_us_county"},
-	    {"nation_zcta5",  "ZCTA520",  "tl_YEAR_us_zcta520"},
+	    {"nation_state", "STATE", "tl_YEAR_us_state"},
+	    {"nation_county", "COUNTY", "tl_YEAR_us_county"},
+	    {"nation_zcta5", "ZCTA520", "tl_YEAR_us_zcta520"},
 	};
 
 	for (const auto &step : steps) {
@@ -349,9 +347,7 @@ static void DoLoadNation(ClientContext &context, const LoaderBindData &bind, std
 		}
 		auto vsi = BuildVsiPath(bind.source, step.subdir, zip_base);
 		auto section = ExtractSection(tmpl, step.section);
-		auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc},
-		                                         {"@FUNC@", func_loc},
-		                                         {"@VSIPATH@", vsi}});
+		auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@VSIPATH@", vsi}});
 		int64_t rows = ExecuteInsert(conn, rendered, step.section);
 		out.push_back({step.section, rows});
 	}
@@ -380,16 +376,23 @@ static void LoadTigerNationExecute(ClientContext &context, TableFunctionInput &d
 // Resolve a list of state abbreviations into LoaderBindData::states (in order).
 // Dedups case-insensitively while preserving first-occurrence order; errors on
 // any unknown abbrev.
-static void ResolveStates(Connection &conn, LoaderBindData &bind,
-                           const std::vector<std::string> &abbrevs) {
+static void ResolveStates(Connection &conn, LoaderBindData &bind, const std::vector<std::string> &abbrevs) {
 	std::vector<std::string> seen;
 	for (const auto &raw : abbrevs) {
 		std::string up;
 		up.reserve(raw.size());
-		for (char c : raw) { up += static_cast<char>(std::toupper(static_cast<unsigned char>(c))); }
+		for (char c : raw) {
+			up += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+		}
 		bool dup = false;
-		for (const auto &s : seen) { if (s == up) { dup = true; break; } }
-		if (dup) continue;
+		for (const auto &s : seen) {
+			if (s == up) {
+				dup = true;
+				break;
+			}
+		}
+		if (dup)
+			continue;
 		seen.push_back(up);
 		auto fips = LookupStateFips(conn, bind.func_schema, up);
 		bind.states.push_back({up, fips});
@@ -408,23 +411,24 @@ static std::vector<std::string> AbbrevsFromValue(const Value &v, const char *con
 	if (v.type().id() == LogicalTypeId::LIST) {
 		auto &children = ListValue::GetChildren(v);
 		for (const auto &child : children) {
-			if (child.IsNull()) continue;
+			if (child.IsNull())
+				continue;
 			auto s = StringValue::Get(child);
-			if (!s.empty()) out.push_back(s);
+			if (!s.empty())
+				out.push_back(s);
 		}
 	} else if (v.type().id() == LogicalTypeId::VARCHAR) {
 		auto s = StringValue::Get(v);
-		if (!s.empty()) out.push_back(s);
+		if (!s.empty())
+			out.push_back(s);
 	} else {
-		throw BinderException("%s: expected VARCHAR or VARCHAR[], got %s",
-		                      context_fn, v.type().ToString());
+		throw BinderException("%s: expected VARCHAR or VARCHAR[], got %s", context_fn, v.type().ToString());
 	}
 	return out;
 }
 
 static unique_ptr<FunctionData> LoadTigerStateBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types,
-                                                    vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("step");
 	return_types.emplace_back(LogicalType::BIGINT);
@@ -442,8 +446,7 @@ static unique_ptr<FunctionData> LoadTigerStateBind(ClientContext &context, Table
 }
 
 static unique_ptr<FunctionData> LoadTigerStatesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                     vector<LogicalType> &return_types,
-                                                     vector<string> &names) {
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("step");
 	return_types.emplace_back(LogicalType::BIGINT);
@@ -461,8 +464,7 @@ static unique_ptr<FunctionData> LoadTigerStatesBind(ClientContext &context, Tabl
 }
 
 static unique_ptr<FunctionData> LoadTigerAllStatesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types,
-                                                       vector<string> &names) {
+                                                       vector<LogicalType> &return_types, vector<string> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("step");
 	return_types.emplace_back(LogicalType::BIGINT);
@@ -479,8 +481,8 @@ static unique_ptr<FunctionData> LoadTigerAllStatesBind(ClientContext &context, T
 	// pass the abbrev to load_tiger_states explicitly.
 	Connection conn(*context.db);
 	auto result = conn.Query("SELECT abbrev FROM " + bind_data->func_schema +
-	                          ".state_lookup WHERE CAST(statefp AS INTEGER) BETWEEN 1 AND 56 "
-	                          "ORDER BY CAST(statefp AS INTEGER)");
+	                         ".state_lookup WHERE CAST(statefp AS INTEGER) BETWEEN 1 AND 56 "
+	                         "ORDER BY CAST(statefp AS INTEGER)");
 	if (result->HasError()) {
 		throw IOException("us_geocoder load_tiger_all_states: %s", result->GetError());
 	}
@@ -488,16 +490,17 @@ static unique_ptr<FunctionData> LoadTigerAllStatesBind(ClientContext &context, T
 	while (auto row = result->Fetch()) {
 		for (idx_t i = 0; i < row->size(); ++i) {
 			auto v = row->GetValue(0, i);
-			if (!v.IsNull()) { abbrevs.push_back(v.GetValue<std::string>()); }
+			if (!v.IsNull()) {
+				abbrevs.push_back(v.GetValue<std::string>());
+			}
 		}
 	}
 	ResolveStates(conn, *bind_data, abbrevs);
 	return std::move(bind_data);
 }
 
-static void DoLoadState(ClientContext &context, const LoaderBindData &bind,
-                         const LoaderBindData::StatePlan &state,
-                         std::vector<LoaderResult> &out) {
+static void DoLoadState(ClientContext &context, const LoaderBindData &bind, const LoaderBindData::StatePlan &state,
+                        std::vector<LoaderResult> &out) {
 	EnsureHttpfsIfRemote(*context.db, bind.source);
 	Connection conn(*context.db);
 	BootstrapTargetSchema(conn, bind);
@@ -510,9 +513,7 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind,
 	// Wipe existing rows for this state so the load is idempotent.
 	{
 		auto sec = ExtractSection(tmpl, "unload_state");
-		auto rendered = RenderTemplate(sec, {{"@TIGER@", data_loc},
-		                                     {"@FUNC@", func_loc},
-		                                     {"@STATEFP@", fips}});
+		auto rendered = RenderTemplate(sec, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", fips}});
 		auto result = conn.Query(rendered);
 		if (result->HasError()) {
 			throw IOException("us_geocoder loader (unload_state): %s", result->GetError());
@@ -521,22 +522,26 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind,
 	}
 
 	// State-level files: place, cousub.
-	struct StateLevelStep { const char *section; const char *subdir; const char *zip_base; };
+	struct StateLevelStep {
+		const char *section;
+		const char *subdir;
+		const char *zip_base;
+	};
 	const StateLevelStep state_level[] = {
-	    {"state_place",  "PLACE",  "tl_YEAR_FIPS_place"},
+	    {"state_place", "PLACE", "tl_YEAR_FIPS_place"},
 	    {"state_cousub", "COUSUB", "tl_YEAR_FIPS_cousub"},
 	};
 	for (const auto &s : state_level) {
 		std::string zip_base = s.zip_base;
 		auto pos = zip_base.find("YEAR");
-		if (pos != std::string::npos) zip_base.replace(pos, 4, year);
+		if (pos != std::string::npos)
+			zip_base.replace(pos, 4, year);
 		pos = zip_base.find("FIPS");
-		if (pos != std::string::npos) zip_base.replace(pos, 4, fips);
+		if (pos != std::string::npos)
+			zip_base.replace(pos, 4, fips);
 		auto vsi = BuildVsiPath(bind.source, s.subdir, zip_base);
 		auto section = ExtractSection(tmpl, s.section);
-		auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc},
-		                                         {"@FUNC@", func_loc},
-		                                         {"@VSIPATH@", vsi}});
+		auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@VSIPATH@", vsi}});
 		int64_t rows = ExecuteInsert(conn, rendered, s.section);
 		out.push_back({s.section, rows});
 	}
@@ -572,35 +577,38 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind,
 	// so we issue one INSERT per (county, table-type). Users who need
 	// faster HTTP loads should pre-download in parallel via curl/xargs
 	// and point at the local directory (see docs/api.md).
-	struct CountyTable { const char *label; const char *subdir; const char *zip_base;
-	                     const char *ext; const char *insert_section; const char *branch_section; };
+	struct CountyTable {
+		const char *label;
+		const char *subdir;
+		const char *zip_base;
+		const char *ext;
+		const char *insert_section;
+		const char *branch_section;
+	};
 	const CountyTable county_level[] = {
-	    {"county_edges",     "EDGES",     "tl_YEAR_FIPSCOUNTY_edges",     "shp",
-	     "county_edges_insert",     "county_edges_branch"},
-	    {"county_faces",     "FACES",     "tl_YEAR_FIPSCOUNTY_faces",     "shp",
-	     "county_faces_insert",     "county_faces_branch"},
-	    {"county_featnames", "FEATNAMES", "tl_YEAR_FIPSCOUNTY_featnames", "dbf",
-	     "county_featnames_insert", "county_featnames_branch"},
-	    {"county_addr",      "ADDR",      "tl_YEAR_FIPSCOUNTY_addr",      "dbf",
-	     "county_addr_insert",      "county_addr_branch"},
+	    {"county_edges", "EDGES", "tl_YEAR_FIPSCOUNTY_edges", "shp", "county_edges_insert", "county_edges_branch"},
+	    {"county_faces", "FACES", "tl_YEAR_FIPSCOUNTY_faces", "shp", "county_faces_insert", "county_faces_branch"},
+	    {"county_featnames", "FEATNAMES", "tl_YEAR_FIPSCOUNTY_featnames", "dbf", "county_featnames_insert",
+	     "county_featnames_branch"},
+	    {"county_addr", "ADDR", "tl_YEAR_FIPSCOUNTY_addr", "dbf", "county_addr_insert", "county_addr_branch"},
 	};
 	for (const auto &cfp : countyfps) {
 		for (const auto &t : county_level) {
 			std::string zip_base = t.zip_base;
 			auto pos = zip_base.find("YEAR");
-			if (pos != std::string::npos) zip_base.replace(pos, 4, year);
+			if (pos != std::string::npos)
+				zip_base.replace(pos, 4, year);
 			pos = zip_base.find("FIPSCOUNTY");
-			if (pos != std::string::npos) zip_base.replace(pos, 10, fips + cfp);
+			if (pos != std::string::npos)
+				zip_base.replace(pos, 10, fips + cfp);
 			auto vsi = BuildVsiPath(bind.source, t.subdir, zip_base, t.ext);
-			auto insert_prefix = RenderTemplate(ExtractSection(tmpl, t.insert_section),
-			                                     {{"@TIGER@", data_loc},
-			                                      {"@FUNC@", func_loc}});
-			auto branch = RenderTemplate(ExtractSection(tmpl, t.branch_section),
-			                              {{"@TIGER@", data_loc},
-			                               {"@FUNC@", func_loc},
-			                               {"@VSIPATH@", vsi},
-			                               {"@STATEFP@", fips},
-			                               {"@COUNTYFP@", cfp}});
+			auto insert_prefix =
+			    RenderTemplate(ExtractSection(tmpl, t.insert_section), {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}});
+			auto branch = RenderTemplate(ExtractSection(tmpl, t.branch_section), {{"@TIGER@", data_loc},
+			                                                                      {"@FUNC@", func_loc},
+			                                                                      {"@VSIPATH@", vsi},
+			                                                                      {"@STATEFP@", fips},
+			                                                                      {"@COUNTYFP@", cfp}});
 			std::string sql = insert_prefix + branch + ";";
 			int64_t rows = ExecuteInsert(conn, sql, std::string(t.label) + ":" + cfp);
 			out.push_back({std::string(t.label) + ":" + cfp, rows});
@@ -623,9 +631,7 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind,
 	}
 	for (const auto *name : derived) {
 		auto section = ExtractSection(tmpl, name);
-		auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc},
-		                                         {"@FUNC@", func_loc},
-		                                         {"@STATEFP@", fips}});
+		auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", fips}});
 		int64_t rows = ExecuteInsert(conn, rendered, name);
 		out.push_back({name, rows});
 	}
@@ -658,10 +664,8 @@ static void LoadTigerStateExecute(ClientContext &context, TableFunctionInput &da
 // =====================================================================
 
 static const char *const kDataTables[] = {
-    "state",       "county",     "place",           "cousub",  "zcta5",
-    "zip_state",   "zip_state_loc", "zip_lookup_base",
-    "edges",       "faces",      "featnames",       "addr",
-    "edge_containment",
+    "state",           "county", "place", "cousub",    "zcta5", "zip_state",        "zip_state_loc",
+    "zip_lookup_base", "edges",  "faces", "featnames", "addr",  "edge_containment",
 };
 static constexpr size_t kDataTableCount = sizeof(kDataTables) / sizeof(kDataTables[0]);
 
@@ -699,8 +703,7 @@ struct SchemaOpGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> InstallSchemaBind(ClientContext &, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types,
-                                                   vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("step");
 	return_types.emplace_back(LogicalType::BIGINT);
@@ -752,8 +755,7 @@ static void InstallSchemaExecute(ClientContext &context, TableFunctionInput &dat
 // =====================================================================
 
 static unique_ptr<FunctionData> SetReferenceBind(ClientContext &, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types,
-                                                  vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("table");
 	return_types.emplace_back(LogicalType::VARCHAR);
@@ -795,7 +797,8 @@ static void SetReferenceExecute(ClientContext &context, TableFunctionInput &data
 				// are not mutually forgiving, so we try both.
 				{
 					auto r = conn.Query("DROP VIEW IF EXISTS " + local_ref);
-					if (r->HasError()) { /* swallow; fall through to DROP TABLE */ }
+					if (r->HasError()) { /* swallow; fall through to DROP TABLE */
+					}
 				}
 				{
 					auto r = conn.Query("DROP TABLE IF EXISTS " + local_ref);
@@ -812,22 +815,21 @@ static void SetReferenceExecute(ClientContext &context, TableFunctionInput &data
 					// We do this ONCE outside the loop — see post-loop below.
 					kind = "base_table";
 				} else {
-					auto view_sql = "CREATE VIEW " + local_ref + " AS SELECT * FROM " +
-					                source_qualified + "." + QuoteIdent(tbl);
+					auto view_sql =
+					    "CREATE VIEW " + local_ref + " AS SELECT * FROM " + source_qualified + "." + QuoteIdent(tbl);
 					auto r = conn.Query(view_sql);
 					if (r->HasError()) {
-						throw IOException("us_geocoder set_tiger_reference (create view %s): %s",
-						                  tbl, r->GetError());
+						throw IOException("us_geocoder set_tiger_reference (create view %s): %s", tbl, r->GetError());
 					}
 					kind = "view";
 				}
 				gstate.results.push_back({tbl, 0});
 				(void)kind; // captured into results' step field? No — we return tbl+kind below.
-				// Store kind in rows field as 0/1 to keep schema simple? Use a side vector.
-				// Simpler: re-run the tiger_schema template once after the loop to recreate
-				// base tables when resetting. We'll just report "view" or "base_table" via
-				// a second results field — extend LoaderResult below? Easier: encode in step.
-				// Keep step = tbl, rows = 0; we emit a "kind" column by looking up resetting.
+				            // Store kind in rows field as 0/1 to keep schema simple? Use a side vector.
+				            // Simpler: re-run the tiger_schema template once after the loop to recreate
+				            // base tables when resetting. We'll just report "view" or "base_table" via
+				            // a second results field — extend LoaderResult below? Easier: encode in step.
+				            // Keep step = tbl, rows = 0; we emit a "kind" column by looking up resetting.
 			}
 
 			if (resetting) {
@@ -835,8 +837,7 @@ static void SetReferenceExecute(ClientContext &context, TableFunctionInput &data
 				auto rendered = ApplySubstitutions(TigerSchemaSql(), {{"@TIGER@", QuoteIdent(local)}});
 				auto r = conn.Query(rendered);
 				if (r->HasError()) {
-					throw IOException("us_geocoder set_tiger_reference (recreate base tables): %s",
-					                  r->GetError());
+					throw IOException("us_geocoder set_tiger_reference (recreate base tables): %s", r->GetError());
 				}
 			}
 			conn.Commit();
@@ -866,10 +867,8 @@ static void SetReferenceExecute(ClientContext &context, TableFunctionInput &data
 //   GEOIDs on demand.
 // =====================================================================
 
-static unique_ptr<FunctionData> BuildContainmentBind(ClientContext &context,
-                                                      TableFunctionBindInput &input,
-                                                      vector<LogicalType> &return_types,
-                                                      vector<string> &names) {
+static unique_ptr<FunctionData> BuildContainmentBind(ClientContext &context, TableFunctionBindInput &input,
+                                                     vector<LogicalType> &return_types, vector<string> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("step");
 	return_types.emplace_back(LogicalType::BIGINT);
@@ -901,16 +900,13 @@ static void BuildContainmentExecute(ClientContext &context, TableFunctionInput &
 		for (const auto &state : bind.states) {
 			gstate.results.push_back({"begin:" + state.abbrev, 0});
 			// Idempotent: wipe existing rows for this state first, then recompute.
-			auto del_sql = "DELETE FROM " + data_loc + ".edge_containment WHERE statefp = '" +
-			               state.fips + "'";
+			auto del_sql = "DELETE FROM " + data_loc + ".edge_containment WHERE statefp = '" + state.fips + "'";
 			auto del = conn.Query(del_sql);
 			if (del->HasError()) {
-				throw IOException("us_geocoder build_edge_containment (delete %s): %s",
-				                  state.abbrev, del->GetError());
+				throw IOException("us_geocoder build_edge_containment (delete %s): %s", state.abbrev, del->GetError());
 			}
-			auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc},
-			                                         {"@FUNC@", func_loc},
-			                                         {"@STATEFP@", state.fips}});
+			auto rendered =
+			    RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", state.fips}});
 			int64_t rows = ExecuteInsert(conn, rendered, "edge_containment:" + state.abbrev);
 			gstate.results.push_back({"edge_containment:" + state.abbrev, rows});
 			gstate.results.push_back({"done:" + state.abbrev, 0});
@@ -940,19 +936,19 @@ void RegisterLoaderFunctions(ExtensionLoader &loader, const std::string &) {
 	//                   target_db := NULL, target_schema := 'tiger')
 	// Source defaults to the Census TIGER URL for the given year.
 	// target_db / target_schema control where the TIGER data tables live.
-	TableFunction nation_fn0("load_tiger_nation", {}, LoadTigerNationExecute,
-	                         LoadTigerNationBind, LoaderGlobalState::Init);
+	TableFunction nation_fn0("load_tiger_nation", {}, LoadTigerNationExecute, LoadTigerNationBind,
+	                         LoaderGlobalState::Init);
 	AddLoaderNamedParams(nation_fn0);
 	loader.RegisterFunction(nation_fn0);
 
-	TableFunction nation_fn1("load_tiger_nation", {LogicalType::VARCHAR}, LoadTigerNationExecute,
-	                         LoadTigerNationBind, LoaderGlobalState::Init);
+	TableFunction nation_fn1("load_tiger_nation", {LogicalType::VARCHAR}, LoadTigerNationExecute, LoadTigerNationBind,
+	                         LoaderGlobalState::Init);
 	AddLoaderNamedParams(nation_fn1);
 	loader.RegisterFunction(nation_fn1);
 
 	// load_tiger_state(state_abbrev VARCHAR [, source VARCHAR], ...)
-	TableFunction state_fn1("load_tiger_state", {LogicalType::VARCHAR}, LoadTigerStateExecute,
-	                        LoadTigerStateBind, LoaderGlobalState::Init);
+	TableFunction state_fn1("load_tiger_state", {LogicalType::VARCHAR}, LoadTigerStateExecute, LoadTigerStateBind,
+	                        LoaderGlobalState::Init);
 	AddLoaderNamedParams(state_fn1);
 	loader.RegisterFunction(state_fn1);
 
@@ -963,32 +959,32 @@ void RegisterLoaderFunctions(ExtensionLoader &loader, const std::string &) {
 
 	// load_tiger_states(states VARCHAR[] [, source VARCHAR], ...)
 	const auto list_vc = LogicalType::LIST(LogicalType::VARCHAR);
-	TableFunction states_fn1("load_tiger_states", {list_vc}, LoadTigerStateExecute,
-	                         LoadTigerStatesBind, LoaderGlobalState::Init);
+	TableFunction states_fn1("load_tiger_states", {list_vc}, LoadTigerStateExecute, LoadTigerStatesBind,
+	                         LoaderGlobalState::Init);
 	AddLoaderNamedParams(states_fn1);
 	loader.RegisterFunction(states_fn1);
 
-	TableFunction states_fn2("load_tiger_states", {list_vc, LogicalType::VARCHAR},
-	                         LoadTigerStateExecute, LoadTigerStatesBind, LoaderGlobalState::Init);
+	TableFunction states_fn2("load_tiger_states", {list_vc, LogicalType::VARCHAR}, LoadTigerStateExecute,
+	                         LoadTigerStatesBind, LoaderGlobalState::Init);
 	AddLoaderNamedParams(states_fn2);
 	loader.RegisterFunction(states_fn2);
 
 	// load_tiger_all_states([source VARCHAR], ...)
 	//   Loads every row of state_lookup with statefp 01–56 (50 states + DC).
-	TableFunction all_states_fn0("load_tiger_all_states", {}, LoadTigerStateExecute,
-	                              LoadTigerAllStatesBind, LoaderGlobalState::Init);
+	TableFunction all_states_fn0("load_tiger_all_states", {}, LoadTigerStateExecute, LoadTigerAllStatesBind,
+	                             LoaderGlobalState::Init);
 	AddLoaderNamedParams(all_states_fn0);
 	loader.RegisterFunction(all_states_fn0);
 
-	TableFunction all_states_fn1("load_tiger_all_states", {LogicalType::VARCHAR},
-	                              LoadTigerStateExecute, LoadTigerAllStatesBind, LoaderGlobalState::Init);
+	TableFunction all_states_fn1("load_tiger_all_states", {LogicalType::VARCHAR}, LoadTigerStateExecute,
+	                             LoadTigerAllStatesBind, LoaderGlobalState::Init);
 	AddLoaderNamedParams(all_states_fn1);
 	loader.RegisterFunction(all_states_fn1);
 
 	// install_tiger_schema(database VARCHAR [, schema VARCHAR DEFAULT 'tiger'])
 	//   Creates the TIGER data tables in a target catalog. Idempotent.
-	TableFunction install_fn1("install_tiger_schema", {LogicalType::VARCHAR},
-	                          InstallSchemaExecute, InstallSchemaBind, SchemaOpGlobalState::Init);
+	TableFunction install_fn1("install_tiger_schema", {LogicalType::VARCHAR}, InstallSchemaExecute, InstallSchemaBind,
+	                          SchemaOpGlobalState::Init);
 	loader.RegisterFunction(install_fn1);
 	TableFunction install_fn2("install_tiger_schema", {LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                          InstallSchemaExecute, InstallSchemaBind, SchemaOpGlobalState::Init);
@@ -997,29 +993,27 @@ void RegisterLoaderFunctions(ExtensionLoader &loader, const std::string &) {
 	// set_tiger_reference([database VARCHAR, schema VARCHAR DEFAULT 'tiger'])
 	//   No-arg / NULL / empty-string first arg → restore empty local base tables.
 	//   Non-empty database → repoint local tiger.<table> to VIEWs over <db>.<schema>.<table>.
-	TableFunction set_ref_fn0("set_tiger_reference", {},
-	                          SetReferenceExecute, SetReferenceBind, SchemaOpGlobalState::Init);
+	TableFunction set_ref_fn0("set_tiger_reference", {}, SetReferenceExecute, SetReferenceBind,
+	                          SchemaOpGlobalState::Init);
 	loader.RegisterFunction(set_ref_fn0);
-	TableFunction set_ref_fn1("set_tiger_reference", {LogicalType::VARCHAR},
-	                          SetReferenceExecute, SetReferenceBind, SchemaOpGlobalState::Init);
+	TableFunction set_ref_fn1("set_tiger_reference", {LogicalType::VARCHAR}, SetReferenceExecute, SetReferenceBind,
+	                          SchemaOpGlobalState::Init);
 	loader.RegisterFunction(set_ref_fn1);
-	TableFunction set_ref_fn2("set_tiger_reference", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                          SetReferenceExecute, SetReferenceBind, SchemaOpGlobalState::Init);
+	TableFunction set_ref_fn2("set_tiger_reference", {LogicalType::VARCHAR, LogicalType::VARCHAR}, SetReferenceExecute,
+	                          SetReferenceBind, SchemaOpGlobalState::Init);
 	loader.RegisterFunction(set_ref_fn2);
 
 	// build_edge_containment(VARCHAR | VARCHAR[], target_db := NULL,
 	//                        target_schema := 'tiger'])
 	const auto list_vc2 = LogicalType::LIST(LogicalType::VARCHAR);
-	TableFunction bec_varchar("build_edge_containment", {LogicalType::VARCHAR},
-	                           BuildContainmentExecute, BuildContainmentBind,
-	                           LoaderGlobalState::Init);
+	TableFunction bec_varchar("build_edge_containment", {LogicalType::VARCHAR}, BuildContainmentExecute,
+	                          BuildContainmentBind, LoaderGlobalState::Init);
 	bec_varchar.named_parameters["target_db"] = LogicalType::VARCHAR;
 	bec_varchar.named_parameters["target_schema"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(bec_varchar);
 
-	TableFunction bec_list("build_edge_containment", {list_vc2},
-	                        BuildContainmentExecute, BuildContainmentBind,
-	                        LoaderGlobalState::Init);
+	TableFunction bec_list("build_edge_containment", {list_vc2}, BuildContainmentExecute, BuildContainmentBind,
+	                       LoaderGlobalState::Init);
 	bec_list.named_parameters["target_db"] = LogicalType::VARCHAR;
 	bec_list.named_parameters["target_schema"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(bec_list);

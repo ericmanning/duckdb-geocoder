@@ -1,5 +1,6 @@
 # name: test/sql/tiger_schema.test
 # description: TIGER parent tables are registered and empty at extension load
+# group: [sql]
 
 require us_geocoder
 

@@ -1,5 +1,6 @@
 # name: test/sql/geocode_address.test
 # description: Stage A vectorized address-match macro against hand-crafted fixtures
+# group: [sql]
 
 require us_geocoder
 

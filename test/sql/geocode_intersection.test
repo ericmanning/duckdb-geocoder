@@ -1,5 +1,6 @@
 # name: test/sql/geocode_intersection.test
 # description: geocode_intersection — finds intersection via shared TIGER node IDs
+# group: [sql]
 
 require us_geocoder
 

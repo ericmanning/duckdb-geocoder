@@ -1,5 +1,7 @@
 # name: test/sql/from_pagc.test
 # description: geocode_input type + from_pagc repack logic
+# group: [sql]
+
 #
 # In a real deployment, from_pagc is auto-registered at extension-load time
 # if us_address_standardizer (community ext) is also loaded. CI doesn't have

@@ -1,5 +1,7 @@
 # name: test/sql/loader_zcta_clip.test
 # description: Per-state ZCTA clipping invariants (geocode_flow.md §14.9 +
+# group: [sql]
+
 #   loader_templates.sql.in :derived_zcta5_clip:). The loader runs against
 #   real TIGER zip files so we can't drive it from sqllogictest end-to-end;
 #   instead we replay the same SQL the loader emits over synthetic state +

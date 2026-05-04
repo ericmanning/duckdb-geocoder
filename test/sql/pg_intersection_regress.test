@@ -1,5 +1,7 @@
 # name: test/sql/pg_intersection_regress.test
 # description: Port of PG's `test-geocode_intersection_spacing` regress
+# group: [sql]
+
 #   (sql_bits/test-geocode_intersection_spacing.sql.in) — synthetic Coppell, TX
 #   data covering the I-635 intersection-spacing fix (#1461). PG inserts the
 #   rows in a BEGIN/ROLLBACK block; we insert them into a fresh in-memory

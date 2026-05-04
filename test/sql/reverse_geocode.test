@@ -1,5 +1,6 @@
 # name: test/sql/reverse_geocode.test
 # description: reverse_geocode — point → ranked nearby street candidates
+# group: [sql]
 
 require us_geocoder
 

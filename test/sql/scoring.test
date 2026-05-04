@@ -1,5 +1,6 @@
 # name: test/sql/scoring.test
 # description: scalar scoring primitives (non-spatial)
+# group: [sql]
 
 require us_geocoder
 
