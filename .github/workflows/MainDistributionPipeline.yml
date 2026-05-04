@@ -19,6 +19,10 @@ jobs:
       duckdb_version: v1.5.2
       ci_tools_version: v1.5.2
       extension_name: us_geocoder
+      # Skip Windows MSVC, WASM (mvp/eh/threads), and Intel macOS — same matrix
+      # the us_address_standardizer community extension ships on. Native build
+      # matrix is linux_amd64, linux_arm64, osx_arm64.
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64;osx_amd64'
 
   code-quality-check:
     name: Code Quality Check
