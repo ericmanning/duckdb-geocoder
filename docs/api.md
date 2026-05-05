@@ -84,12 +84,12 @@ Local sources use the **Census-nested** layout — a (partial) mirror of `https:
 
 This is what `wget --mirror` against the Census FTP produces out of the box. The HTTP source mode uses the same subdirectory convention, so swapping between HTTP and local is a one-line change.
 
-Other layouts are **not** supported in v0.1:
+Other layouts are **not** supported:
 
-- Flat-in-one-directory (all zips in `/data/tiger_2025/` with no `EDGES/`, `FACES/`, … subdirs) — fails because the loader always inserts the Census subdir when constructing the `/vsizip/` path.
-- Pre-extracted shapefiles (unzipped `.shp` + `.dbf` + `.shx` on disk) — fails because the loader always wraps in `/vsizip/`, which requires a real zip.
+- Flat-in-one-directory (all zips in `/data/tiger_2025/` with no `EDGES/`, `FACES/`, … subdirs) — the loader always inserts the Census subdir when constructing the `/vsizip/` path.
+- Pre-extracted shapefiles (unzipped `.shp` + `.dbf` + `.shx` on disk) — the loader always wraps in `/vsizip/`, which requires a real zip.
 
-Unzip and flattening are explicit out-of-scope; a user who wants either can either rewrap (zip the files back up, or create symlinks with the expected nested structure) or open an issue for explicit support.
+Either rewrap (zip the files back up, or create symlinks with the expected nested structure) or open an issue if you need a different layout.
 
 ---
 
@@ -207,7 +207,7 @@ The main geocoder. Returns up to `max_results` candidate matches, ordered by `ra
 - `restrict_geom` — optional `GEOMETRY`. If non-NULL, only edges intersecting this polygon are considered. Auto-transformed to EPSG:4269 if the input SRID is different (SRID 0 treated as 4269).
 - `require_containment` — `'none'` | `'block'` | `'tract'` | `'blkgrp'`.
   - `'none'` — return all candidates; `containment_guaranteed` is informational.
-  - `'block'`/`'tract'`/`'blkgrp'` — filter to `containment_guaranteed = true`. In v0.1 these three are equivalent (conservative single-face check); looser tract/blkgrp dissolve-polygon checks are a v0.2 follow-up.
+  - `'block'`/`'tract'`/`'blkgrp'` — filter to `containment_guaranteed = true`. All three currently resolve to the same conservative single-face check; looser tract/blkgrp dissolve-polygon checks are a known follow-up.
 
 **Returns:**
 | column | type | meaning |
@@ -339,13 +339,13 @@ The `block_geoid`, `tract_geoid`, `blkgrp_geoid` columns are always populated fr
 - `true` — the 10m-offset midpoint of the matched edge is provably inside the GEOID's face polygon. Use when downstream linkage (demographics, policy) requires high confidence.
 - `false` — the check failed. The GEOID is still the best-guess assignment; for the majority of addresses it's correct, but the offset point may land near a face boundary.
 
-The guarantee is only valid at the default 10m offset and the default 0.5 interpolation fraction. v0.1 limitations (all conservative, producing false negatives only):
+The guarantee is only valid at the default 10m offset and the default 0.5 interpolation fraction. Known conservative-failure cases (all produce false negatives, not false positives):
 
 - **L1** offset-sensitive — a per-call custom offset invalidates the flag.
 - **L2** intra-block faces — an edge whose offset strip crosses from one face into a neighboring face in the same block reads false even though the block-level truth holds.
 - **L3** endpoint caps — the midpoint check passes near intersections even when the buffer would otherwise leak into a neighboring face.
 
-`require_containment='tract'` and `'blkgrp'` currently resolve to the same face-level check as `'block'`; looser (but still sound) checks via dissolved-polygon pre-aggregation are a v0.2 follow-up.
+`require_containment='tract'` and `'blkgrp'` currently resolve to the same face-level check as `'block'`; looser (but still sound) checks via dissolved-polygon pre-aggregation are a follow-up.
 
 ---
 

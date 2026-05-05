@@ -1,8 +1,8 @@
 # Geocode Flow — Reference for the DuckDB Port
 
-This document traces what actually happens inside `postgis_tiger_geocoder` when its workhorse geocoding functions run against a single address or a batch of addresses. It is **not** an API reference — it is a semantic spec intended to let us rebuild the geocoder from scratch as a DuckDB community extension without transliterating the PL/pgSQL.
+This document is the semantic spec the DuckDB port was built against. §1–§12 describe what `postgis_tiger_geocoder` does internally (kept as a reference for future maintainers); §14 records the locked design decisions (D1–D14) for the DuckDB port, plus the architecture of the resulting code.
 
-All file references are to paths under [src/](../src/) unless noted.
+For shipped API + parity status, see [README.md](README.md), [docs/api.md](docs/api.md), and [docs/parity.md](docs/parity.md). Inline file references in §1–§12 are to paths in PostGIS's `postgis_tiger_geocoder` source (vendored under `scripts/parity/pg_compare/tiger_geocoder/`).
 
 ## 0. Big picture
 
@@ -196,7 +196,7 @@ Builds one giant SQL statement (parameterized) that:
     (edges.tfidr = faces.tfid AND addr.side = 'R')
     ```
 
-    For each edge, computes `interpolate_from_address(parsed.address, fromhn, tohn, edges.the_geom, side)` as the output point (see §13). Computes a `sub_rating`:
+    For each edge, computes `interpolate_from_address(parsed.address, fromhn, tohn, edges.the_geom, side)` as the output point (see §12). Computes a `sub_rating`:
 
     ```
     sub_rating = rate_attributes(...)
@@ -349,282 +349,6 @@ Ancillary house-number helpers in [src/geocode/other_helper_functions.sql](../sr
 - `normalize_street_name(s)` — canonicalizes whitespace around `-` so `I-635` and `I- 635` collapse.
 - `includes_address(given, addr1, addr2, addr3, addr4)` — range+parity check for two-sided streets (left pair vs right pair); used historically for pre-filtering but not in the current hot path.
 
-## 13. Data loading pipeline — how the reference data gets into Postgres
-
-The loader is the other half of the story. The geocoder above is *useless* without data, and the data does not come from the extension install — it has to be pulled down per-state from the Census TIGER/Line FTP site. The loader machinery lives in [src/tiger_loader.sql](../src/tiger_loader.sql) and is substantial (~500 lines of PL/pgSQL + SQL). The single most important design fact to internalize:
-
-> **The loader does not load data. It generates shell/batch scripts that the *user* runs outside Postgres, which then pipe `shp2pgsql` output back into `psql`.**
-
-This is because TIGER distributes ~3500 shapefile zips (one per county per file-type plus per-state plus nation-wide), totalling tens of GB. Streaming that through `COPY` from a PL/pgSQL function would be slow and fragile. Instead, the extension uses a small templating engine (`loader_macro_replace`) and three control tables to emit bespoke scripts the user inspects and runs.
-
-For the DuckDB port this whole architecture can be collapsed into one or two table functions that use DuckDB spatial's shapefile reader directly — but it is worth understanding what the Postgres version actually does, because the *post-load* work (derived tables, indexes, column pruning, constraint partitioning) is exactly what we still need to reproduce.
-
-### 13.1 The three control tables
-
-All live in schema `tiger` (the extension's schema).
-
-**`loader_platform(os, declare_sect, pgbin, wget, unzip_command, psql, path_sep, loader, environ_set_command, county_process_command)`** — one row per target OS. Ships with two rows: `windows` and `sh`. Each row is essentially a set of shell-snippet templates:
-
-- `declare_sect` — the env-var preamble (e.g. `set PGBIN=...`, `cd ${staging_fold}`). Users are expected to edit this to match their machine — this is the only hand-configuration step.
-- `wget` — path to wget (`%WGETTOOL%` on Windows, `wget` on sh).
-- `unzip_command` — shell snippet to loop over `*.zip` in the staging dir and extract everything to `TMPDIR`. Literally different between Windows (`for /r %%z in (*.zip) do %UNZIPTOOL% e %%z -o%TMPDIR%`) and Linux (`for z in *.zip; do $UNZIPTOOL -o -d $TMPDIR $z; done`).
-- `psql`, `loader` — the `${PSQL}` and `${SHP2PGSQL}` placeholders.
-- `path_sep` — `\\` vs `/`; used by `replace(..., '/', platform.path_sep)` at generation time to swap slashes.
-- `county_process_command` — a templated inner loop that runs `${loader} ... ${table_name} | ${psql}` for every `*${table_name}*.dbf` present; used for county-level files (featnames, edges, addr, faces, addrfeat).
-
-Non-trivial behavior to note: the `declare_sect` contains dummy credentials (`set PGPASSWORD=yourpasswordhere`). Users **must** edit this before running. There is no validation.
-
-**`loader_variables(tiger_year, website_root, staging_fold, data_schema, staging_schema)`** — a single row. In the 2025 build this is:
-
-```
-tiger_year      = '2025'
-website_root    = 'https://www2.census.gov/geo/tiger/TIGER2025'
-staging_fold    = '/gisdata'
-data_schema     = 'tiger_data'
-staging_schema  = 'tiger_staging'
-```
-
-`tiger_year` and `website_root` bump with each annual TIGER release (see [NEWS.md](../NEWS.md) — "update the geocoder to load TIGER 2025 data"). `staging_fold` is where zips land and get extracted; the user creates this directory with a `temp/` subdirectory. `data_schema` is where loaded data lives (parent tables are in `tiger`, per-state children in `tiger_data`). `staging_schema` is a scratch schema that gets dropped and recreated on every run.
-
-**`loader_lookuptables(process_order, lookup_name, table_name, single_mode, load, level_county, level_state, level_nation, post_load_process, single_geom_mode, insert_mode, pre_load_process, columns_exclude, website_root_override)`** — one row per TIGER table-type (`state`, `county`, `place`, `cousub`, `tract`, `tabblock20`, `bg`, `zcta5_raw`, `faces`, `featnames`, `edges`, `addr`, `addrfeat`, `county_all`, `state_all`). Roughly 14 rows. The column semantics are spelled out in `COMMENT ON COLUMN` but the non-obvious ones:
-
-- `process_order` — integer sort key. Dictates the order of blocks in the emitted script. `state_all=1`, `county_all=2`, then `place=3`, `cousub=4`, `faces=6`, `featnames=7`, `edges=8`, `addr=9`, `addrfeat=9`, `tract=10`, `tabblock20=11`, `bg=12`, `zcta5_raw=13`. The gaps are intentional — `edges` must run before `addr`'s post-load (because `addr` queries `edges` to build `zip_state`), and `featnames` depends on nothing but must run before `edges` for index-cache coherence, etc.
-- `lookup_name` vs `table_name` — `lookup_name` is the name of the *parent* table (and the suffix of the per-state child). `table_name` is the filename fragment TIGER uses. For most rows they are identical; they differ for `zcta5_raw/zcta520`, `state_all/state`, `county_all/county`.
-- `level_state` / `level_county` / `level_nation` — boolean tags controlling which generator function picks this row up. Nation-level rows (`state_all`, `county_all`, `zcta5_raw`) appear only in `loader_generate_nation_script`; state-level rows appear in the state-level section of `loader_generate_script`; county-level rows expand into one wget-per-county in the same script.
-- `load` — master switch. `bg`, `addrfeat`, `zcta5_raw` ship with `load = false` so they are not emitted by default. Users flip these to true if they want block groups or `addrfeat` (the TIGER 2010+ address-feature shapefile, which duplicates `addr+edges` data in a single table).
-- `insert_mode` — `c` or `a`, feeds directly into `shp2pgsql`'s `-c` (create) or `-a` (append). `featnames`, `edges`, `addr`, `addrfeat` use `a` because a county-level loop appends into one per-state table.
-- `single_geom_mode` — maps to `shp2pgsql -S` (produce single-type geometry instead of multi-). Used for `addrfeat` and `zcta5_raw`.
-- `columns_exclude` — text array of source columns to *drop* when `INSERT`ing from the staging table into the final table. This is substantial: the `faces` row excludes 40+ columns (every legacy `_00` and `_10` variant). Rationale: TIGER shapefiles accumulate generational columns forever; the geocoder's parent table only defines the current ones.
-- `website_root_override` — used to point specific rows at a different URL than the year-wide `loader_variables.website_root`. Historically used for zcta5 (Census only published that directory sporadically).
-- `pre_load_process` — shell snippet that runs *before* `shp2pgsql` pipes data in. Always a `${psql} -c "CREATE TABLE ${data_schema}.${state_abbrev}_${lookup_name}(...) INHERITS(tiger.${lookup_name})"`. This is where the per-state child table gets created with its primary key.
-- `post_load_process` — shell snippet that runs *after* data is inserted. This is where all the work happens:
-  - `${psql} -c "SELECT loader_load_staged_data(...)"` to copy from staging to data schema (see §13.4).
-  - `${psql} -c "ALTER TABLE ... ADD CONSTRAINT chk_statefp CHECK (statefp = '${state_fips}')"` — critical for constraint exclusion (see §13.6).
-  - `${psql} -c "CREATE INDEX ... USING gist(the_geom)"`, and other indexes.
-  - For `edges` and `addr`: SQL that *derives* `zip_state_loc`, `zip_lookup_base`, and `zip_state` per-state tables from the just-loaded edges+faces+place joins. This is how the non-spatial ZIP→city lookups get populated — TIGER itself doesn't publish them.
-  - For `zcta5_raw`: a big `INSERT ... SELECT` that clips each ZCTA to each state polygon (`ST_Intersection` or `ST_Covers`) and writes to `zcta5_all`, then drops `zcta5_raw`. ZCTAs cross state boundaries, so the clip is what produces the per-state-indexed ZCTA polygons the geocoder expects.
-  - `${psql} -c "VACUUM ANALYZE ..."`.
-
-This table **is the spec** for what needs to happen per-table-type. For the DuckDB port, this is the checklist.
-
-### 13.2 Source data layout
-
-TIGER/Line shapefiles are published at:
-
-```
-${website_root}/
-    STATE/tl_${year}_us_state.zip                 # nation-level
-    COUNTY/tl_${year}_us_county.zip               # nation-level
-    ZCTA520/tl_${year}_us_zcta520.zip             # nation-level (formerly zcta510)
-    PLACE/tl_${year}_${state_fips}_place.zip      # state-level
-    COUSUB/tl_${year}_${state_fips}_cousub.zip    # state-level
-    TRACT/tl_${year}_${state_fips}_tract.zip      # state-level
-    TABBLOCK20/tl_${year}_${state_fips}_tabblock20.zip   # state-level
-    BG/tl_${year}_${state_fips}_bg.zip            # state-level
-    FACES/tl_${year}_${state_fips}${county_fips}_faces.zip       # county-level
-    FEATNAMES/tl_${year}_${state_fips}${county_fips}_featnames.zip  # county-level
-    EDGES/tl_${year}_${state_fips}${county_fips}_edges.zip       # county-level
-    ADDR/tl_${year}_${state_fips}${county_fips}_addr.zip         # county-level
-    ADDRFEAT/tl_${year}_${state_fips}${county_fips}_addrfeat.zip # county-level (opt)
-```
-
-State FIPS is 2 digits (`25` for MA); county FIPS is 3 digits. A state load for MA with 14 counties pulls 14 × 5 county-level zips + 5 state-level zips = 75 zips.
-
-The directory names in the URL (`STATE`, `FEATNAMES`, etc.) are derived in-code as `upper(lookup_name)` — with a hardcoded special case for `zcta5 → ZCTA5` on top of the already-renamed `zcta5_raw`. Keep that case in mind if pointing at a different year's layout.
-
-### 13.3 The three generator functions
-
-All return `SETOF text` — one giant shell-script string. Users typically `\o script.sh` + `\a` + `\t` in psql before calling, so the result lands in a runnable file.
-
-**`loader_generate_nation_script(os text) → SETOF text`** ([src/tiger_loader.sql:313](../src/tiger_loader.sql#L313))
-
-Emits the nation-level script for one platform. Contains rows where `level_nation = true AND load = true` (i.e. `state_all`, `county_all`, and optionally `zcta5_raw`). Output structure:
-
-```
-<declare_sect from loader_platform, with env vars substituted>
-<environ_set_command>
-<for each nation-level row in process_order>:
-    cd ${staging_fold}
-    ${wget} ${website_root}/<UPPER_TABLE>/tl_${year}_us_<table_name>.zip --mirror --reject=html
-    cd ${staging_fold}/<host-derived-subpath>/<UPPER_TABLE>
-    <unzip_command for tl_*<table_name>.zip>
-    <pre_load_process>                         # CREATE TABLE ... INHERITS(tiger.xxx)
-    ${loader} -D -<c|a> -s 4269 -g the_geom [-S] -W "latin1" tl_${year}_us_<table_name>.dbf tiger_staging.<table_name> | ${psql}
-    <post_load_process>                        # loader_load_staged_data, CREATE INDEX, VACUUM
-```
-
-This must run **once, first**, because state-level scripts depend on `tiger.county` being populated to enumerate county FIPS codes per state.
-
-**`loader_generate_script(param_states text[], os text) → SETOF text`** ([src/tiger_loader.sql:356](../src/tiger_loader.sql#L356))
-
-Emits the per-state script. For each state in the input array, produces two blocks:
-
-1. **State-level block.** One `wget`+`unzip`+`shp2pgsql`+`psql`+`post_load_process` sequence per row where `level_state = true AND load = true`, in `process_order` order. Target table becomes `tiger_data.<state_abbrev>_<lookup_name>`, staging table `tiger_staging.<state_abbrev>_<table_name>`.
-
-2. **County-level block.** For each row where `level_county = true AND load = true`:
-    - A `wget --mirror` loop over *every county FIPS in that state*, enumerated by joining to `tiger.county` (which is why nation must run first).
-    - A single unzip that globs `tl_*_${state_fips}*_${table_name}*.zip`.
-    - The platform's `county_process_command` — which is itself a loop over `*${table_name}*.dbf` files that runs `${loader} | ${psql}` per county and then calls `loader_load_staged_data` to move each into the per-state table.
-    - Post-load: the big derived-table SQL for `edges` (creates `<state>_zip_state_loc` and `<state>_zip_lookup_base`) and for `addr` (creates `<state>_zip_state`).
-
-Typical usage from the README:
-```sql
-SELECT loader_generate_script(ARRAY['DC','RI'], 'sh');
-```
-
-**`loader_generate_census_script(param_states text[], os text) → SETOF text`** ([src/tiger_loader.sql:459](../src/tiger_loader.sql#L459))
-
-A narrowed variant that only emits blocks for `bg`, `tract`, `tabblock` (census enumeration geographies). Used when you already have the geocoder data loaded and only want to add census tables later, e.g. for `get_tract()`. Also calls `create_census_base_tables()` as its first SQL statement (note: this function was dropped in the Makefile preamble; the call is legacy and currently `SELECT create_census_base_tables()` resolves to the dropped shim — a small latent bug).
-
-### 13.4 `loader_macro_replace` and `loader_load_staged_data`
-
-**`loader_macro_replace(input text, keys text[], values text[]) → text`** is the templating primitive. Walks `keys` and `values` in parallel and does `replace(input, '${'||keys[i]||'}', values[i])`. Every generator function double-wraps calls to this with slightly different variable sets — because some variables (`state_abbrev`, `state_fips`) aren't resolved until the state loop, and others (`psql`, `data_schema`) are resolved from `loader_platform`/`loader_variables`.
-
-The full variable set seen in templates:
-
-| Variable | Source | Example |
-| --- | --- | --- |
-| `${staging_fold}` | loader_variables | `/gisdata` |
-| `${website_root}` | loader_variables | `https://www2.census.gov/geo/tiger/TIGER2025` |
-| `${tiger_year}` | loader_variables (inline) | `2025` |
-| `${data_schema}` | loader_variables | `tiger_data` |
-| `${staging_schema}` | loader_variables | `tiger_staging` |
-| `${psql}` | loader_platform | `${PSQL}` |
-| `${loader}` | loader_platform | `${SHP2PGSQL}` |
-| `${state_abbrev}` | state_lookup | `ma` |
-| `${state_fips}` | state_lookup | `25` |
-| `${state_fold}` | state_lookup | `25_Massachusetts` |
-| `${lookup_name}` | loader_lookuptables | `edges` |
-| `${table_name}` | loader_lookuptables | `edges` |
-
-Note the `${...}` substitution happens *in SQL* during script generation — the emitted script has all of these already replaced with literal values. The only `${...}`-style variables surviving into the shell script are the ones that the shell itself will expand (e.g. `${TMPDIR}`, `${PSQL}`), written with `$$` in the PL/pgSQL string literal.
-
-**`loader_load_staged_data(staging_table, target_table [, exclude_columns])` → integer** ([src/tiger_loader.sql:410](../src/tiger_loader.sql#L410)) is the per-row staging→data mover:
-
-1. Introspect the columns of the *target* table from `information_schema.columns`, excluded by `exclude_columns` (defaulted from the lookup table's `columns_exclude` if omitted — the 2-arg overload resolves the exclusion list by matching the target table name against `loader_lookuptables.lookup_name` with `LIKE`).
-2. Introspect the columns of the *staging* table likewise.
-3. Build and execute `INSERT INTO data_schema.target (col1,col2,...) SELECT col1,col2,... FROM staging_schema.staging` — both column lists are built from `information_schema` in alphabetical order, so they will line up iff the column *names* match. TIGER column names are stable year-to-year so this works in practice, but it is a latent footgun.
-4. `DropGeometryTable()` the staging table.
-5. Return row count.
-
-The implicit default `columns_exclude` list in the 2-arg overload is ~50 columns long, covering every generational legacy column the geocoder doesn't care about (`statefp00`, `statefp10`, `uace00`, etc.).
-
-### 13.5 The lookup dictionaries are separate
-
-None of the above loads the small lookup dictionaries that `normalize_address()` consults (`direction_lookup`, `street_type_lookup`, `secondary_unit_lookup`, `state_lookup`). Those are static seed data, **created and populated at `CREATE EXTENSION` time** by [src/tables/lookup_tables_2011.sql](../src/tables/lookup_tables_2011.sql) running ~1300 lines of `INSERT INTO` statements.
-
-Three related tables, `place_lookup`, `county_lookup`, `countysub_lookup`, are created empty and never populated by the current codebase — their `INSERT` statements in `lookup_tables_2011.sql` are commented out (`/** INSERT INTO place_lookup SELECT ... pl99_d00 ... **/`). They reference long-deleted `pl99_d00`/`co99_d00` tables from Census 2000 Shapefile pilots. At runtime the geocoder's location extractor instead joins directly against the loaded `tiger.place` and `tiger.cousub` tables — so these `_lookup` tables are dead weight. For the DuckDB port we can drop them entirely.
-
-The `zip_lookup_base` table is a hybrid case: declared empty by the lookup-tables script, but populated **per-state** by the `edges` row's `post_load_process` via an `INSERT ... SELECT DISTINCT e.zipl, ..., p.name, ..., c.name FROM ${state}_edges e JOIN tiger.county c ... JOIN ${state}_faces f ... JOIN ${state}_place p ...`. So "load tiger data for MA" implicitly builds "tiger_data.ma_zip_lookup_base" as a child of `tiger.zip_lookup_base`.
-
-### 13.6 Inheritance and constraint exclusion
-
-Every per-state table in `tiger_data` is created with `INHERITS(tiger.<parent>)` plus `CHECK (statefp = '<FIPS>')`. For example:
-
-```
-CREATE TABLE tiger_data.ma_edges (
-    CONSTRAINT pk_ma_edges PRIMARY KEY (gid),
-    CONSTRAINT chk_statefp CHECK (statefp = '25')
-) INHERITS (tiger.edges);
-```
-
-This achieves two things:
-
-1. **Transparent fan-out.** Queries like `SELECT ... FROM tiger.edges WHERE ...` read from every inheriting child. The geocoder never hardcodes state-specific table names — it always queries the parent.
-2. **Constraint exclusion pruning.** When the query contains `WHERE statefp = '25'` (which the geocoder adds whenever it knows the state from the input ZIP/state), the planner sees the CHECK constraint on `tiger_data.ma_edges` and physically excludes every other state's child from the plan. This is why the geocoder's `WHERE statefp = $in_statefp` is the dominant selectivity win — without it, every query scans nationwide edge data.
-
-`tiger_data.state_all`, `tiger_data.county_all`, `tiger_data.zcta5_all` are nation-wide children (no `statefp` CHECK); the geocoder scans them uniformly.
-
-The `create_census_base_tables()` function referenced in the Makefile and in `loader_generate_census_script` is the original installer for the census subset (`tract`, `bg`, `tabblock20`). It's been dropped-and-recreated inline in `src/tiger_loader.sql` and `src/tables/census_tables.sql`, and those files' table definitions are what live in the `tiger` schema.
-
-### 13.7 Post-load housekeeping functions
-
-Run **once**, by the user, from a psql session after scripts finish:
-
-- **`install_missing_indexes() → boolean`** ([src/geocode/other_helper_functions.sql:219](../src/geocode/other_helper_functions.sql#L219)) — executes the SQL returned by `missing_indexes_generate_script()`. This is the safety net: if any expected index didn't get created (e.g. a partial load, a user-added state), this function creates it.
-- **`missing_indexes_generate_script() → text`** ([src/geocode/other_helper_functions.sql:77](../src/geocode/other_helper_functions.sql#L77)) — introspects `information_schema.columns` and `pg_catalog.pg_indexes` to find missing indexes on both `tiger.*` and `tiger_data.*`. It generates DDL for:
-  - `UNIQUE INDEX (tfid)` on every `*faces` table.
-  - `btree` indexes on `countyfp, tlid, tfidl, tfidr, tfid, zip, placefp, cousubfp`.
-  - `gist` spatial indexes on `the_geom` / `geom`.
-  - `btree(soundex(col))` and `btree(lower(col))` on `name`, `place`, `city` of `*county*`, `*featnames*`, `*place*`, `*zip*`, `*cousub*`.
-  - `btree(least_hn(fromhn, tohn))` on every `*addr*` table (accelerates range checks).
-  - `btree(lower(col) varchar_pattern_ops)` for LIKE-prefix lookups.
-  - `btree(zipl)`, `btree(zipr)` on every `*edges*` table.
-
-These are *exactly* the indexes the geocoder queries depend on — the `ORDER BY soundex(name)` in `location_extract`, the `lower(name) = lower(input)` joins in `geocode_address`, the `least_hn(fromhn, tohn)` comparisons. Missing any of them pushes a given query from index scan to seq scan on ~150M rows.
-
-- **`drop_state_tables_generate_script(state text, schema text = 'tiger_data') → text`** ([src/tiger_loader.sql:66](../src/tiger_loader.sql#L66)) — emits `DROP TABLE tiger_data.<state>_*;` for every table prefixed with the state abbrev. Used to reload a single state.
-- **`drop_nation_tables_generate_script(schema text = 'tiger_data') → text`** ([src/tiger_loader.sql:79](../src/tiger_loader.sql#L79)) — emits DROPs for the nation-level children (`state_all`, `county_all`, `zcta5_all`, plus any stray two-letter-prefixed `county`/`state` tables).
-- **`drop_dupe_featnames_generate_script() → text`** ([src/geocode/other_helper_functions.sql:230](../src/geocode/other_helper_functions.sql#L230)) — emits a per-table `CREATE TEMPORARY TABLE dup AS ... DELETE ... DROP` block that deduplicates `(tlid, lower(fullname))` rows in `*featnames` tables, then creates a tlid btree. TIGER publishes the same feature name multiple times per edge occasionally; this cleans it up.
-
-### 13.8 End-to-end user workflow (canonical)
-
-The README's six-step procedure, translated into what's actually happening:
-
-1. Create `${staging_fold}` and `${staging_fold}/temp/` on disk.
-2. Edit `loader_platform.declare_sect` to match your PG binary paths and creds.
-3. `psql -c "SELECT loader_generate_nation_script('sh')"` → run the script → loads `state_all`, `county_all`, and (if enabled) `zcta5_all`.
-4. `psql -c "SELECT loader_generate_script(ARRAY['DC','RI'], 'sh')"` → run the script → loads per-state `place`, `cousub`, `tract`, `tabblock20`, `bg` (if enabled), `faces`, `featnames`, `edges`, `addr`. Derives per-state `zip_state`, `zip_state_loc`, `zip_lookup_base`.
-5. `psql -c "SELECT install_missing_indexes()"` → belt-and-suspenders indexing.
-6. Sanity-check with a `SELECT * FROM geocode('...')`.
-
-Step 3 must precede step 4. Step 4 can be run incrementally per state.
-
-### 13.9 Runtime behavior that depends on the loader
-
-Several quirks of the geocoder only make sense in light of the loader's layout:
-
-- `WHERE statefp = $1` everywhere — to get the constraint-exclusion prune.
-- `parsed.zip` → `zip_lookup_base` → `statefp` fallback in `geocode_address` — because ZIPs cross state boundaries but the geocoder needs to pick *one* state's child table to scan efficiently.
-- `restrict_geom` → intersected with `zcta5` at 4269 — because ZCTA polygons are the coarsest, smallest, pre-indexed geometries available for a rough cut.
-- The per-state `zip_state`, `zip_state_loc`, `zip_lookup_base` tables exist at all — they're the "static lookup" alternative to actually joining `edges ⨝ faces ⨝ place`, and since they're derived at load-time, query-time is cheap. The DuckDB port should keep these as materialized tables for the same reason.
-- `lower(name)`, `soundex(name)`, `levenshtein_ignore_case(name, ...)` — matched by the exact indexes the loader creates. Changing the case handling in the geocoder would force an index rebuild.
-
-### 13.10 What the DuckDB port loader should look like
-
-Don't replicate the shell-script-generator pattern. Replace it with a thin C++ shim (per D11) that drives a per-state × per-table loop, with all the SQL expressed as macros or inline statements. API sketch:
-
-```sql
-CALL load_tiger_nation(year := 2025, temp_dir := '/tmp/duckdb_tiger');   -- one-off; loads state_all, county_all, zcta5_all
-CALL load_tiger_states(states := ['DC','RI'], year := 2025,             -- per-state, idempotent
-                       temp_dir := '/tmp/duckdb_tiger');
-```
-
-Per the D1 recipe, the C++ driver, per (state, table):
-
-1. Build the TIGER URL from `year` + `state_fips` + `table_name` conventions (§13.2), with a per-year config struct allowing year-specific URL tweaks (per D12).
-2. `HTTP GET` the zip into `temp_dir` via `httpfs` / libcurl.
-3. `INSERT INTO <target_table> (<non-excluded columns>) SELECT <same cols> FROM ST_Read('/vsizip/<temp_dir>/tl_2025_25_edges.zip/tl_2025_25_edges.shp')` — the column-exclusion list from PG's `loader_lookuptables.columns_exclude` is preserved as a static per-table constant in the shim.
-4. `std::filesystem::remove` the zip.
-5. After the state's base tables finish, run the derived-table SQL from §13 (per-state `zip_state`, `zip_state_loc`, `zip_lookup_base` build queries, translated essentially unchanged from the PG `post_load_process` snippets).
-6. For `zcta5` clipping: DuckDB spatial has `ST_Intersection` / `ST_Covers` / `ST_SimplifyPreserveTopology`; port the PG SQL verbatim.
-
-Locked port decisions (cross-reference D1–D13 above):
-
-- **Partitioning.** Single table per entity. No explicit sort needed: each state loads in its own INSERT, so row groups are naturally contiguous per `statefp` and zonemaps prune on `WHERE statefp = '25'` without intervention. (D2)
-- **Indexing.** No user-managed indexes for `soundex(name)` / `lower(name)` — instead precompute `name_lower`, `name_soundex` columns at load time and `ORDER BY name_lower` (or cluster by it) so zonemaps prune effectively. DuckDB spatial R-tree index on `the_geom` for every table with a geometry column. ART indexes on `tlid`, `statefp`, `tfid` where equality-joined.
-- **Keep:**
-  - Column-exclusion lists. TIGER really does have 40+ legacy columns on `faces`. Drop them at load time, not every query.
-  - Post-load derivation SQL for `zip_state`, `zip_state_loc`, `zip_lookup_base`. These are the fastest path to the location-only fallback (§8) and the ZIP-window expansion in `geocode_address` (§7.1).
-  - The `zcta5` state-clipping step. Without it, `geocode_location` can't do the per-state `ST_Intersects(zcta5.the_geom, ...)` prune cheaply.
-- **Drop:**
-  - `tract`, `bg`, `tabblock20`, `addrfeat` tables. Not consulted by the geocoder. (D8)
-  - The `loader_platform` / `loader_variables` / `loader_lookuptables` control tables. Their content becomes C++ constants in the shim. (D11)
-  - The shell-script generators (`loader_generate_*`). The extension loads data in-process.
-  - `loader_load_staged_data` — there's no staging schema; `ST_Read` streams directly into final tables.
-  - `loader_macro_replace` — DuckDB has parameterized SQL.
-  - `drop_*_tables_generate_script` — implement as `DELETE FROM tiger.edges WHERE statefp = ?` etc. inside an `unload_tiger_state(state)` table function.
-  - `install_missing_indexes` / `missing_indexes_generate_script` — the loader creates expected indexes itself; no safety net needed.
-  - `create_census_base_tables` — legacy; the current tables are declared inline (and we're not loading census tables anyway per D8).
-  - The `CHECK (statefp=...)` constraints — DuckDB can't use them for planning and we're single-table, so they're documentation-only noise.
-  - Per-OS templating. Everything in-process; no shell to escape. (D11 cross-platform note)
-
-- **Preserve:**
-  - TIGER filename/URL conventions (§13.2). These are external to us.
-  - Column names — downstream users of `tiger.edges`, `tiger.faces`, `tiger.addr`, `tiger.featnames` expect the same columns. Deviating makes ported Postgres queries break silently.
-  - SRID 4269 on all geometry in storage. Transform at query time, not load time.
-  - The `(zip, stusps, statefp)` uniqueness of `zip_state`, the `(zip, stusps, place)` uniqueness of `zip_state_loc`, the `(zip, state, county, city, statefp)` uniqueness of `zip_lookup_base`. The geocoder's `DISTINCT ON` relies on these.
-
 ## 14. What the DuckDB port actually needs to do
 
 Based on the flow above, here is the minimum semantic scaffolding a DuckDB port must provide. Everything else is optimization.
@@ -647,7 +371,7 @@ Before the scaffolding, the committed choices from design discussion:
 | D10 | **SRID policy.** Loader data: always 4269, no conversion. User-input geometry (`restrict_geom`, the point to `reverse_geocode`): auto-transform to 4269 at the boundary if SRID is set and different. SRID 0 is treated as "assume 4269" (matches PG). Do not silently misinterpret 4326 as 4269 — that's a 1–3m wrong-answer bug on short blocks. |
 | D11 | **Extension language.** Thin C++ shim (~100 LOC) for extension registration, HTTP orchestration, and the state-×-table-×-county loop (which needs iteration that DuckDB SQL doesn't offer). 95% of logic stays in SQL macros — `from_pagc`, `geocode`, `rate_attributes`, `interpolate_from_address`, per-table column projections, and all derived-table build queries. |
 | D12 | **Year handling.** `2025` default; `year` is a runtime parameter override. Per-year URL patterns and per-year schema tweaks live in a small internal config structure so year-to-year TIGER drift can be handled without a new extension release. |
-| D13 | **Parity testing.** v0.1 ships with (a) a hand-curated ~50-address corpus covering stress classes (numbered highways, `prequalabr` like `Old`, short street names, ZIP typos, cross-state ZIPs, unit suffixes, `I-635`/`I- 635` highway spacing), plus (b) ports of PG's regression tests from [src/regress/](../src/regress/): `pagc_normalize_address_regress`, `geocode_regress`, `reverse_geocode_regress`, and `test-geocode_intersection_spacing`. We skip `normalize_address_regress` — that parser isn't ported. |
+| D13 | **Parity testing.** v0.1 ships with (a) a hand-curated ~50-address corpus covering stress classes (numbered highways, `prequalabr` like `Old`, short street names, ZIP typos, cross-state ZIPs, unit suffixes, `I-635`/`I- 635` highway spacing), plus (b) ports of PG's regression tests (`geocode_regress`, `reverse_geocode_regress`, `test-geocode_intersection_spacing`) — see [docs/parity.md](../docs/parity.md). We skip `normalize_address_regress` — that parser isn't ported. |
 | D14 | **Census block/tract containment guarantees.** Precompute per-edge-per-side whether the interpolated offset point is guaranteed to land inside the adjacent face (implying block, tract, block group, county, state). Exposed at geocode time via `block_geoid`/`tract_geoid`/`blkgrp_geoid` output columns (always populated) plus a `containment_guaranteed` boolean, and a `require_containment` filter parameter. Guarantee holds at the default offset only. See §14.3 for the full spec and known limitations. |
 
 **Cross-platform note.** Unlike PG, which spends ~350 lines on `loader_platform` with per-OS paths for `wget` / `unzip` / `7z.exe` / `shp2pgsql` / `psql`, our loader does everything in-process via libraries that are already cross-platform: `httpfs` uses libcurl, `/vsizip/` is in GDAL, `ST_Read` is in DuckDB spatial, temp-path resolution uses C++17 `std::filesystem`. No shell escaping, no OS-specific unzip invocation, no `PATH` hunting. Builds and runs identically on Windows, macOS, and Linux through DuckDB's standard cross-compiled extension CI.
@@ -655,7 +379,7 @@ Before the scaffolding, the committed choices from design discussion:
 ### 14.1 Scaffolding (informed by the decisions above)
 
 
-**Data ingestion.** See §13 for the full treatment — the Postgres loader is a metadata-driven shell-script generator that we should *not* replicate. Instead, provide one or two DuckDB table functions that read TIGER shapefiles directly and write permanent tables. At minimum the loader must materialize these tables, all with geometry in EPSG:4269:
+**Data ingestion.** PostGIS's loader is a metadata-driven shell-script generator (`loader_platform`/`loader_variables` control tables, per-OS templated batch/sh fragments) — we deliberately did *not* replicate that pattern (D11). Instead, provide one or two DuckDB table functions that read TIGER shapefiles directly and write permanent tables. At minimum the loader must materialize these tables, all with geometry in EPSG:4269:
 
 - `state(statefp, stusps, geom)`
 - `county(statefp, countyfp, geom)`
@@ -670,7 +394,7 @@ Before the scaffolding, the committed choices from design discussion:
 - `featnames(statefp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc)`
 - `addr(statefp, tlid, fromhn, tohn, side, zip, plus4)`
 
-TIGER distributes this as per-state shapefiles; the single-table decision is locked (D2). Per-state partitioning is what makes the PostGIS version usably fast. In DuckDB we get the same effect for free: each state is loaded in its own INSERT, so row groups are naturally contiguous per `statefp` and zonemap pruning handles the per-state selectivity with no explicit sort. See §13.10 for the full loader-design discussion.
+TIGER distributes this as per-state shapefiles; the single-table decision is locked (D2). Per-state partitioning is what makes the PostGIS version usably fast. In DuckDB we get the same effect for free: each state is loaded in its own INSERT, so row groups are naturally contiguous per `statefp` and zonemap pruning handles the per-state selectivity with no explicit sort.
 
 ### 14.2 Loading modes and the portable-database pattern
 

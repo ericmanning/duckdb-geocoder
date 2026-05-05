@@ -58,7 +58,7 @@ Benchmarked on NJ (21 counties, 86 zips, ~800K edges) in April 2026. Details in 
 - Compare `user`/`real` CPU-time ratios to see whether DuckDB is already saturating cores — if user/real is already ~N, adding N more outer workers won't help.
 - Benchmark cold vs warm caches separately. Network variance and CDN warming make consecutive runs non-comparable.
 
-**April 2026 follow-up hypothesis tests** ([`scripts/benchmarks/`](scripts/benchmarks/)): wrote four targeted tests to isolate *why* parallel download and parallel ingest didn't pay off, expecting at least one hypothesis to be confirmed. **All four were falsified:**
+**April 2026 follow-up hypothesis tests** (lived under `scripts/benchmarks/` — removed in tree-tidy commit; see git history if you want to rerun): wrote four targeted tests to isolate *why* parallel download and parallel ingest didn't pay off, expecting at least one hypothesis to be confirmed. **All four were falsified:**
 
 - `/vsicurl/` is NOT doing partial Range fetches — we measured 128% of full-zip bytes on the wire during a serial load. Census does support Range; GDAL apparently isn't using it for shapefile reads. So commit 1's "parallel prefetch moves more bytes" story was wrong — both paths move roughly full-zip bytes.
 - DuckDB is NOT internally parallelizing `INSERT ... FROM ST_Read(...)` — `threads=1` vs `threads=14` ran the same INSERT in 0.45s vs 0.41s. So commit 2's "outer parallelism oversubscribes cores" story was also wrong; DuckDB wasn't using those cores for the INSERT.

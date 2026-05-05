@@ -8,92 +8,58 @@ Given a street address, it returns (a) a point in NAD83 coordinates interpolated
 
 ## Install
 
-Once published:
-
 ```sql
 INSTALL us_geocoder FROM community;
-INSTALL spatial;              -- core
-INSTALL splink_udfs FROM community;
+INSTALL spatial;
+INSTALL splink_udfs            FROM community;
 INSTALL us_address_standardizer FROM community;  -- optional (for raw-string inputs)
 
 LOAD us_geocoder;
 LOAD spatial;
 LOAD splink_udfs;
-LOAD us_address_standardizer;  -- if installed
+LOAD us_address_standardizer;
 ```
 
-(While the extension isn't in the community registry yet, build from source — see [Building](#building).)
+If the extension isn't yet in the community registry, build from source — see [Building](#building).
 
 ## Load TIGER data
 
 From the Census CDN (default — needs `httpfs`):
 
 ```sql
-CALL load_tiger_nation(year := 2025);                     -- one-time: state, county, zcta5
-CALL load_tiger_state('RI');                              -- one state
-CALL load_tiger_states(['RI','MA','CT']);                 -- several states in one call
-CALL load_tiger_all_states();                             -- all 50 states + DC
+CALL load_tiger_nation(year := 2025);          -- one-time: state, county, zcta5
+CALL load_tiger_state('RI');                   -- one state
+CALL load_tiger_states(['RI','MA','CT']);      -- several states in one call
+CALL load_tiger_all_states();                  -- 50 states + DC
 ```
 
-Or from a local **Census-nested** mirror of `https://www2.census.gov/geo/tiger/TIGER<year>/`:
+`load_tiger_state[s]` must run after `load_tiger_nation`. RI loads in ~45s from the Census CDN, ~25s from a local mirror.
 
-```
-/data/tiger_2025/
-  STATE/tl_2025_us_state.zip
-  COUNTY/tl_2025_us_county.zip
-  ZCTA520/tl_2025_us_zcta520.zip
-  PLACE/tl_2025_44_place.zip
-  COUSUB/tl_2025_44_cousub.zip
-  EDGES/tl_2025_44007_edges.zip
-  FACES/tl_2025_44007_faces.zip
-  FEATNAMES/tl_2025_44007_featnames.zip
-  ADDR/tl_2025_44007_addr.zip
-  …
-```
+Local sources need a **Census-nested** layout (`STATE/`, `COUNTY/`, `EDGES/`, `FACES/`, `FEATNAMES/`, … under a single root) — see [docs/api.md § Local source layout](docs/api.md#local-source-layout) for the full subdirectory map.
 
 ```sql
 CALL load_tiger_nation('/data/tiger_2025');
 CALL load_tiger_states(['RI','MA'], '/data/tiger_2025');
 ```
 
-This layout matches what `wget --recursive` / `curl --remote-name` against the Census FTP produces, so it's also what the parallel-fetch recipe below targets. `load_tiger_state[s]` must run after `load_tiger_nation` — the state loader enumerates counties from the `tiger.county` table populated by the nation load. Loading one state (all 5 counties of RI) from the Census CDN takes ~45s over residential broadband; a local source cuts that to ~25s.
-
-If you don't need the census-block / tract / block-group GEOID output columns, pass `build_containment := false` to skip the per-state `edge_containment` precompute (saves ~1–2 min per state). You can populate it later for selected states with `CALL build_edge_containment(['RI','MA'])`.
+Pass `build_containment := false` to skip the per-state `edge_containment` precompute (saves ~1–2 min/state) if you don't need block / tract / block-group GEOIDs. Populate later with `CALL build_edge_containment(['RI','MA'])`.
 
 ## Reference databases (attached catalogs)
 
-The 13 TIGER data tables can live in the current database, in a separate read-write attached catalog, or in a shared read-only attached catalog. The macros always stay local — only the data moves.
+The 13 TIGER data tables can live in the current database, a read-write attached catalog, or a read-only attached catalog. Macros stay local; only data moves. See [docs/api.md § Reference databases](docs/api.md#reference-databases) for the full contract; quick examples:
 
-**Current DB (default):**
 ```sql
-CALL load_tiger_state('RI');
-SELECT * FROM tiger.geocode(...);
-```
-
-**Attached read-write:**
-```sql
+-- Read-write: load into 'work' attached DB, repoint local tiger.* at it.
 ATTACH 'work.duckdb' AS work;
 CALL load_tiger_state('RI', target_db := 'work');
-CALL set_tiger_reference('work');                -- repoint local tiger.* at work.tiger.*
+CALL set_tiger_reference('work');
 SELECT * FROM tiger.geocode(...);
-```
 
-**Attached read-only (portable-DB workflow for secure / air-gapped envs):**
-```sql
--- Staging env, with internet:
-ATTACH 'tiger_us_2025.duckdb' AS tgt;
-CALL load_tiger_nation(target_db := 'tgt');
-CALL load_tiger_state('RI', target_db := 'tgt');
-DETACH tgt;
--- Ship tiger_us_2025.duckdb to the secure env.
-
--- Secure env, no internet:
+-- Portable: ship a prebuilt DB to an air-gapped env, attach READ_ONLY.
 ATTACH 'tiger_us_2025.duckdb' AS ref (READ_ONLY);
 CALL set_tiger_reference('ref');
 SELECT * FROM tiger.geocode(...);
 ```
-
-`set_tiger_reference()` with no arguments resets the local `tiger.*` data tables to empty base tables. See [docs/api.md](docs/api.md) for the full contract.
 
 ## Geocode
 

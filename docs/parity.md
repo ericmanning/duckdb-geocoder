@@ -26,7 +26,7 @@ PG returns a single record with parallel arrays (`intpt[]`, `addy[]`, `street[]`
 
 PG's geocoder has multiple `rating = 0 → return immediately` and `exact_street → skip Stage B` short-circuits, plus a `LOOP` over `zip_info` shapes that can short-circuit after iter 1 returns enough rows. `us_geocoder` is a SQL macro with no equivalent control flow — it computes all candidates in one vectorized pass with `ORDER BY rating LIMIT max_results`.
 
-**As of `patch/d7` merge** (see [`d7-revisit.md`](d7-revisit.md)), Stage A is a two-pass structure that mirrors PG's primary + fallback distinction *as predicates*, without the iteration:
+Stage A is a two-pass structure that mirrors PG's primary + fallback distinction *as predicates*, without the iteration:
 
 - **Pass A**: primary-shaped filter (length-gated soundex/prefix); always runs.
 - **Pass B**: fallback-shaped filter (ungated soundex / fullname-LIKE / name-prefix); fires when Pass A is weak (`n_rows = 0 OR min_r ≥ 30`), mirroring PG's `IF var_bestrating < 30 THEN RETURN`.
@@ -93,41 +93,21 @@ Expect identical `rating` values, identical `(addy)` contents, and geometry with
 
 ## Parity test layout
 
-Three layers, separating what runs in CI from what requires real TIGER data.
+Three layers, separating CI checks from harnesses that need a real TIGER reference DB.
 
 ### Layer 1 — unit tests (CI)
 
-Hand-curated unit tests covering the geocoder's primitives. No real TIGER data; synthetic fixtures only.
-
-- Exact-match happy path (rating 0)
-- Perpendicular offset math (left/right side in UTM)
-- Location fallback (rating ≥ 100)
-- Intersection finder via shared TIGER nodes
-- Reverse geocode rank ordering
-- Containment GEOID derivation
-- Every scoring primitive (`rate_attributes`, `diff_zip`, `zip_range`, `least_hn`/`greatest_hn`, `numeric_streets_equal`, `normalize_street_name`, `cull_null`, `levenshtein_ignore_case`)
+Hand-curated [test/sql/](../test/sql/) sqllogic tests covering the geocoder primitives — happy path, perpendicular offset math, side-of-street semantics, location fallback, intersection finder, reverse-geocode rank, containment GEOID derivation, every scoring primitive. No TIGER data; synthetic fixtures only.
 
 ### Layer 2 — stress-class regression (CI)
 
-[`test/sql/parity_stress.test`](../test/sql/parity_stress.test) systematically exercises every stress class spec D13 calls out. Synthetic multi-street RI fixture; no real TIGER data needed. **NOT** a PG parity test — it asserts our own behavior is consistent across each `geocode_address_impl` branch:
+[test/sql/parity_stress.test](../test/sql/parity_stress.test) systematically exercises every stress class D13 calls out (numeric-street equivalence, prequalabr discount, short-name LIKE-prefix bypass, highway spacing, ZIP window tolerance, house-number penalties, soft type/direction penalties, Stage B fallback). Synthetic multi-street RI fixture. **Not** a PG parity test — asserts our own per-branch behavior.
 
-1. **Numeric-street equivalence** — `15` and `15rd` match `15th St` via `numeric_streets_equal`.
-2. **prequalabr discount** — `Main St` matches `Old Main St`; the `OLD` prefix doesn't reject.
-3. **Short-name LIKE-prefix bypass** — names ≤5 chars skip the `LIKE name || '%'` branch but still match via exact / soundex / numeric.
-4. **Highway spacing** — `I-635` and `I- 635` reach the same fullname after `normalize_street_name`.
-5. **ZIP window tolerance** — long names get ±2 ZIP typo tolerance via `zip_range`; ZIPs outside the window produce zero matches.
-6. **House-number out-of-range** — penalty +5 + scaled distance, output address is the nearest range endpoint.
-7. **House-number wrong parity** — penalty +2.
-8. **Soft penalties on type / direction** — `Avenue` rates worse than `Ave`, `Northwest` worse than `NW`, but both still match.
-9. **Stage B fallback** — input with no `street_name` returns rating ≥ 100 from `geocode_location`; address-level matches always rate < 100.
+### Layer 3 — PG-mirrored parity harnesses (local-only)
 
-### Layer 3 — PG-mirrored parity harness (local-only)
+[scripts/parity/run_geocode_regress.sh](../scripts/parity/run_geocode_regress.sh) and [scripts/parity/run_reverse_geocode_regress.sh](../scripts/parity/run_reverse_geocode_regress.sh) run PG's regression inputs through *our* geocoder and diff against PG-2025-PAGC oracle output captured in [test/parity/upstream/](../test/parity/upstream/) (NOTICE + GPLv2 attribution there).
 
-[`scripts/parity/run_geocode_regress.sh`](../scripts/parity/run_geocode_regress.sh) runs PG's actual regression-test inputs through *our* geocoder and diffs the output against PG's expected outputs. The PG files are vendored verbatim in [`test/parity/upstream/`](../test/parity/upstream/) (NOTICE + GPLv2 attribution there).
-
-**Why not in CI:** PG's tests target Boston / Cambridge / Minneapolis addresses against PG's TIGER vintage (~2010-era based on the test format). Running them needs a reference DB with TIGER 2025 loaded for at least MA + MN — multi-GB, doesn't fit a typical CI budget. Expected outputs were captured against the older vintage, so some divergence is *expected*: block boundaries shift, addresses get added, the PAGC rule files in `us_address_standardizer` evolve.
-
-**Workflow.** Build a parity reference DB once:
+**Not run in CI** — needs a reference DB with TIGER 2025 loaded for at least MA + MN (multi-GB). Build once:
 
 ```sql
 ATTACH 'pg_parity.duckdb' AS tgt;
@@ -136,127 +116,37 @@ CALL load_tiger_states(['MA','MN'], target_db := 'tgt');
 DETACH tgt;
 ```
 
-Then run the harness:
+Then:
 
 ```sh
-./scripts/parity/run_geocode_regress.sh pg_parity.duckdb
+./scripts/parity/run_geocode_regress.sh         pg_parity.duckdb
+./scripts/parity/run_reverse_geocode_regress.sh pg_parity.duckdb
 ```
 
-Output is a per-test `match` / `diverge` / `missing` tally with diffs inlined for divergent rows. The harness extracts ~25 of PG's standard test cases (the simple `geocode('addr', N)` shapes); batched-VALUES forms (`#TB1`, `#1073*`, `#1076*`) are skipped — patches welcome.
+Output is a per-test `match` / `diverge` / `missing` tally with diffs inlined. **Match** means identical `pprint_addy(addy)` + 4-decimal-truncated `POINT(lng lat)` + integer rating.
 
-**What "match" means:** identical `pprint_addy(addy)` text, identical 5-decimal-truncated `POINT(lng lat)`, identical integer rating. Anything weaker is a `diverge`. Engineers investigating concrete divergence reports use the harness output to distinguish "our geocoder is wrong" from "TIGER vintage drift" from "PAGC rules version drift."
-
-### Baseline (TIGER 2025, April 2026)
-
-Captured at [`test/parity/baseline/geocode_regress.txt`](../test/parity/baseline/geocode_regress.txt). Tally vs the *vendored* expected file: `0 match / 23 diverge / 35 missing`. The 35 missing are batched-VALUES PG tests the harness regex doesn't extract.
-
-Of the 23 divergences, the surface tally was misleading until validated against an actual PG instance running with PAGC enabled. See the next section.
-
-### PG-on-PG validation (Docker side-by-side)
-
-[`scripts/parity/pg_compare/`](../scripts/parity/pg_compare/) builds a Docker image with PG 16 + PostGIS + the upstream `address_standardizer` + `postgis_tiger_geocoder`, loads TIGER 2025 for MA + MN, and runs PG's `geocode_regress.sql` with `set_geocode_setting('use_pagc_address_parser','true')`. Three-way diff (PG-with-PAGC vs us-with-PAGC vs the vendored expected, which was generated with PG's *built-in* normalizer, not PAGC):
-
-| Class | Tests | Reading |
-|---|---|---|
-| **A. Match PG-with-PAGC, both off vendored by +1** | T3, T6, T9, T18b | Pure parser-version artifact. Vendored expected was built with `normalize_address`, not PAGC. PAGC parses these inputs slightly differently from the built-in. **Not a bug.** |
-| **B. We were 1 lower than PG-with-PAGC** | T12, T13, T14, T15, T16 | **Fixed.** Common factor: input has **no ZIP**. PG's [`geocode_address.sql:124-127`](../scripts/parity/pg_compare/tiger_geocoder/src/geocode/geocode_address.sql) uses literal `+1` as the ZIP-term fallback when input ZIP is missing; we used `+0`. The CASE in [`src/sql/geocode_address.sql.in:206`](../src/sql/geocode_address.sql.in) now splits the NULL branches (`p_zip IS NULL → 1`, `a_zip IS NULL → 0`, else compute). T12-T16 ratings (1, 1, 1, 11, 11) match PG-with-PAGC exactly post-fix. |
-| **C. Same misparse, different downstream pick** | T18a | Both PAGC implementations misparse "26 Court Street, 02109" (city='STREET'). PG and we both end at rating 18. PG picks "26 Court **Sq**, Boston"; we pick "26 Court **St**, Boston". Tiebreak ordering differs. Worth a separate investigation, but not a rating-arithmetic issue. |
-
-**Reproduce locally:**
-
-```sh
-docker build -t duckdb-geocoder-pgparity scripts/parity/pg_compare/
-docker run -d --rm --name pgparity --shm-size=2g \
-    -p 55432:5432 -e POSTGRES_PASSWORD=parity duckdb-geocoder-pgparity
-bash scripts/parity/pg_compare/load_tiger_via_pg.sh MA,MN     # ~1 hour
-
-# Run regress with PAGC enabled
-( echo "SELECT tiger.set_geocode_setting('use_pagc_address_parser','true');"
-  echo "\\pset format unaligned" "\\pset fieldsep '|'" "\\pset tuples_only on"
-  cat scripts/parity/pg_compare/tiger_geocoder/src/regress/geocode_regress.sql
-) | docker exec -i pgparity psql -U postgres -d parity
-```
-
-Net: the parity harness's surface "0 match" tally against the vendored expected file is heavily inflated by the parser-baseline mismatch (vendored built with the built-in normalizer, our outputs come from PAGC). With the no-ZIP +1 fix landed, T-series tests T2-T16 now match PG-with-PAGC exactly; remaining differences are T18a (tiebreak ordering — we and PG both score "26 Court Street, 02109" candidates equivalently after the misparse, but pick different streets) and the batched-VALUES `#1073…#1145…` tests, which mostly reflect TIGER vintage drift between PG's regress baseline and 2025 data.
-
-### PG-2025-PAGC oracle (April 2026)
-
-[`scripts/parity/pg_compare/regenerate_expected.sh`](../scripts/parity/pg_compare/regenerate_expected.sh) regenerates [`test/parity/upstream/geocode_regress_2025_pagc`](../test/parity/upstream/geocode_regress_2025_pagc) by running our test inputs through the PG container with `use_pagc_address_parser=true` against TIGER 2025. Output is byte-stable across re-runs (rows ordered by `(test_id, target, rating, geom WKT)`).
-
-Comparing that oracle to our output (post +1 fix), 26 of 58 unique test IDs match PG-2025-PAGC exactly on first-row rating + picked address:
-
-| ✓ Match (26) | ✗ Diverge (32) |
-|---|---|
-| T1-T17, T18b | T18a (tiebreak) |
-| #TB1 (batched) | #1073a/b, #1076a-h, #1145a/b/d/e (numeric-named streets / batched edge cases) |
-| #1074a/b | #1113a-e (prequalabr `Old` handling — PG keeps it, we strip it) |
-| #1076g, #1087a/b/c | #1112a (we drop to Stage B where PG finds Stage A) |
-| #1112b/c/d/e, #1113f, #1145c | |
-
-**Two real buckets remain (everything else is upstream parser drift):**
-
-- **Bucket 1 — T18a is intentionally better than PG, not a bug:** input "26 Court Street, 02109" has no city-before-ZIP. Both PAGC parsers misparse `city='STREET'`, no `suftype`. PG's [`pagc_normalize_address`](../scripts/parity/pg_compare/tiger_geocoder/src/pagc_normalize/pagc_normalize_address.sql) is a thin COALESCE wrapper around the two parsers — no validation, no recovery — so the misparse flows straight into scoring: `lev('STREET','BOSTON')` ≈ 6 plus `lev('','St')*5` = 10 type penalty per candidate → Court St and Court Sq both rate 18 (true tie, broken arbitrarily toward Court Sq). Our [`from_pagc`](../src/sql/from_pagc.sql.in) adds a post-PAGC validation step PG doesn't have: when both parsers agree the "city" is a street-type word (a hardcoded list of suffix abbreviations), infer `street_type` from that word and null out `location`. That changes our scoring so Court St rates 7 and Court Sq rates 12 (the type-match resolves the tie correctly). We pick Court St — same address as the vendored expected (rating 6), at rating 7. **The workaround is a DuckDB-specific value-add, not a port artifact** — do not remove it in any "bit-match PG exactly" cleanup; doing so would regress this case to PG's wrong-pick.
-
-- **Bucket 2 — `us_address_standardizer` rule-file lineage divergence (~15 tests including #1076*, #1112*, #1113*, #1145*):** the DuckDB community extension's PAGC rule files (`us_lex`, `us_gaz`, `us_rules`) are a 1:1 faithful copy of *upstream* `postgis/address_standardizer`. PG's bundled `pagc_*` rule files are a *hand-modified fork* of that same upstream, tuned for TIGER's vocabulary (TIGER stores street types in abbreviated form like `SVC RD`, so PG's rules tokenize toward `SVC RD` instead of upstream's `SERVICE ROAD`, and add composite-token rules like `SERVICE DR → SVC DR` that upstream lacks). Same `address_standardizer` C library; different rule data because PG is the one that diverged from upstream. Verified against three concrete cases:
-
-  | Input | Our parse | PG's parse |
-  |-------|-----------|-----------|
-  | `"8401 W 35W Service Dr NE"` | house=`35 W`, name=SERVICE, unit=`# 8401 W` (broken) | house=8401, name=`"35 W"`, suftype=`SVC DR`, sufdir=NE |
-  | `"8040 OLD CEDAR AVE S"` | name=CEDAR, **qual**=OLD (split) | name=`"OLD CEDAR"` (kept together) |
-  | `"16725 Co Rd 24"` | pretype=`COUNTY ROAD`, name=24 | suftype=`CO RD`, name=24 |
-
-  These flow into our geocoder as different field assignments → different scoring/output formatting. **Our geocoder is correct given the parses it receives**; the divergence is upstream of us. Fix is to align the community extension's rule files with PG's, or to monkey-patch our rule-loader to override critical entries. Tracked in [project memory](../.claude/projects/-Users-ericmm-Documents-GitHub-duckdb-geocoder/memory/project_us_address_standardizer_rules.md).
-
-The remaining surface-level divergences (T6, T12, T13, T16 multi-row outputs) reflect documented D7 (relaxed dedup) and float precision at the 5th decimal — first-row picks match.
-
-The full PG-2025-PAGC oracle is the new parity baseline; the original vendored file is retained as historical reference (PG's built-in normalizer + ~2010-era TIGER) but should not be used for new parity work.
+The Docker image at [scripts/parity/pg_compare/](../scripts/parity/pg_compare/) builds the PG side (PG 16 + PostGIS + upstream `address_standardizer` + `postgis_tiger_geocoder`) so the oracle in [test/parity/upstream/](../test/parity/upstream/) can be regenerated. See the script headers for full reproduce instructions.
 
 ### Documented improvements over PG (deliberate divergences)
 
-Three specific mechanisms in our pipeline produce *better* results than PG-with-PAGC on certain inputs. All intentional; **don't remove them in any "match PG bit-for-bit" cleanup**.
+Three mechanisms produce *better* results than PG-with-PAGC on certain inputs. All intentional; **don't remove in any "match PG bit-for-bit" cleanup**. See [parity-divergences.md](parity-divergences.md) for per-test detail.
 
-**Mechanism A — `from_pagc` post-PAGC validation** (resolves T18a-class).
+- **A. `from_pagc` post-PAGC validation** — when PAGC misparses a street-type word as the city (e.g. `"26 Court Street, 02109"` → `city='STREET'`), our adapter infers `street_type` from that word and nulls location. PG's `pagc_normalize_address` accepts the misparse verbatim. Resolves T18a-class.
+- **B. Unconditional `numeric_streets_equal` in candidate-finding** — PAGC strips ordinal suffixes (`27th` → `27`); PG's primary stage_a only exact-matches short names, so it misses TIGER's `name='27th'`. Our `name_match_tlids_a` always runs the `numeric_streets_equal` branch. Resolves #1145a/b/e-class.
+- **C. PAGC numeric-suffix recombination** — for inputs like `"35W"` PAGC over-splits to `name='35', sufdir='W'`, and `soundex('35')` collides with every digit-stem street; we detect and recombine. Net positive vs PG's plpgsql LOOP short-circuit.
 
-PG's [`pagc_normalize_address`](../scripts/parity/pg_compare/tiger_geocoder/src/pagc_normalize/pagc_normalize_address.sql) is a thin COALESCE wrapper around two PAGC parsers — no validation, no recovery. Whatever PAGC says, PG accepts. For inputs with no city before the ZIP (e.g. `"26 Court Street, 02109"`), PAGC misparses `city='STREET'`; PG inflates the rating by paying `lev('STREET','BOSTON') ≈ 6` against every Boston candidate.
+### Status
 
-Our [`from_pagc`](../src/sql/from_pagc.sql.in) detects when both parsers agree the "city" is one of a hardcoded list of street-type words, infers `street_type` from that word, and nulls `location`. Triggers when: input has no recognizable city before the ZIP AND the trailing word is a street-type abbreviation.
+Strict-match parity against PG-2025-PAGC: **34/51** (`pprint_addy(addy)` + 4-decimal-truncated `POINT(lng lat)` + integer rating identical up to per-test `max_n`).
 
-**Mechanism B — `numeric_streets_equal` always on in candidate-finding** (resolves #1145a/b/e-class).
+All 17 remaining divergences fall into three classes — none are bugs in our code. Per-test breakdown in [parity-divergences.md](parity-divergences.md). One-line summary:
 
-PAGC strips ordinal suffixes: `"27th"` → name=`'27'`, `"36th"` → `'36'`, `"18th"` → `'18'`. PG's primary stage_a uses ONLY exact `f.name = $2` for short streetnames (length ≤ 5), so it can't match TIGER's `name='27th'` from input `'27'`. PG has a `numeric_streets_equal` clause but only in its **fallback** stage_a, which runs only if primary's best rating ≥ 30. For `#1145a`, PG primary finds `Co Rd 27` at rating 27 (under threshold) → never tries fallback → never finds 27th Ave S.
-
-Our [`name_match_tlids_a`](../src/sql/geocode_address.sql.in) always runs the `numeric_streets_equal` branch. We find both `name='27'` AND `name='27th'` candidates and pick the one that scores best.
-
-Triggers when: PAGC strips ordinal/letter suffix from a numeric streetname (length ≤ 5 result) AND TIGER's name retains the suffix AND PG primary's best alternate would rate < 30.
-
-**Mechanism C — PAGC numeric-suffix recombination in `from_pagc`** (added in `patch/d7`; helps #1073a-class indirectly).
-
-For inputs like `"8401 West 35W, ..."`, PAGC parses `street_name='35', sufdir='W'` (PG's `pagc_normalize_address` does the same; verified via Docker side-by-side). When `street_name='35'`, `soundex('35')='0000'` collides with every digit-stem street name (Co Rd 37, US Hwy 10, 101st, ...). PG's `geocode` function happens to avoid the resulting flood because its plpgsql `LOOP` short-circuits after iter 1 returns enough rows; our table-query model has no equivalent control flow.
-
-[`from_pagc`](../src/sql/from_pagc.sql.in) detects when the raw input contains an unspaced `<digits><single-letter>` token AND PAGC over-split it, and recombines back into `street_name='35W', post_dir=NULL`. Conservative trigger conditions (only purely-digit name + single direction letter + raw text contains the unspaced concat). Trade-off: TIGER stores compound numeric-direction streets inconsistently (Pattern A `name='35W'` ~725 rows in MA/MN/CT, Pattern B `name='35', sufdir='W'` ~3500 rows). For Pattern B inputs where the user *did* type the unspaced concat, the recombined parse loses the explicit sufdir match and incurs a +2 rating penalty (`numeric_streets_equal` still finds the right candidate). Net positive.
-
-### Post-investigation status (May 2026, post-`patch/d7` + interpolate audit)
-
-After the D7 revisit work (see [`d7-revisit.md`](d7-revisit.md)) and a follow-up audit of the remaining divergences that uncovered two `interpolate_from_address` calc bugs (out-of-range house → midpoint not endpoint clamp; local-segment azimuth not overall start-to-end), parity against PG-2025-PAGC is **34/51 strict match** (`pprint_addy(addy)` + 4-decimal-truncated `POINT(lng lat)` + integer rating identical for all rows up to per-test `max_n`).
-
-The original three "D7-cost" divergences (#1076h, #1073a, #1145d) are now resolved structurally — though the resolutions are more nuanced than full primary/fallback rewrite:
-
-- **#1076h** — top row matches PG exactly (rating 18, Hingham). Row-2 still diverges in geom only (sub-meter precision drift on tied sub_rating; same address text and rating).
-- **#1073a** — we now find the *correct* address `212 3rd Ave N, Minneapolis, MN 55401 r=4`. PG returns `10000 3rd St NE, Hanover, MN 55341 r=38` (PG's own iter-2 `LIMIT 10` after alphabetical sort hides Minneapolis from PG's final-sort input). **We beat PG; this is now classified us-better-than-PG.**
-- **#1145d** — structurally closes (Pass A=0 path now fires Pass B's loose branches); we return real candidates instead of dropping to Stage B. Top candidate text differs from PG's row-1 due to PG-specific iter-2 query plan effects (DISTINCT ON ordering, alphabetical pre-sort) that aren't expressible in our table-query model.
-
-The 17 remaining divergences are written up per-test in [parity-divergences.md](parity-divergences.md). Summary:
-
-| Class | Count | Tests | Disposition |
-|---|---|---|---|
-| **A. Us-better-than-PG** | 11 | #1073a, #1073b, #1087b, #1113a, #1113b, #1145a, #1145b, #1145c, #1145d, #1145e, T18a | Mechanisms A/B/C produce correct/better candidates than PG. Several cases (#1073a, #1145a/b/c/e) we find the actually-correct address; PG returns wrong-answer candidates because of its query-plan `LIMIT 10`-before-final-sort artifact. Don't revert. |
-| **B. PG heap row-order tiebreak** | 5 | #1074a, #1074b, #1076a, #1076h, #1113d | At sub_rating ties within a `DISTINCT ON` partition, PG's pick depends on physical heap row insertion order (not specified at the SQL level). DuckDB columnar storage has different natural ordering, so we deterministically pick a different row from the same tied set. House# typically differs by 1 (the L/R-side parity-twin row); geom typically differs by <5m. Not closeable in SQL. |
-| **C. Path-divergence on rating** | 1 | #1076e | PG and we both find the same candidate set, but PG ranks an out-of-range row as fallback-shape (NULL house, fallback formula) while we rank it as primary-shape (clamped house, primary formula). Different rating, same fundamental match. Specific to short streetnames where PG's primary/iter-1-fallback distinction collapses. Not a calc bug; not currently worth a structural fix. |
-
-**Audit conclusion (May 2026):** the audit identified and fixed two real `interpolate_from_address` calc bugs (committed). All remaining divergences are accounted for by deliberate design choices, PG-specific storage/query-plan effects, or rating-formula path differences that aren't expressible in SQL.
+- **11 us-better-than-PG** (Mechanisms A/B/C)
+- **5 PG heap row-order tiebreak** at sub_rating ties — not closeable in SQL (would require replicating PostgreSQL's physical heap layout)
+- **1 rating path-divergence** (#1076e — same edge, different formula path)
 
 ### Roadmap
 
-- Port `pagc_normalize_address_regress` as a CI-friendly sqllogic test (parser-only, no TIGER). The PG-vendored expected outputs become the test oracle for our `from_pagc` repack.
-- Extend the harness to the batched-VALUES forms in `geocode_regress.sql`.
-- Port `reverse_geocode_regress.sql` (8 tests, MA + MN).
+- 10k-row random-sample corpus from a loaded TIGER state — catches scoring/parser regressions outside the curated test set.
+- Port `pagc_normalize_address_regress` as a parser-level harness for `from_pagc` vs PG's `normalize_address(use_pagc=true)`.
+- Extend `run_geocode_regress.sh` to cover the batched-VALUES forms (`#TB1`, `#1073*`, `#1076*`).
