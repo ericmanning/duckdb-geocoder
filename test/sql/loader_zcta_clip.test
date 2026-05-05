@@ -20,8 +20,7 @@ require us_geocoder
 statement ok
 LOAD spatial;
 
-statement ok
-LOAD splink_udfs;
+require splink_udfs
 
 # Synthetic states: A (unit square at origin) + B (adjacent east).
 # state_lookup is preseeded with real FIPS codes — use values that don't

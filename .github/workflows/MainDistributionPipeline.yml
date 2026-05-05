@@ -24,6 +24,12 @@ jobs:
       # the us_address_standardizer community extension ships on. Native build
       # matrix is linux_amd64, linux_arm64, osx_arm64.
       exclude_archs: wasm_mvp;wasm_eh;wasm_threads;windows_amd64;osx_amd64
+      # Point the test runner at the build's local extension repo so
+      # `require splink_udfs` (which our test files use) resolves to the
+      # splink_udfs.duckdb_extension that extension_config.cmake builds at
+      # configure time. Without this the test runner has autoload off by
+      # default and require falls back to a disk-cache lookup that fails.
+      test_config: '{"test_env_variables": {"LOCAL_EXTENSION_REPO": "/duckdb_build_dir/build/release/repository"}}'
 
   code-quality-check:
     name: Code Quality Check

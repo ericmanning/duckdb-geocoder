@@ -7,8 +7,7 @@ require us_geocoder
 statement ok
 LOAD spatial;
 
-statement ok
-LOAD splink_udfs;
+require splink_udfs
 
 # Fixture: one edge on Meeting St in Providence RI (statefp=44).
 # 100-block, addresses 100–199 on the right side (odd parity), 101-199 on left.

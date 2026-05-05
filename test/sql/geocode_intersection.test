@@ -7,8 +7,7 @@ require us_geocoder
 statement ok
 LOAD spatial;
 
-statement ok
-LOAD splink_udfs;
+require splink_udfs
 
 # Two streets meeting at node 3001 = (-71.405, 41.826).
 # Meeting St runs east from the shared corner; Benefit St runs north.

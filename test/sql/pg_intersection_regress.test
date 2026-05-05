@@ -13,8 +13,7 @@ require us_geocoder
 statement ok
 LOAD spatial;
 
-statement ok
-LOAD splink_udfs;
+require splink_udfs
 
 # --- Synthetic Coppell, TX fixture (PG #1461 regress data) -------------------
 # state_lookup is preseeded by LoadInternal; statefp=48 = Texas.

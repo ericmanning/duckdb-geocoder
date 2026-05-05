@@ -7,8 +7,7 @@ require us_geocoder
 statement ok
 LOAD spatial;
 
-statement ok
-LOAD splink_udfs;
+require splink_udfs
 
 # Reuse the Meeting St / Providence fixture.
 statement ok

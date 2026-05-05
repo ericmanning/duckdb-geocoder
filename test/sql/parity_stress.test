@@ -19,8 +19,7 @@ require us_geocoder
 statement ok
 LOAD spatial;
 
-statement ok
-LOAD splink_udfs;
+require splink_udfs
 
 # --------------------------------------------------------------------
 # Shared fixture: small RI fragment with seven streets, each chosen to

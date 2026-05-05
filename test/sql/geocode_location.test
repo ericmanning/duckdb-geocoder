@@ -7,8 +7,7 @@ require us_geocoder
 statement ok
 LOAD spatial;
 
-statement ok
-LOAD splink_udfs;
+require splink_udfs
 
 # Insert a minimal fixture: one zcta5, matching zip_lookup_base, one place.
 statement ok
