@@ -1,0 +1,29 @@
+# name: test/sql/pg_intersection_regress_pagc.test
+# description: PG #1461c parser parity — requires us_address_standardizer
+# group: [sql]
+
+# Split out from pg_intersection_regress.test because us_address_standardizer
+# is a C-API extension that can't be statically embedded into the test runner
+# via extension_config.cmake the way splink_udfs is. `require` skips the file
+# when the extension isn't installed (e.g. in CI without a pre-install step).
+
+require us_geocoder
+
+require us_address_standardizer
+
+statement ok
+LOAD spatial;
+
+statement ok
+LOAD splink_udfs;
+
+# --- #1461c: parser parity for '0 353 Rte, Coppell, TX' ---------------------
+# PG's normalize_address yields streetname='353', streettypeabbrev='Rte'.
+# We delegate to PAGC via tiger.from_pagc(); assert the same fields land on
+# the from_pagc struct.
+
+query II
+SELECT (tiger.from_pagc('0 353 Rte, Coppell, TX'))['street_name'],
+       (tiger.from_pagc('0 353 Rte, Coppell, TX'))['street_type'];
+----
+353	Rte

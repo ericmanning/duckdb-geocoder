@@ -133,15 +133,6 @@ LIMIT 1;
 50	Weld	4
 
 # --- #1461c: parser parity for '0 353 Rte, Coppell, TX' ---------------------
-# PG's normalize_address yields streetname='353', streettypeabbrev='Rte'.
-# We delegate to PAGC via tiger.from_pagc(); assert the same fields land on
-# the from_pagc struct.
-
-statement ok
-LOAD us_address_standardizer;
-
-query II
-SELECT (tiger.from_pagc('0 353 Rte, Coppell, TX'))['street_name'],
-       (tiger.from_pagc('0 353 Rte, Coppell, TX'))['street_type'];
-----
-353	Rte
+# Moved to test/sql/pg_intersection_regress_pagc.test (gated on
+# `require us_address_standardizer` so CI skips the assertion when the
+# standardizer C-API extension isn't pre-installed).
