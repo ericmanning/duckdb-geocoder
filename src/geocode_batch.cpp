@@ -12,10 +12,10 @@
 //   SELECT * FROM geocode_batch((SELECT id, address, street_name,
 //                                       state_abbrev, zip FROM bench_input));
 //
-// Output (current MVP):
+// Output:
 //   <passthrough cols...>, rating BIGINT, lng DOUBLE, lat DOUBLE,
-//   adr_text VARCHAR
-// (Followups: geom GEOMETRY + adr STRUCT + GEOID columns.)
+//   adr_text VARCHAR, block_geoid VARCHAR, tract_geoid VARCHAR,
+//   blkgrp_geoid VARCHAR, containment_guaranteed BOOLEAN
 //
 // Pipeline:
 //   1. Buffer up to 100K input rows (NEED_MORE_INPUT until threshold or
@@ -200,11 +200,11 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 	}
 	bind_data->n_passthrough = bind_data->passthrough_input_indices.size();
 
-	// Geocoder result columns. Output mirrors what tiger.geocode returns
-	// minus geom GEOMETRY and adr STRUCT, which need catalog type lookups
-	// to declare from C++ and are deferred to a follow-up. Users get geom
-	// reconstituted via ST_Point(lng, lat) and pprint_adr-style rendering
-	// via adr_text.
+	// Geocoder result columns. The point geometry is returned shredded to
+	// (lng, lat) doubles — callers that want a GEOMETRY value can wrap with
+	// ST_Point(lng, lat). The matched address is rendered as a single string
+	// via tiger.pprint_adr; callers that need the structured form can re-cast
+	// the components from passthrough columns.
 	return_types.emplace_back(LogicalType::BIGINT);
 	names.emplace_back("rating");
 	return_types.emplace_back(LogicalType::DOUBLE);
