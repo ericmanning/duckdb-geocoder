@@ -5,6 +5,7 @@
 #include "us_geocoder_embedded_sql.hpp"
 #include "us_geocoder_loader.hpp"
 #include "vendored_soundex.hpp"
+#include "geocode_batch.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -147,6 +148,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register the C++ loader table functions (load_tiger_nation, load_tiger_state).
 	// These don't need spatial at load time; ST_Read only fires at invocation.
 	us_geocoder::RegisterLoaderFunctions(loader, kDefaultTigerSchema);
+
+	// tiger.geocode_batch — C++ table-in-out function for batched geocoding
+	// (works around the per-row LATERAL decorrelation that hangs the SQL
+	// macro on nationwide TIGER. See src/geocode_batch.cpp). SCAFFOLD only
+	// at present.
+	us_geocoder::RegisterGeocodeBatchFunction(loader);
 }
 
 void UsGeocoderExtension::Load(ExtensionLoader &loader) {
