@@ -48,12 +48,11 @@ struct StepTimer {
 		done = true;
 	}
 	~StepTimer() {
-		if (!done) {
-			// Path triggered on exception — log so the user sees where we failed.
-			auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-			fprintf(stderr, "[us_geocoder %s] %s: FAILED (%.1fs)\n", prefix.c_str(), step.c_str(), secs);
-			fflush(stderr);
-		}
+		// Intentionally silent on the failure path. The IOException thrown
+		// by ExecuteInsert already includes the step label (e.g. "us_geocoder
+		// loader (county_faces:019): IO Error..."), so a separate FAILED log
+		// here was redundant and noisy under sqllogictest's `statement error`
+		// path (where exceptions are an expected outcome).
 	}
 };
 
