@@ -32,16 +32,47 @@ ADDR_SQL_DK="concat_ws(', ',
     concat_ws(' ', NULLIF(city,''),
                    concat_ws(' ', NULLIF(state,''), NULLIF(zip,''))))"
 
-for size in "${SIZES[@]}"; do
+# Optional input filter for per-state-subset timings. Set STATE_FILTER to
+# any SQL boolean expression over bench_input columns (e.g. STATE_FILTER=
+# "state='AR'" or STATE_FILTER="state IN ('AR','CA','TX')") to constrain
+# the input. With it empty (default), all rows of bench_input are eligible.
+# This is the knob the parity scale-curve uses — single-state inputs let
+# geocode_batch dispatch a single per-state SQL (best amortization),
+# multi-state inputs pay per-state plan overhead × N distinct states.
+STATE_FILTER="${STATE_FILTER:-}"
+if [[ -n "$STATE_FILTER" ]]; then
+    INPUT_PRED="WHERE $STATE_FILTER"
+    LABEL_SUFFIX="-$(echo "$STATE_FILTER" | tr -dc 'A-Za-z0-9')"
+else
+    INPUT_PRED=""
+    LABEL_SUFFIX=""
+fi
+echo "Input filter: ${STATE_FILTER:-<none>}"
+echo ""
+
+# Word-split SIZES / DUCKDB_THREAD_COUNTS into proper arrays. Existing
+# config.sh defines them quoted, which yields a 1-element array containing
+# a space-separated string ("1000 10000 0") instead of three numbers.
+read -ra SIZES_ARR <<< "${SIZES[*]}"
+read -ra THREADS_ARR <<< "${DUCKDB_THREAD_COUNTS[*]}"
+
+for size in "${SIZES_ARR[@]}"; do
     if [[ "$size" -eq 0 ]]; then
-        LIMIT_SQL=""
-        LABEL="all"
+        LIMIT_SQL="$INPUT_PRED"
+        LABEL="all${LABEL_SUFFIX}"
     else
-        LIMIT_SQL="WHERE id IN (SELECT id FROM bench_input ORDER BY id LIMIT $size)"
-        LABEL="$size"
+        # When STATE_FILTER is set, the LIMIT applies AFTER the filter so
+        # we get N rows from the filtered population (not N from anywhere
+        # then filtered, which would silently shrink under tight filters).
+        if [[ -n "$INPUT_PRED" ]]; then
+            LIMIT_SQL="WHERE id IN (SELECT id FROM bench_input $INPUT_PRED ORDER BY id LIMIT $size)"
+        else
+            LIMIT_SQL="WHERE id IN (SELECT id FROM bench_input ORDER BY id LIMIT $size)"
+        fi
+        LABEL="${size}${LABEL_SUFFIX}"
     fi
 
-    for threads in "${DUCKDB_THREAD_COUNTS[@]}"; do
+    for threads in "${THREADS_ARR[@]}"; do
         if [[ "$threads" -eq 0 ]]; then
             THREAD_CMD=""
             THREAD_LABEL="default"
