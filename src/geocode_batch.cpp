@@ -89,10 +89,16 @@ struct BufferedRow {
 // One geocoder result. Tagged with input_idx so we can pair with passthrough.
 struct GeocodeResult {
 	idx_t input_idx;
-	Value rating;   // BIGINT or NULL
-	Value lng;      // DOUBLE or NULL
-	Value lat;      // DOUBLE or NULL
-	Value adr_text; // VARCHAR or NULL
+	Value rating;                 // BIGINT or NULL
+	Value lng;                    // DOUBLE or NULL
+	Value lat;                    // DOUBLE or NULL
+	Value adr_text;               // VARCHAR or NULL — pprint_adr(adr) rendering
+	Value block_geoid;            // VARCHAR or NULL — 15-digit FIPS block code
+	Value tract_geoid;            // VARCHAR or NULL — 11-digit FIPS tract code
+	Value blkgrp_geoid;           // VARCHAR or NULL — 12-digit FIPS block-group code
+	Value containment_guaranteed; // BOOLEAN or NULL — true iff edge_containment
+	                              // marked the matched side as fully inside the
+	                              // returned face/block/tract/blkgrp polygon
 };
 
 struct BatchGlobalState : public GlobalTableFunctionState {
@@ -195,7 +201,11 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 	}
 	bind_data->n_passthrough = bind_data->passthrough_input_indices.size();
 
-	// Geocoder result columns (MVP shape — geom + adr struct in a follow-up).
+	// Geocoder result columns. Output mirrors what tiger.geocode returns
+	// minus geom GEOMETRY and adr STRUCT, which need catalog type lookups
+	// to declare from C++ and are deferred to a follow-up. Users get geom
+	// reconstituted via ST_Point(lng, lat) and pprint_adr-style rendering
+	// via adr_text.
 	return_types.emplace_back(LogicalType::BIGINT);
 	names.emplace_back("rating");
 	return_types.emplace_back(LogicalType::DOUBLE);
@@ -204,6 +214,14 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 	names.emplace_back("lat");
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("adr_text");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("block_geoid");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("tract_geoid");
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("blkgrp_geoid");
+	return_types.emplace_back(LogicalType::BOOLEAN);
+	names.emplace_back("containment_guaranteed");
 
 	return std::move(bind_data);
 }
@@ -383,7 +401,9 @@ static void RunPerStateGeocode(Connection &conn, const std::string &statefp_lit,
 	    << " SELECT input.input_idx,"
 	    << " g.rating,"
 	    << " ST_X(g.geom) AS lng, ST_Y(g.geom) AS lat,"
-	    << " tiger.pprint_adr(g.adr) AS adr_text"
+	    << " tiger.pprint_adr(g.adr) AS adr_text,"
+	    << " g.block_geoid, g.tract_geoid, g.blkgrp_geoid,"
+	    << " g.containment_guaranteed"
 	    << " FROM input,"
 	    << " LATERAL tiger.geocode_address_for_state("
 	    << EscapeSqlLiteral(statefp_lit) << ", struct_arg, 1, NULL, 2.0) g"
@@ -401,6 +421,10 @@ static void RunPerStateGeocode(Connection &conn, const std::string &statefp_lit,
 			gr.lng = row->GetValue(2, r);
 			gr.lat = row->GetValue(3, r);
 			gr.adr_text = row->GetValue(4, r);
+			gr.block_geoid = row->GetValue(5, r);
+			gr.tract_geoid = row->GetValue(6, r);
+			gr.blkgrp_geoid = row->GetValue(7, r);
+			gr.containment_guaranteed = row->GetValue(8, r);
 			out.push_back(std::move(gr));
 		}
 	}
@@ -449,11 +473,9 @@ static void FlushBuffer(ClientContext &context, const BatchBindData &bind_data, 
 		GeocodeResult gr;
 		gr.input_idx = i;
 		if (it != by_input_idx.end()) {
-			gr.rating = it->second.rating;
-			gr.lng = it->second.lng;
-			gr.lat = it->second.lat;
-			gr.adr_text = it->second.adr_text;
-		} // else: leave defaults (NULL Values).
+			gr = std::move(it->second);
+			gr.input_idx = i; // re-stamp after move (paranoia)
+		} // else: leave defaults (all-NULL Values).
 		gstate.pending_output.push_back(std::move(gr));
 	}
 
@@ -479,6 +501,10 @@ static idx_t EmitFromQueue(const BatchBindData &bind_data, BatchGlobalState &gst
 		output.SetValue(base + 1, out_row, gr.lng);
 		output.SetValue(base + 2, out_row, gr.lat);
 		output.SetValue(base + 3, out_row, gr.adr_text);
+		output.SetValue(base + 4, out_row, gr.block_geoid);
+		output.SetValue(base + 5, out_row, gr.tract_geoid);
+		output.SetValue(base + 6, out_row, gr.blkgrp_geoid);
+		output.SetValue(base + 7, out_row, gr.containment_guaranteed);
 	}
 	output.SetCardinality(n);
 	gstate.output_emitted += n;
