@@ -24,6 +24,7 @@ file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/spatial_macros.sql.in SPATIAL_MACR
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/tiger_schema.sql.in TIGER_SCHEMA_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_location.sql.in GEOCODE_LOCATION_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_address.sql.in GEOCODE_ADDRESS_SQL)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_address_for_state.sql.in GEOCODE_ADDRESS_FOR_STATE_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode.sql.in GEOCODE_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_intersection.sql.in GEOCODE_INTERSECTION_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/reverse_geocode.sql.in REVERSE_GEOCODE_SQL)
@@ -76,6 +77,12 @@ ${GEOCODE_LOCATION_SQL}
 inline const std::string &GeocodeAddressSql() {
   static const std::string data(R\"USGSQLBLK(
 ${GEOCODE_ADDRESS_SQL}
+)USGSQLBLK\");
+  return data;
+}
+inline const std::string &GeocodeAddressForStateSql() {
+  static const std::string data(R\"USGSQLBLK(
+${GEOCODE_ADDRESS_FOR_STATE_SQL}
 )USGSQLBLK\");
   return data;
 }
@@ -140,6 +147,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/tiger_schema.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_location.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_address.sql.in
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_address_for_state.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_intersection.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/reverse_geocode.sql.in

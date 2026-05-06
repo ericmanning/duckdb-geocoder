@@ -120,6 +120,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TryRegisterOptional(conn, us_geocoder::TigerSchemaSql(), kDefaultTigerSchema);
 	TryRegisterOptional(conn, us_geocoder::GeocodeLocationSql(), kDefaultTigerSchema);
 	TryRegisterOptional(conn, us_geocoder::GeocodeAddressSql(), kDefaultTigerSchema);
+	TryRegisterOptional(conn, us_geocoder::GeocodeAddressForStateSql(), kDefaultTigerSchema);
 	TryRegisterOptional(conn, us_geocoder::GeocodeSql(), kDefaultTigerSchema);
 	TryRegisterOptional(conn, us_geocoder::GeocodeIntersectionSql(), kDefaultTigerSchema);
 	TryRegisterOptional(conn, us_geocoder::ReverseGeocodeSql(), kDefaultTigerSchema);
