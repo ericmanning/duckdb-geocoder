@@ -21,14 +21,21 @@ echo "Exporting DuckDB results ..."
 DK_START=$(python3 -c "import time; print(time.time())")
 "$DUCKDB_BIN" "$DUCKDB_DB" <<SQL >/dev/null
 LOAD us_geocoder; LOAD spatial; LOAD us_address_standardizer;
+-- Uses geocode_batch (C++ table function w/ per-state literal-statefp
+-- dispatch). The input subquery's `state` column passes through to the
+-- output as `input_state`; geocode_batch detects `addr_str` and uses
+-- Form 1 (freeform → from_pagc internally). Other named columns
+-- (addr1/addr2/city/zip) would also be consumed if present, so we wrap
+-- them under aliases that don't collide with the recognized field names.
 COPY (
-    SELECT a.id,
-           a.state AS input_state,
-           g.rating,
-           ST_X(g.geom) AS lng,
-           ST_Y(g.geom) AS lat,
-           tiger.pprint_adr(g.adr) AS adr_text
-    FROM bench_input a, LATERAL tiger.geocode(tiger.from_pagc($ADDR_SQL_DK), 1, NULL, 'none') g
+    SELECT id, input_state, rating, lng, lat, adr_text,
+           block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
+    FROM geocode_batch((
+        SELECT a.id,
+               a.state AS input_state,
+               $ADDR_SQL_DK AS addr_str
+        FROM bench_input a
+    ))
 ) TO '$DK_CSV' (HEADER, DELIMITER ',', NULL '');
 CHECKPOINT;
 SQL

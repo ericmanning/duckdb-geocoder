@@ -181,20 +181,19 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 	}
 	bind_data->form_freeform = has_addr_str;
 
+	// Recognized geocoder-input columns are CONSUMED — they don't appear in
+	// the output schema. Callers who want to see their input string (or any
+	// pre-parsed field) should select it under a different name. Everything
+	// else passes through unchanged.
 	auto is_consumed = [&](idx_t i) {
-		if (bind_data->form_freeform) {
-			return i == bind_data->addr_str_idx;
-		}
-		return i == bind_data->address_idx || i == bind_data->street_name_idx ||
-		       i == bind_data->street_type_idx || i == bind_data->internal_idx ||
-		       i == bind_data->pre_dir_idx || i == bind_data->post_dir_idx ||
-		       i == bind_data->location_idx || i == bind_data->state_abbrev_idx ||
-		       i == bind_data->zip_idx;
+		return i == bind_data->addr_str_idx || i == bind_data->address_idx ||
+		       i == bind_data->street_name_idx || i == bind_data->street_type_idx ||
+		       i == bind_data->internal_idx || i == bind_data->pre_dir_idx ||
+		       i == bind_data->post_dir_idx || i == bind_data->location_idx ||
+		       i == bind_data->state_abbrev_idx || i == bind_data->zip_idx;
 	};
 	for (idx_t i = 0; i < input.input_table_names.size(); i++) {
-		if (is_consumed(i)) {
-			continue;
-		}
+		if (is_consumed(i)) continue;
 		bind_data->passthrough_input_indices.push_back(i);
 		return_types.emplace_back(input.input_table_types[i]);
 		names.emplace_back(input.input_table_names[i]);

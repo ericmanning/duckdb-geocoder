@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# Benchmark tiger.geocode() on DuckDB across SIZES × THREADS × RUNS. Logs
+# Benchmark geocode_batch on DuckDB across SIZES × THREADS × RUNS. Logs
 # wall-clock timings to $RESULTS_DIR/timings.tsv.
+#
+# Uses the C++ geocode_batch table function (table-valued input, partitions
+# by resolved statefp internally, dispatches per-state SQL with literal
+# WHERE statefp='<lit>' so the planner uses ART pushdown). The previous
+# LATERAL macro form (`tiger.geocode(tiger.from_pagc(s))`) hung at
+# nationwide scale due to the dynamic-statefp planning issue — see
+# CLAUDE.md / commits on perf/geocode-batch-planning for the diagnosis.
 #
 # Methodology mirrors the standardizer benchmark:
 #   - One CTAS into a TEMP TABLE per run, captured via .timer on.
@@ -51,13 +58,14 @@ LOAD us_geocoder; LOAD spatial; LOAD us_address_standardizer;
 $THREAD_CMD
 .timer on
 CREATE TEMP TABLE _bench_geocode AS
-SELECT a.id,
-       g.rating,
-       ST_X(g.geom) AS lng,
-       ST_Y(g.geom) AS lat,
-       tiger.pprint_adr(g.adr) AS adr_text
-FROM bench_input a, LATERAL tiger.geocode(tiger.from_pagc($ADDR_SQL_DK), 1, NULL, 'none') g
-$LIMIT_SQL;
+SELECT id, rating, lng, lat, adr_text,
+       block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
+FROM geocode_batch((
+    SELECT a.id,
+           $ADDR_SQL_DK AS addr_str
+    FROM bench_input a
+    $LIMIT_SQL
+));
 DROP TABLE _bench_geocode;
 -- TEMP table doesn't itself need a checkpoint, but the LOAD us_geocoder
 -- on first open creates session-private temp tiger refs. Force a clean
