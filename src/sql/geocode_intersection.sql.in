@@ -194,7 +194,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_intersection(
             location     := in_city,
             state_abbrev := in_state,
             zip          := in_zip
-        )::@TIGER@.geocode_input AS addy,
+        )::@TIGER@.geocode_input AS adr,
         geom,
         rating
     FROM deduped

@@ -96,22 +96,17 @@ echo "--- post-load: install_missing_indexes ---"
 "\$PSQL" -c "SELECT tiger.install_missing_indexes()"
 
 echo
-echo "--- row counts ---"
-# Tiger partition tables live in the tiger_data schema. Schema-qualify to
-# avoid relying on search_path resolution for names like state/county_all
-# (which exist in tiger_data, not tiger).
+echo "--- row counts (parent tables; inheritance aggregates per-state children) ---"
 "\$PSQL" -c "
-SELECT 'state_all' AS tbl, COUNT(*) FROM tiger_data.state_all UNION ALL
-SELECT 'county_all',       COUNT(*) FROM tiger_data.county_all UNION ALL
-SELECT 'zcta5_all',        COUNT(*) FROM tiger_data.zcta5_all UNION ALL
-SELECT 'ma_place',         COUNT(*) FROM tiger_data.ma_place UNION ALL
-SELECT 'ma_edges',         COUNT(*) FROM tiger_data.ma_edges UNION ALL
-SELECT 'ma_addr',          COUNT(*) FROM tiger_data.ma_addr UNION ALL
-SELECT 'ma_featnames',     COUNT(*) FROM tiger_data.ma_featnames UNION ALL
-SELECT 'ma_faces',         COUNT(*) FROM tiger_data.ma_faces UNION ALL
-SELECT 'mn_edges',         COUNT(*) FROM tiger_data.mn_edges UNION ALL
-SELECT 'mn_addr',          COUNT(*) FROM tiger_data.mn_addr UNION ALL
-SELECT 'mn_featnames',     COUNT(*) FROM tiger_data.mn_featnames
+SELECT 'state'     AS tbl, COUNT(*) FROM tiger.state     UNION ALL
+SELECT 'county',           COUNT(*) FROM tiger.county    UNION ALL
+SELECT 'place',            COUNT(*) FROM tiger.place     UNION ALL
+SELECT 'cousub',           COUNT(*) FROM tiger.cousub    UNION ALL
+SELECT 'zcta5',            COUNT(*) FROM tiger.zcta5     UNION ALL
+SELECT 'edges',            COUNT(*) FROM tiger.edges     UNION ALL
+SELECT 'faces',            COUNT(*) FROM tiger.faces     UNION ALL
+SELECT 'featnames',        COUNT(*) FROM tiger.featnames UNION ALL
+SELECT 'addr',             COUNT(*) FROM tiger.addr
 ORDER BY tbl;"
 EOF
 

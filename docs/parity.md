@@ -84,12 +84,12 @@ All three limitations are **false-negatives only** — `containment_guaranteed =
    ```
    ```sql
    -- DuckDB:
-   SELECT rating, ST_AsText(geom), (addy).* FROM tiger.geocode(
+   SELECT rating, ST_AsText(geom), (adr).* FROM tiger.geocode(
        tiger.from_pagc('120 Benefit St, Providence RI 02903'), 3, NULL, 'none')
    ORDER BY rating;
    ```
 
-Expect identical `rating` values, identical `(addy)` contents, and geometry within ~1 m. Wider divergence typically means a difference in PAGC rules version, TIGER vintage, or a rating tie boundary (D7).
+Expect identical `rating` values, identical `(adr)` contents, and geometry within ~1 m. Wider divergence typically means a difference in PAGC rules version, TIGER vintage, or a rating tie boundary (D7).
 
 ## Parity test layout
 
@@ -123,7 +123,7 @@ Then:
 ./scripts/parity/run_reverse_geocode_regress.sh pg_parity.duckdb
 ```
 
-Output is a per-test `match` / `diverge` / `missing` tally with diffs inlined. **Match** means identical `pprint_addy(addy)` + 4-decimal-truncated `POINT(lng lat)` + integer rating.
+Output is a per-test `match` / `diverge` / `missing` tally with diffs inlined. **Match** means identical `pprint_adr(adr)` + 4-decimal-truncated `POINT(lng lat)` + integer rating.
 
 The Docker image at [scripts/parity/pg_compare/](../scripts/parity/pg_compare/) builds the PG side (PG 16 + PostGIS + upstream `address_standardizer` + `postgis_tiger_geocoder`) so the oracle in [test/parity/upstream/](../test/parity/upstream/) can be regenerated. See the script headers for full reproduce instructions.
 
@@ -137,7 +137,7 @@ Three mechanisms produce *better* results than PG-with-PAGC on certain inputs. A
 
 ### Status
 
-Strict-match parity against PG-2025-PAGC: **34/51** (`pprint_addy(addy)` + 4-decimal-truncated `POINT(lng lat)` + integer rating identical up to per-test `max_n`).
+Strict-match parity against PG-2025-PAGC: **34/51** (`pprint_adr(adr)` + 4-decimal-truncated `POINT(lng lat)` + integer rating identical up to per-test `max_n`).
 
 All 17 remaining divergences fall into three classes — none are bugs in our code. Per-test breakdown in [parity-divergences.md](parity-divergences.md). One-line summary:
 

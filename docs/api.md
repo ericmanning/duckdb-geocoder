@@ -212,7 +212,7 @@ The main geocoder. Returns up to `max_results` candidate matches, ordered by `ra
 **Returns:**
 | column | type | meaning |
 |---|---|---|
-| `addy` | `tiger.geocode_input` | canonicalized matched address (name/type/dir from TIGER; location resolved via place → cousub → county; zip from `addr.zip`) |
+| `adr` | `tiger.geocode_input` | canonicalized matched address (name/type/dir from TIGER; location resolved via place → cousub → county; zip from `addr.zip`) |
 | `geom` | `GEOMETRY` | interpolated point, EPSG:4269, 10m offset to the matched side of the street |
 | `rating` | `INTEGER` | quality score, lower is better (see [Rating scale](#rating-scale)) |
 | `block_geoid` | `VARCHAR(15)` | 2020 census block GEOID of the matched side (always populated when `edge_containment` is built) |
@@ -263,7 +263,7 @@ SELECT rating, ST_AsText(geom)
 FROM tiger.geocode_intersection('Benefit', 'Meeting', 'RI', 'Providence', '02903', 3);
 ```
 
-Returns `(addy, geom, rating)`. Output geom is the shared endpoint of the first road's edge.
+Returns `(adr, geom, rating)`. Output geom is the shared endpoint of the first road's edge.
 
 **Pre-normalization.** Each road input is internally synthesized into a fake address (`'0 ' || road || ', ' || city || ', ' || state || ' ' || zip`) and parsed via [`tiger.from_pagc`](#tigerfrom_pagcraw_text-varchar--tigergeocode_input), mirroring PG's `normalize_address` step in [PostGIS' geocode_intersection.sql:42-43](https://gitea.osgeo.org/postgis/postgis_tiger_geocoder/src/branch/main/src/geocode/geocode_intersection.sql#L42-L43). This strips periods (`'N. Belt Line'` → `'N BELT LINE'`), expands directionals, and generally reduces input variance. Requires `us_address_standardizer` to be loaded at call time — the extension auto-loads it.
 
@@ -272,7 +272,7 @@ Returns `(addy, geom, rating)`. Output geom is the shared endpoint of the first 
 Given a point, returns the nearest street candidates.
 
 ```sql
-SELECT rank, street, (addy).address, (addy).location, dist_m
+SELECT rank, street, (adr).address, (adr).location, dist_m
 FROM tiger.reverse_geocode(ST_Point(-71.40882, 41.82993), 5)
 ORDER BY rank;
 ```

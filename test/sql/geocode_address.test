@@ -7,7 +7,6 @@ require us_geocoder
 statement ok
 LOAD spatial;
 
-require splink_udfs
 
 # Fixture: one edge on Meeting St in Providence RI (statefp=44).
 # 100-block, addresses 100–199 on the right side (odd parity), 101-199 on left.
@@ -77,7 +76,7 @@ true
 
 # Location populated from adjacent place polygon.
 query I
-SELECT (addy).location
+SELECT (adr).location
 FROM tiger.geocode_address_impl(
     CAST({
         address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,

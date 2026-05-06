@@ -81,13 +81,13 @@ echo "Loaded $n_inputs test cases from $INPUTS"
 # (whitespace squeezed, NULL fields elided). We replicate this with a SQL macro.
 echo "Running our geocoder against $REF_DB ..."
 "$DUCKDB_BIN" "$REF_DB" 2>/dev/null <<EOF > "$ACTUAL"
-LOAD us_geocoder; LOAD spatial; LOAD splink_udfs;
+LOAD us_geocoder; LOAD spatial;
 LOAD us_address_standardizer;
 .mode list
 .separator '|'
 .headers off
 
--- Use the extension's tiger.pprint_addy (handles is_hw type-prepending).
+-- Use the extension's tiger.pprint_adr (handles is_hw type-prepending).
 
 -- DuckDB rejects correlated columns inside the geocode() macro's
 -- internal LIMIT. Workaround: ask for up to 50 candidates (largest
@@ -100,7 +100,7 @@ WITH inputs AS (
 ),
 geocoded AS (
     SELECT inputs.test_id, inputs.raw AS target, inputs.max_n,
-           inputs.is_batched, g.addy, g.rating,
+           inputs.is_batched, g.adr, g.rating,
            -- Snap to PG's 5-decimal grid so the tiebreak ORDER BY is stable.
            tiger.st_snaptogrid(g.geom, 0.00001) AS snapped,
            ROW_NUMBER() OVER (
@@ -113,7 +113,7 @@ geocoded AS (
     CROSS JOIN LATERAL tiger.geocode(tiger.from_pagc(raw), 50, NULL, 'none') AS g
 )
 SELECT
-    test_id || '|' || tiger.pprint_addy(addy)
+    test_id || '|' || tiger.pprint_adr(adr)
         || CASE WHEN is_batched = 1 THEN '|' || target ELSE '' END
         -- PG renders ST_AsText(ST_SnapToGrid(geom,0.00001)) with trailing
         -- zeros ("42.35900"); duckdb-spatial's ST_AsText drops them. Use

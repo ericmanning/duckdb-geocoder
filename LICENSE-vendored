@@ -1,0 +1,47 @@
+us_geocoder vendors a small amount of MIT-licensed code from third parties.
+The full attribution + copyright notices are reproduced here, as required by
+the respective licenses. The vendored source files themselves carry inline
+attribution at the top of each file.
+
+==============================================================================
+splink_udfs — Soundex implementation
+==============================================================================
+
+Vendored file: src/include/vendored_soundex.hpp
+Source:        https://github.com/moj-analytical-services/splink_udfs/blob/main/src/include/phonetic/soundex.hpp
+
+The header is a self-contained C++ Soundex encoder. We use it via the
+`soundex` scalar function registered in src/us_geocoder_extension.cpp.
+Vendoring this single file lets us drop the splink_udfs runtime dependency
+(see CLAUDE.md / README.md "Runtime dependencies"), keeping us_geocoder's
+install footprint to just core DuckDB + spatial + (optionally)
+us_address_standardizer.
+
+The original splink_udfs LICENSE:
+
+  MIT License
+
+  Copyright (c) 2025 Ministry of Justice
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+splink_udfs's soundex.hpp itself acknowledges Rob Tillaart's MIT-licensed
+Arduino Soundex library (https://github.com/RobTillaart/Soundex) as the
+algorithmic inspiration. That attribution is preserved verbatim in
+src/include/vendored_soundex.hpp.

@@ -111,5 +111,6 @@ Benchmarked on NJ (21 counties, 86 zips, ~800K edges) in April 2026. Details in 
 See end of [geocode_flow.md § 14.9](geocode_flow.md). Active deferred work:
 - Phase 12: PG-regress parity ports + 10k-row random-sample corpus.
 - Phase 14: cross-platform CI via [.github/workflows/MainDistributionPipeline.yml](.github/workflows/MainDistributionPipeline.yml) + community-extensions submission.
-- Real parallel HTTPS loads (`read_blob` prefetch, or upstream `UNION ALL` + `ST_Read` parallelization fix in DuckDB/spatial).
+- Real parallel HTTPS loads at the loader layer — only viable path left is upstream `UNION ALL` + `ST_Read` parallelization in DuckDB/spatial. `read_blob` prefetch / parallel INSERT / parallel CTAS were all tried and reverted (see Loader performance notes above).
 - Parquet distribution (prebuilt per-state parquet for faster first-run UX).
+- All-states pre-download → local-ingest → cleanup wrapper. Loop [`scripts/parallel_download_state.sh`](scripts/parallel_download_state.sh) over 50+DC, ingesting each state then `rm -rf` of its zips before the next, so disk stays bounded by `max(state_size)` (~10 GB worst case for TX). With resumable loads + retry-with-backoff already shipped, a failed state just resumes on next pass. ~30-line wrapper around the existing script. Queue after parity benchmark.

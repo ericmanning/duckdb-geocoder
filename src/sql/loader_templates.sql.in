@@ -68,12 +68,12 @@ FROM ST_Read('@VSIPATH@')
 -- @SECTION:county_featnames_insert@
 -- name_lower, fullname_norm, and name_soundex are precomputed equi-join
 -- keys used by geocode_address_impl (name match), cutting the Stage A
--- filter from ~15s to ~50ms on a full-state batch. name_soundex needs
--- splink_udfs loaded (LoadInternal auto-loads it).
-INSERT INTO @TIGER@.featnames (statefp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc, name_lower, fullname_norm, name_soundex)
+-- filter from ~15s to ~50ms on a full-state batch. soundex is a built-in
+-- scalar function registered by LoadInternal (see vendored_soundex.hpp).
+INSERT INTO @TIGER@.featnames (statefp, countyfp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc, name_lower, fullname_norm, name_soundex)
 
 -- @SECTION:county_featnames_branch@
-SELECT '@STATEFP@', TLID, NAME, FULLNAME,
+SELECT '@STATEFP@', '@COUNTYFP@', TLID, NAME, FULLNAME,
        NULLIF(PREDIRABRV, ''), NULLIF(PRETYPABRV, ''), NULLIF(PREQUALABR, ''),
        NULLIF(SUFTYPABRV, ''), NULLIF(SUFDIRABRV, ''), MTFCC,
        lower(NAME),
@@ -82,14 +82,16 @@ SELECT '@STATEFP@', TLID, NAME, FULLNAME,
 FROM ST_Read('@VSIPATH@')
 
 -- @SECTION:county_addr_insert@
-INSERT INTO @TIGER@.addr (statefp, tlid, fromhn, tohn, side, zip, plus4)
+INSERT INTO @TIGER@.addr (statefp, countyfp, tlid, fromhn, tohn, side, zip, plus4)
 
 -- @SECTION:county_addr_branch@
-SELECT '@STATEFP@', TLID, FROMHN, TOHN, SIDE, NULLIF(ZIP, ''), NULLIF(PLUS4, '')
+SELECT '@STATEFP@', '@COUNTYFP@', TLID, FROMHN, TOHN, SIDE, NULLIF(ZIP, ''), NULLIF(PLUS4, '')
 FROM ST_Read('@VSIPATH@')
 
 -- @SECTION:derived_zip_state@
--- per-state zip → (stusps, statefp) from edges' zipl/zipr
+-- per-state zip → (stusps, statefp) from edges' zipl/zipr.
+-- No NOT EXISTS guard: unload_state above DELETEs every zip_state row for
+-- this statefp, so the target is empty for this state by construction.
 INSERT INTO @TIGER@.zip_state (zip, stusps, statefp)
 SELECT DISTINCT z.zip, st.stusps, '@STATEFP@'
 FROM (
@@ -97,26 +99,36 @@ FROM (
     UNION
     SELECT zipr AS zip FROM @TIGER@.edges WHERE statefp = '@STATEFP@' AND zipr IS NOT NULL
 ) z
-JOIN @TIGER@.state st ON st.statefp = '@STATEFP@'
-WHERE NOT EXISTS (
-    SELECT 1 FROM @TIGER@.zip_state WHERE zip = z.zip AND statefp = '@STATEFP@'
-);
+JOIN @TIGER@.state st ON st.statefp = '@STATEFP@';
 
 -- @SECTION:derived_zip_state_loc@
+-- No NOT EXISTS guard: unload_state DELETEs every zip_state_loc row for
+-- this statefp before this INSERT runs.
+--
+-- The semantically-equivalent OR-on-join `fc.tfid = e.tfidl OR fc.tfid =
+-- e.tfidr` makes DuckDB's planner fall back to a nested-loop join (edges×
+-- faces) — pathological at state scale (e.g. AL = ~1.5M edges × ~80K faces).
+-- Splitting into UNION ALL of two equality joins lets each half run as a
+-- hash join. Output is bytewise identical because for each edge the OR
+-- form would have visited both faces anyway.
+WITH edge_face AS (
+    SELECT e.zipl, e.zipr, fc.placefp
+    FROM @TIGER@.edges e
+    JOIN @TIGER@.faces fc ON fc.statefp = e.statefp AND fc.tfid = e.tfidl
+    WHERE e.statefp = '@STATEFP@'
+    UNION ALL
+    SELECT e.zipl, e.zipr, fc.placefp
+    FROM @TIGER@.edges e
+    JOIN @TIGER@.faces fc ON fc.statefp = e.statefp AND fc.tfid = e.tfidr
+    WHERE e.statefp = '@STATEFP@'
+)
 INSERT INTO @TIGER@.zip_state_loc (zip, stusps, statefp, place)
 SELECT DISTINCT z.zip, st.stusps, '@STATEFP@', pl.name
-FROM @TIGER@.edges e
-JOIN @TIGER@.faces fc ON fc.statefp = e.statefp
-     AND (fc.tfid = e.tfidl OR fc.tfid = e.tfidr)
-JOIN @TIGER@.place pl ON pl.statefp = fc.statefp AND pl.placefp = fc.placefp
+FROM edge_face ef
+JOIN @TIGER@.place pl ON pl.statefp = '@STATEFP@' AND pl.placefp = ef.placefp
 JOIN @TIGER@.state st ON st.statefp = '@STATEFP@'
-CROSS JOIN LATERAL (VALUES (e.zipl), (e.zipr)) AS z(zip)
-WHERE e.statefp = '@STATEFP@'
-  AND z.zip IS NOT NULL
-  AND NOT EXISTS (
-      SELECT 1 FROM @TIGER@.zip_state_loc
-      WHERE zip = z.zip AND statefp = '@STATEFP@' AND place = pl.name
-  );
+CROSS JOIN LATERAL (VALUES (ef.zipl), (ef.zipr)) AS z(zip)
+WHERE z.zip IS NOT NULL;
 
 -- @SECTION:derived_zcta5_clip@
 -- Per-state ZCTA clipping (geocode_flow.md §14.9). For each ZCTA whose
@@ -190,23 +202,29 @@ LEFT JOIN @TIGER@.faces f_r ON f_r.statefp = e.statefp AND f_r.tfid = e.tfidr
 WHERE e.statefp = '@STATEFP@';
 
 -- @SECTION:derived_zip_lookup_base@
+-- No NOT EXISTS guard: unload_state DELETEs every zip_lookup_base row for
+-- this statefp before this INSERT runs. UNION-ALL the two face matches
+-- explicitly to avoid the OR-on-join → nested-loop fallback (see notes on
+-- derived_zip_state_loc above for details).
+WITH edge_face AS (
+    SELECT e.zipl, e.zipr, fc.placefp, fc.countyfp
+    FROM @TIGER@.edges e
+    JOIN @TIGER@.faces fc ON fc.statefp = e.statefp AND fc.tfid = e.tfidl
+    WHERE e.statefp = '@STATEFP@'
+    UNION ALL
+    SELECT e.zipl, e.zipr, fc.placefp, fc.countyfp
+    FROM @TIGER@.edges e
+    JOIN @TIGER@.faces fc ON fc.statefp = e.statefp AND fc.tfid = e.tfidr
+    WHERE e.statefp = '@STATEFP@'
+)
 INSERT INTO @TIGER@.zip_lookup_base (zip, state, county, city, statefp)
 SELECT DISTINCT z.zip, st.stusps, c.name, pl.name, '@STATEFP@'
-FROM @TIGER@.edges e
-JOIN @TIGER@.faces fc ON fc.statefp = e.statefp
-     AND (fc.tfid = e.tfidl OR fc.tfid = e.tfidr)
-LEFT JOIN @TIGER@.place pl ON pl.statefp = fc.statefp AND pl.placefp = fc.placefp
-JOIN @TIGER@.county c ON c.statefp = e.statefp AND c.countyfp = fc.countyfp
+FROM edge_face ef
+LEFT JOIN @TIGER@.place pl ON pl.statefp = '@STATEFP@' AND pl.placefp = ef.placefp
+JOIN @TIGER@.county c ON c.statefp = '@STATEFP@' AND c.countyfp = ef.countyfp
 JOIN @TIGER@.state st ON st.statefp = '@STATEFP@'
-CROSS JOIN LATERAL (VALUES (e.zipl), (e.zipr)) AS z(zip)
-WHERE e.statefp = '@STATEFP@'
-  AND z.zip IS NOT NULL
-  AND NOT EXISTS (
-      SELECT 1 FROM @TIGER@.zip_lookup_base
-      WHERE zip = z.zip AND statefp = '@STATEFP@'
-        AND city IS NOT DISTINCT FROM pl.name
-        AND county = c.name
-  );
+CROSS JOIN LATERAL (VALUES (ef.zipl), (ef.zipr)) AS z(zip)
+WHERE z.zip IS NOT NULL;
 
 -- @SECTION:unload_state@
 DELETE FROM @TIGER@.edges            WHERE statefp = '@STATEFP@';

@@ -7,7 +7,6 @@ require us_geocoder
 statement ok
 LOAD spatial;
 
-require splink_udfs
 
 statement ok
 INSERT INTO tiger.state (statefp, stusps, name, the_geom) VALUES
@@ -54,7 +53,7 @@ INSERT INTO tiger.addr (statefp, tlid, fromhn, tohn, side, zip, plus4) VALUES
 
 # Point near the midpoint of Meeting St.
 query III
-SELECT rank, street, (addy).location
+SELECT rank, street, (adr).location
 FROM tiger.reverse_geocode(ST_Point(-71.404, 41.826), 5)
 ORDER BY rank;
 ----
@@ -71,7 +70,7 @@ true
 
 # Interpolated house number in range [100, 198].
 query I
-SELECT (addy).address BETWEEN 100 AND 198
+SELECT (adr).address BETWEEN 100 AND 198
 FROM tiger.reverse_geocode(ST_Point(-71.404, 41.826), 5)
 ORDER BY rank
 LIMIT 1;
@@ -80,7 +79,7 @@ true
 
 # ZIP pulled from the adjacent ZCTA.
 query I
-SELECT (addy).zip
+SELECT (adr).zip
 FROM tiger.reverse_geocode(ST_Point(-71.404, 41.826), 5)
 ORDER BY rank
 LIMIT 1;

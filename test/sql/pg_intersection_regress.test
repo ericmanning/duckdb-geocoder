@@ -13,7 +13,6 @@ require us_geocoder
 statement ok
 LOAD spatial;
 
-require splink_udfs
 
 # --- Synthetic Coppell, TX fixture (PG #1461 regress data) -------------------
 # state_lookup is preseeded by LoadInternal; statefp=48 = Texas.
@@ -78,7 +77,7 @@ INSERT INTO tiger.addr (statefp, tlid, fromhn, tohn, side, zip) VALUES
 # OR-name. Documented in docs/parity.md.
 
 query II
-SELECT (addy).address, (addy).street_name
+SELECT (adr).address, (adr).street_name
 FROM tiger.geocode_intersection('N Belt Line', 'I- 635', 'TX', 'Coppell', NULL, 1)
 ORDER BY rating
 LIMIT 1;
@@ -99,7 +98,7 @@ LIMIT 1;
 # which catches PAGC's over-split mis-tokenization.
 
 query II
-SELECT (addy).address, (addy).street_name
+SELECT (adr).address, (adr).street_name
 FROM tiger.geocode_intersection('N. Belt Line', 'I- 635', 'TX', 'Coppell', NULL, 1)
 ORDER BY rating
 LIMIT 1;
@@ -113,7 +112,7 @@ LIMIT 1;
 # intersection address matches PG.
 
 query II
-SELECT (addy).address, (addy).street_name
+SELECT (adr).address, (adr).street_name
 FROM tiger.geocode_intersection('N Belt Line', 'I-635', 'TX', 'Coppell', NULL, 1)
 ORDER BY rating
 LIMIT 1;
@@ -124,7 +123,7 @@ LIMIT 1;
 # PG expected: 50 Weld Ave, Coppell, TX 75019  rating=4 — bytewise match.
 
 query III
-SELECT (addy).address, (addy).street_name, rating
+SELECT (adr).address, (adr).street_name, rating
 FROM tiger.geocode_intersection('Weld', 'School', 'TX', 'Coppell', NULL, 1)
 ORDER BY rating
 LIMIT 1;

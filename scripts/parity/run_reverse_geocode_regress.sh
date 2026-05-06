@@ -19,7 +19,7 @@
 #
 # Output:
 #   - /tmp/parity_reverse_actual.txt — our outputs canonicalized to
-#     <test_id>|<pprint_addy(rank=1)>
+#     <test_id>|<pprint_adr(rank=1)>
 #   - stdout: per-test match/diverge summary + final tally. Exit 0 if all
 #     match, 1 otherwise.
 
@@ -56,7 +56,7 @@ n_inputs=$(($(wc -l < "$INPUTS") - 1))
 echo "Loaded $n_inputs test points from $INPUTS"
 
 # For each (test_id, lng, lat) row, take rank=1 from tiger.reverse_geocode and
-# format with tiger.pprint_addy(addy). One DuckDB invocation per row keeps the
+# format with tiger.pprint_adr(adr). One DuckDB invocation per row keeps the
 # macro CTE chain self-contained — wrapping multiple calls in a single LATERAL
 # trips DuckDB's scalar-subquery cardinality check on the macro's internal
 # (SELECT ... LIMIT 1) lookups.
@@ -65,11 +65,11 @@ echo "Running our reverse_geocoder against $REF_DB ..."
 while IFS=, read -r test_id lng lat _note; do
     [[ "$test_id" == "test_id" ]] && continue
     "$DUCKDB_BIN" "$REF_DB" 2>/dev/null <<EOF >> "$ACTUAL"
-LOAD us_geocoder; LOAD spatial; LOAD splink_udfs;
+LOAD us_geocoder; LOAD spatial;
 .mode list
 .separator '|'
 .headers off
-SELECT '${test_id}|' || tiger.pprint_addy(addy)
+SELECT '${test_id}|' || tiger.pprint_adr(adr)
 FROM tiger.reverse_geocode(ST_Point(${lng}, ${lat}), 5)
 WHERE rank = 1;
 EOF

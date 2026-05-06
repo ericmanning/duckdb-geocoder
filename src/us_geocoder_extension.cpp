@@ -4,9 +4,11 @@
 #include "us_geocoder_embed.hpp"
 #include "us_geocoder_embedded_sql.hpp"
 #include "us_geocoder_loader.hpp"
+#include "vendored_soundex.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/vector_operations/unary_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
@@ -24,6 +26,28 @@ inline void UsGeocoderVersionFun(DataChunk &args, ExpressionState &state, Vector
 	UsGeocoderExtension ext;
 	result.SetValue(0, Value(ext.Version()));
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+}
+
+// Vectorized wrapper around the vendored Soundex encoder. NULL inputs and
+// empty strings both map to "0000" (matches Postgres' soundex() and the
+// upstream splink_udfs implementation we vendored from). The encoder owns
+// its 12-byte output buffer; we copy each chunk's result into the result
+// vector via StringVector::AddString before the next call clobbers it.
+static void SoundexScalarFn(DataChunk &args, ExpressionState &state, Vector &result) {
+	const idx_t count = args.size();
+	auto &input = args.data[0];
+	::us_geocoder::phonetic::Soundex encoder;
+	UnaryExecutor::Execute<string_t, string_t>(input, result, count, [&](string_t val) -> string_t {
+		if (val.GetSize() == 0) {
+			return StringVector::AddString(result, "0000");
+		}
+		// Copy the input to a NUL-terminated stack/heap buffer; string_t isn't
+		// guaranteed to be NUL-terminated, but the encoder reads char-by-char
+		// until it hits a NUL.
+		std::string nul_terminated(val.GetData(), val.GetSize());
+		const char *code = encoder.Encode(nul_terminated.c_str());
+		return StringVector::AddString(result, code);
+	});
 }
 
 static void ExecuteEmbeddedSql(Connection &conn, const std::string &sql, const std::string &tiger_schema) {
@@ -48,6 +72,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto version_fn = ScalarFunction("us_geocoder_version", {}, LogicalType::VARCHAR, UsGeocoderVersionFun);
 	loader.RegisterFunction(version_fn);
 
+	// Vendored from splink_udfs (MIT) — see src/include/vendored_soundex.hpp.
+	// Registered unconditionally so the geocoder's name-match branches and
+	// the loader's name_soundex precompute work without any community-
+	// extension dependency. Fixed 4-char encoding (matches Postgres).
+	auto soundex_fn = ScalarFunction("soundex", {LogicalType::VARCHAR}, LogicalType::VARCHAR, SoundexScalarFn);
+	loader.RegisterFunction(soundex_fn);
+
 	auto &db = loader.GetDatabaseInstance();
 	Connection conn(db);
 
@@ -70,7 +101,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		ExecuteEmbeddedSql(conn, us_geocoder::CanonMacrosSql(), kDefaultTigerSchema);
 		ExecuteEmbeddedSql(conn, us_geocoder::ScoringMacrosSql(), kDefaultTigerSchema);
 		ExecuteEmbeddedSql(conn, us_geocoder::GeocodeInputTypeSql(), kDefaultTigerSchema);
-		ExecuteEmbeddedSql(conn, us_geocoder::PprintAddySql(), kDefaultTigerSchema);
+		ExecuteEmbeddedSql(conn, us_geocoder::PprintAdrSql(), kDefaultTigerSchema);
 		conn.Commit();
 	} catch (...) {
 		conn.Rollback();
@@ -80,12 +111,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Optional-dependency registrations — best-effort.
 	// spatial_macros, tiger_schema, and geocode_location need duckdb-spatial
 	// (GEOMETRY type, ST_Centroid, ST_Intersects, ST_Transform...).
-	// geocode_location additionally needs splink_udfs for soundex.
-	// from_pagc needs us_address_standardizer. All three are attempted at
-	// auto-load; if any is absent, the dependent macros/tables are absent
-	// and users see "function not found" / "table not found" on call.
+	// from_pagc needs us_address_standardizer. soundex is now built-in
+	// (vendored from splink_udfs, registered above) — no community dep.
 	ExtensionHelper::TryAutoLoadExtension(db, "spatial");
-	ExtensionHelper::TryAutoLoadExtension(db, "splink_udfs");
 	conn.BeginTransaction();
 	TryRegisterOptional(conn, us_geocoder::SpatialMacrosSql(), kDefaultTigerSchema);
 	TryRegisterOptional(conn, us_geocoder::TigerSchemaSql(), kDefaultTigerSchema);

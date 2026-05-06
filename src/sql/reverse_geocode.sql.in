@@ -233,7 +233,7 @@ CREATE OR REPLACE MACRO @TIGER@.reverse_geocode(pt, max_results) AS TABLE (
             -- PG L180-184: prefer addr.zip, fall back to point's ZCTA.
             -- Treat empty-string zip as missing too (PG's `var_redge.zip > ''`).
             zip          := COALESCE(NULLIF(addr_zip, ''), (SELECT zip FROM zip_hit))
-        )::@TIGER@.geocode_input AS addy,
+        )::@TIGER@.geocode_input AS adr,
         ST_ClosestPoint(line, (SELECT p FROM pt_info)) AS geom,
         fn_fullname AS street,
         dist_m

@@ -128,7 +128,7 @@ SELECT (tiger.from_pagc('1 Test St, Anytown MA 02109-1234')).zip;
 statement ok
 CREATE OR REPLACE MACRO tiger.geocode(
     input_geocode_input, max_results, restrict_geom, require_containment
-) AS TABLE (SELECT NULL::tiger.geocode_input AS addy, NULL::VARCHAR AS geom,
+) AS TABLE (SELECT NULL::tiger.geocode_input AS adr, NULL::VARCHAR AS geom,
                    0::INTEGER AS rating, NULL::VARCHAR AS block_geoid,
                    NULL::VARCHAR AS tract_geoid, NULL::VARCHAR AS blkgrp_geoid,
                    false AS containment_guaranteed WHERE false),

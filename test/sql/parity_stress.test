@@ -19,7 +19,6 @@ require us_geocoder
 statement ok
 LOAD spatial;
 
-require splink_udfs
 
 # --------------------------------------------------------------------
 # Shared fixture: small RI fragment with seven streets, each chosen to
@@ -220,11 +219,11 @@ SELECT count(*) FROM tiger.geocode_address_impl(
 # ============================================================
 # Address 500 is well outside the 100-198 range on Meeting St.
 # Should still match (street/type are exact), but with a higher rating
-# than an in-range address, AND the addy.address output should be the
+# than an in-range address, AND the adr.address output should be the
 # nearest range endpoint, not the input 500.
 
 query I
-SELECT (addy).address FROM tiger.geocode_address_impl(
+SELECT (adr).address FROM tiger.geocode_address_impl(
     CAST({address: 500, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
           post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
          AS tiger.geocode_input), 5, NULL, 2.0)

@@ -2,8 +2,9 @@
 -- See geocode_flow.md §7 for the PostGIS cascade we're collapsing and §14.1
 -- for the D7 "single vectorized pass, LIMIT at end" spec.
 --
--- Depends on spatial (ST_Intersects, interpolate_from_address) and
--- splink_udfs (soundex). Registered best-effort by LoadInternal.
+-- Depends on spatial (ST_Intersects, interpolate_from_address). Uses our
+-- built-in soundex (vendored from splink_udfs; see src/include/vendored_soundex.hpp).
+-- Registered best-effort by LoadInternal.
 --
 -- Inputs:
 --   inp               : tiger.geocode_input struct
@@ -12,7 +13,7 @@
 --   zip_penalty       : DOUBLE, PG default 2
 --
 -- Returns candidate rows:
---   (addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed)
+--   (adr, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed)
 -- Stage A produces rating in the [0, 99] band for address matches.
 -- Ordered by rating ascending, truncated to max_results.
 --
@@ -425,7 +426,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                 location     := COALESCE(place_name, cousub_name, county_name, p_location),
                 state_abbrev := state_abbrev,
                 zip          := a_zip
-            )::@TIGER@.geocode_input AS addy,
+            )::@TIGER@.geocode_input AS adr,
             @TIGER@.interpolate_from_address(p_address, a_fromhn, a_tohn, edge_geom, a_side, 10) AS geom,
             rating,
             CASE a_side WHEN 'L' THEN ec.block_geoid_l  ELSE ec.block_geoid_r  END AS block_geoid,
@@ -445,7 +446,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                ON ec.statefp = c.fc_statefp AND ec.tlid = c.e_tlid
     ),
     deduped_a AS (
-        SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed,
+        SELECT adr, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed,
                f_tfidr, f_tfidl
         FROM ranked_a
         WHERE dedup_rn = 1
@@ -657,7 +658,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                 location     := COALESCE(place_name, cousub_name, county_name, p_location),
                 state_abbrev := state_abbrev,
                 zip          := a_zip
-            )::@TIGER@.geocode_input AS addy,
+            )::@TIGER@.geocode_input AS adr,
             @TIGER@.interpolate_from_address(p_address, a_fromhn, a_tohn, edge_geom, a_side, 10) AS geom,
             rating,
             CASE a_side WHEN 'L' THEN ec.block_geoid_l  ELSE ec.block_geoid_r  END AS block_geoid,
@@ -677,7 +678,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                ON ec.statefp = c.fc_statefp AND ec.tlid = c.e_tlid
     ),
     deduped_b AS (
-        SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed,
+        SELECT adr, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed,
                f_tfidr, f_tfidl
         FROM ranked_b
         WHERE dedup_rn = 1
@@ -693,16 +694,16 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         SELECT * FROM deduped_b
     ),
     final_deduped AS (
-        SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed,
+        SELECT adr, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed,
                ROW_NUMBER() OVER (
-                   PARTITION BY (addy).street_name, (addy).street_type, (addy).post_dir,
-                                (addy).location, (addy).state_abbrev, (addy).zip
+                   PARTITION BY (adr).street_name, (adr).street_type, (adr).post_dir,
+                                (adr).location, (adr).state_abbrev, (adr).zip
                    ORDER BY rating, f_tfidr, f_tfidl DESC
                ) AS final_dedup_rn,
                ROW_NUMBER() OVER (ORDER BY rating, f_tfidr, f_tfidl DESC) AS rating_rn
         FROM combined
     )
-    SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
+    SELECT adr, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
     FROM final_deduped
     WHERE final_dedup_rn = 1 AND rating_rn <= max_results
     ORDER BY rating, rating_rn

@@ -1,6 +1,6 @@
--- pprint_addy: render an addy struct as the canonical PostGIS-tiger-geocoder
+-- pprint_adr: render an adr struct as the canonical PostGIS-tiger-geocoder
 -- text form ("529 Main St, Boston, MA 02129"). Ported from PG's
--- src/normalize/pprint_addy.sql.
+-- src/normalize/pprint_adr.sql.
 --
 -- Two-positional rule for street_type: types flagged is_hw=true in
 -- street_type_lookup ("Co Rd", "Co Hwy", "Hwy", "Camino", ...) get prepended
@@ -15,7 +15,7 @@ CREATE OR REPLACE MACRO @TIGER@.is_pretype(t) AS (
     )
 );
 
-CREATE OR REPLACE MACRO @TIGER@.pprint_addy(a) AS (
+CREATE OR REPLACE MACRO @TIGER@.pprint_adr(a) AS (
     regexp_replace(
         trim(
             COALESCE(CAST(a.address AS VARCHAR), '')
@@ -31,7 +31,7 @@ CREATE OR REPLACE MACRO @TIGER@.pprint_addy(a) AS (
         )
         || CASE WHEN a.address IS NOT NULL OR a.street_name IS NOT NULL THEN ', ' ELSE '' END
         -- Internal (unit/suite) renders between street and location, matching
-        -- PG's pprint_addy.sql:33-34 ordering.
+        -- PG's pprint_adr.sql:33-34 ordering.
         || COALESCE(a.internal, '')
         || CASE WHEN a.internal IS NOT NULL THEN ', ' ELSE '' END
         || COALESCE(a.location, '')

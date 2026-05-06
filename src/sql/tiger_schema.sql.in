@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS @TIGER@.faces (
 
 CREATE TABLE IF NOT EXISTS @TIGER@.featnames (
     statefp     VARCHAR,
+    countyfp    VARCHAR,
     tlid        BIGINT,
     name        VARCHAR,
     fullname    VARCHAR,
@@ -116,23 +117,27 @@ CREATE TABLE IF NOT EXISTS @TIGER@.featnames (
     -- Stage A). Without these the filter becomes a full scan with
     -- lower() / normalize_street_name() / soundex() applied per row,
     -- which is the dominant cost on a full-state batch.
-    -- name_soundex is populated iff splink_udfs is loaded at load time;
-    -- if absent, the soundex match branch is effectively disabled (the
-    -- macro falls back to other branches: exact, normalized, LIKE, numeric).
+    -- soundex is registered by LoadInternal (vendored — see
+    -- src/include/vendored_soundex.hpp).
     name_lower    VARCHAR,
     fullname_norm VARCHAR,
     name_soundex  VARCHAR
 );
+-- countyfp added in May 2026 to support per-county restart. Existing rows
+-- (loaded before the migration) have countyfp = NULL until backfilled.
+ALTER TABLE @TIGER@.featnames ADD COLUMN IF NOT EXISTS countyfp VARCHAR;
 
 CREATE TABLE IF NOT EXISTS @TIGER@.addr (
-    statefp VARCHAR,
-    tlid    BIGINT,
-    fromhn  VARCHAR,
-    tohn    VARCHAR,
-    side    VARCHAR,
-    zip     VARCHAR,
-    plus4   VARCHAR
+    statefp  VARCHAR,
+    countyfp VARCHAR,
+    tlid     BIGINT,
+    fromhn   VARCHAR,
+    tohn     VARCHAR,
+    side     VARCHAR,
+    zip      VARCHAR,
+    plus4    VARCHAR
 );
+ALTER TABLE @TIGER@.addr ADD COLUMN IF NOT EXISTS countyfp VARCHAR;
 
 -- Per-edge-per-side block/tract/blkgrp containment precomputation (Phase 6).
 -- Built from edges ⨝ faces after each state loads; populated by the loader.
@@ -147,4 +152,15 @@ CREATE TABLE IF NOT EXISTS @TIGER@.edge_containment (
     block_geoid_r         VARCHAR,
     tract_geoid_r         VARCHAR,
     blkgrp_geoid_r        VARCHAR
+);
+
+-- Per-section completion ledger. Loader marks a section done only after the
+-- corresponding INSERT (or DELETE-then-INSERT) succeeds, which lets a re-run
+-- skip already-completed work at per-(state, county, table) granularity.
+-- Section keys: 'nation:<step>', 'state:<fp>:<step>',
+-- 'state:<fp>:county:<cfp>:<table>', 'state:<fp>:derived:<name>',
+-- 'state:<fp>:edge_containment'. Cleared by unload_tiger_state(<abbrev>).
+CREATE TABLE IF NOT EXISTS @TIGER@.loader_progress (
+    section      VARCHAR PRIMARY KEY,
+    completed_at TIMESTAMP DEFAULT now()
 );

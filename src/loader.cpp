@@ -9,12 +9,53 @@
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_helper.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <sstream>
+#include <thread>
 #include <utility>
 #include <vector>
 
 namespace duckdb {
 namespace us_geocoder {
+
+// Live progress logging. Writes to stderr (and flushes) so a long-running
+// CALL load_tiger_all_states() shows per-file progress as it runs, instead
+// of the whole result vector flooding out at the end.
+static void LogProgress(const std::string &prefix, const std::string &step, int64_t rows, double secs) {
+	fprintf(stderr, "[us_geocoder %s] %s: %lld rows (%.1fs)\n", prefix.c_str(), step.c_str(),
+	        static_cast<long long>(rows), secs);
+	fflush(stderr);
+}
+
+// RAII helper: time an ExecuteInsert call and log it on completion. Use as:
+//   { auto _t = StepTimer(prefix, step_label);
+//     int64_t rows = ExecuteInsert(...);
+//     out.push_back(...);
+//     _t.Done(rows); }
+struct StepTimer {
+	std::string prefix;
+	std::string step;
+	std::chrono::steady_clock::time_point t0;
+	bool done = false;
+	StepTimer(std::string p, std::string s)
+	    : prefix(std::move(p)), step(std::move(s)), t0(std::chrono::steady_clock::now()) {
+	}
+	void Done(int64_t rows) {
+		auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+		LogProgress(prefix, step, rows, secs);
+		done = true;
+	}
+	~StepTimer() {
+		if (!done) {
+			// Path triggered on exception — log so the user sees where we failed.
+			auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+			fprintf(stderr, "[us_geocoder %s] %s: FAILED (%.1fs)\n", prefix.c_str(), step.c_str(), secs);
+			fflush(stderr);
+		}
+	}
+};
 
 // =====================================================================
 // Template extraction
@@ -139,6 +180,18 @@ static std::string ZeroPad(const std::string &s, size_t width) {
 	return std::string(width - s.size(), '0') + s;
 }
 
+// Generate a unique cache-bust token. Cloudflare's cache key includes the
+// query string, so appending ?cb=<token> guarantees a fresh fetch from the
+// origin. Caught a real failure mode: tl_2025_02016_faces.zip had a 247-byte
+// "Request Rejected" HTML cached at the edge, served instead of the zip.
+// Cache-bust per-call sidesteps that without depending on edge eviction.
+static uint64_t MakeCacheBust() {
+	static std::atomic<uint64_t> counter{0};
+	auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
+	auto bump = counter.fetch_add(1, std::memory_order_relaxed);
+	return static_cast<uint64_t>(now_ns) + bump;
+}
+
 // Build the /vsizip/ URI for a zip containing a single spatial file with
 // the same base name. Most TIGER tables ship a full shapefile (.shp);
 // featnames and addr are DBF-only (no geometry). GDAL can read both via
@@ -147,15 +200,13 @@ static std::string ZeroPad(const std::string &s, size_t width) {
 // Both local and HTTP sources use the Census **nested** layout:
 //   <source>/<SUBDIR>/<zip_base>.zip         — e.g. <root>/EDGES/tl_2025_44007_edges.zip
 //
-// For HTTP, we prefix /vsizip//vsicurl/ (double slash tells GDAL that the
-// next token is another VSI handler, not a local path).
-//
-// For local sources, the user passes the root of a (partial) mirror of
-// https://www2.census.gov/geo/tiger/TIGER<year>/ — exactly what `wget -r`
-// or a manual download-by-directory script produces. There is no flat
-// layout in v0.1; put the zips under STATE/, EDGES/, etc. directories.
+// HTTP form: /vsizip/{/vsicurl/<URL>?cb=<N>}/<inner>. The braces are
+// required when ?cb=… is present so GDAL doesn't read past the .zip when
+// splitting archive-vs-inner — without them GDAL treats the trailing
+// /<inner> as part of the query string. Pass cache_bust=0 to disable
+// (e.g. for local sources, where the query string would corrupt the path).
 static std::string BuildVsiPath(const std::string &source, const std::string &subdir, const std::string &zip_base,
-                                const std::string &inner_ext = "shp") {
+                                const std::string &inner_ext = "shp", uint64_t cache_bust = 0) {
 	const bool is_http = source.rfind("http://", 0) == 0 || source.rfind("https://", 0) == 0;
 	std::string src = source;
 	if (!src.empty() && src.back() != '/') {
@@ -163,7 +214,11 @@ static std::string BuildVsiPath(const std::string &source, const std::string &su
 	}
 	const std::string inner = zip_base + "." + inner_ext;
 	if (is_http) {
-		return "/vsizip//vsicurl/" + src + subdir + "/" + zip_base + ".zip/" + inner;
+		std::string url = src + subdir + "/" + zip_base + ".zip";
+		if (cache_bust != 0) {
+			url += "?cb=" + std::to_string(cache_bust);
+		}
+		return "/vsizip/{/vsicurl/" + url + "}/" + inner;
 	}
 	return "/vsizip/" + src + subdir + "/" + zip_base + ".zip/" + inner;
 }
@@ -188,6 +243,61 @@ static int64_t ExecuteInsert(Connection &conn, const std::string &sql, const std
 	} catch (...) {
 		return 0;
 	}
+}
+
+// Heuristic: is this loader error worth retrying? Network/GDAL transients
+// (refused connection, corrupted-mid-download zip, /vsicurl/ open failure)
+// retry; SQL syntax / catalog errors should fail fast. Hints are matched
+// case-insensitively — error strings come from a mix of GDAL (paths use
+// lowercase "gdal/"), DuckDB ("HTTP"), and curl, and we don't want a
+// missed case to silently fail the whole load.
+static bool IsRetriableLoaderError(const std::string &msg) {
+	static const char *const kHints[] = {
+	    "gdal",          "/vsicurl/", "/vsizip/",      "http",       "curl",
+	    "timeout",       "timed out", "connection",    "decompression failed",
+	    "z_err",         "cpl_vsil",  "premature end", "unexpected end of",
+	    "ssl",           "tls",       "reset by peer", "broken pipe",
+	};
+	std::string lower;
+	lower.reserve(msg.size());
+	for (char c : msg) {
+		lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+	}
+	for (auto h : kHints) {
+		if (lower.find(h) != std::string::npos) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Wrap ExecuteInsert with retry. The Render callable is invoked once per
+// attempt with a cache-bust token: 0 on the first attempt (CDN cache OK),
+// fresh on every retry. The happy path keeps Cloudflare's edge cache; only
+// failures pay the cache-miss + retry cost. Without this gating, every
+// request hits origin and Census rate-limits us. Backoff: 2s, 5s, 15s;
+// non-network errors fail fast.
+template <typename RenderFn>
+static int64_t RetryableExecuteInsert(Connection &conn, RenderFn render, const std::string &step_label) {
+	constexpr int kAttempts = 3;
+	const int kBackoffSec[] = {2, 5, 15};
+	for (int attempt = 0; attempt < kAttempts; ++attempt) {
+		uint64_t cb = (attempt == 0) ? 0 : MakeCacheBust();
+		try {
+			return ExecuteInsert(conn, render(cb), step_label);
+		} catch (const IOException &e) {
+			std::string msg = e.what();
+			bool last = (attempt + 1 == kAttempts);
+			if (last || !IsRetriableLoaderError(msg)) {
+				throw;
+			}
+			fprintf(stderr, "[us_geocoder] %s: HTTP/GDAL error, retry %d/%d in %ds\n", step_label.c_str(), attempt + 1,
+			        kAttempts - 1, kBackoffSec[attempt]);
+			fflush(stderr);
+			std::this_thread::sleep_for(std::chrono::seconds(kBackoffSec[attempt]));
+		}
+	}
+	throw IOException("us_geocoder loader (%s): unreachable retry loop", step_label);
 }
 
 // DuckDB identifier quoting: wrap in double quotes and escape any embedded ".
@@ -240,6 +350,179 @@ static void BootstrapTargetSchema(Connection &conn, const LoaderBindData &bind) 
 	auto result = conn.Query(rendered);
 	if (result->HasError()) {
 		throw IOException("us_geocoder loader (bootstrap %s): %s", bind.data_location, result->GetError());
+	}
+}
+
+// =====================================================================
+// Per-section completion ledger (tiger.loader_progress).
+//
+// Each loader step writes a row keyed by a structured section string only
+// after its INSERT (or DELETE+INSERT) succeeds. Re-running the loader
+// queries this table to skip already-completed work, supporting partial
+// restart at per-(state, county, table) granularity.
+//
+// Section grammar:
+//   nation:state | nation:county | nation:zcta5
+//   state:<fp>:place | state:<fp>:cousub
+//   state:<fp>:county:<cfp>:edges | …:faces | …:featnames | …:addr
+//   state:<fp>:derived:zip_state | …:zip_state_loc | …:zip_lookup_base | …:zcta5_clip
+//   state:<fp>:edge_containment
+// =====================================================================
+
+static bool IsProgressDone(Connection &conn, const std::string &data_loc, const std::string &section) {
+	auto sql = "SELECT 1 FROM " + data_loc + ".loader_progress WHERE section = '" + section + "' LIMIT 1";
+	auto result = conn.Query(sql);
+	if (result->HasError()) {
+		return false; // table missing or transient; let the caller proceed and surface the real error
+	}
+	return result->RowCount() > 0;
+}
+
+static void MarkProgressDone(Connection &conn, const std::string &data_loc, const std::string &section) {
+	auto sql = "INSERT INTO " + data_loc + ".loader_progress (section, completed_at) VALUES ('" + section +
+	           "', now()) ON CONFLICT (section) DO UPDATE SET completed_at = now()";
+	auto result = conn.Query(sql);
+	if (result->HasError()) {
+		fprintf(stderr, "[us_geocoder] WARN: failed to mark progress '%s': %s\n", section.c_str(),
+		        result->GetError().c_str());
+		fflush(stderr);
+	}
+}
+
+static void DeleteProgressLike(Connection &conn, const std::string &data_loc, const std::string &prefix) {
+	auto sql = "DELETE FROM " + data_loc + ".loader_progress WHERE section LIKE '" + prefix + "%'";
+	auto result = conn.Query(sql);
+	if (result->HasError()) {
+		fprintf(stderr, "[us_geocoder] WARN: failed to clear progress '%s%%': %s\n", prefix.c_str(),
+		        result->GetError().c_str());
+		fflush(stderr);
+	}
+}
+
+// One-shot backfill. If loader_progress is empty but the data tables already
+// have rows (existing DBs from before this migration), infer the completed
+// sections from the data so re-runs skip already-loaded states/counties
+// instead of duplicating rows.
+//
+// featnames/addr lacked countyfp before the schema migration; for legacy
+// rows, we attribute their per-county completion via a join to edges on
+// (statefp, tlid). TLIDs are unique per state to one edge → countyfp is
+// unambiguous. This may over-attribute on the failure-county for partial
+// state loads (e.g. AK county 016, where featnames/addr never ran but the
+// join would mark them done if any featnames existed for AK at all). The
+// risk is bounded: the next user-driven retry would skip the incomplete
+// county; explicit `unload_tiger_state` is the escape hatch.
+static void BackfillProgressIfNeeded(Connection &conn, const std::string &data_loc) {
+	auto check = conn.Query("SELECT count(*) FROM " + data_loc + ".loader_progress");
+	if (check->HasError() || check->RowCount() == 0) {
+		return;
+	}
+	int64_t existing = 0;
+	try {
+		existing = check->Fetch()->GetValue(0, 0).GetValue<int64_t>();
+	} catch (...) {
+		return;
+	}
+	if (existing > 0) {
+		return;
+	}
+	// Skip if nothing is loaded at all (fresh DB).
+	auto data_check = conn.Query("SELECT count(*) FROM " + data_loc + ".state");
+	if (data_check->HasError() || data_check->RowCount() == 0) {
+		return;
+	}
+	int64_t state_rows = 0;
+	try {
+		state_rows = data_check->Fetch()->GetValue(0, 0).GetValue<int64_t>();
+	} catch (...) {
+		return;
+	}
+	if (state_rows == 0) {
+		return;
+	}
+	fprintf(stderr, "[us_geocoder] backfilling loader_progress from existing data tables...\n");
+	fflush(stderr);
+	const char *const kBackfillStmts[] = {
+	    // Nation steps: existence-of-rows on the canonical table.
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT 'nation:state', now()
+	       WHERE EXISTS (SELECT 1 FROM @T@.state WHERE statefp IS NOT NULL))",
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT 'nation:county', now()
+	       WHERE EXISTS (SELECT 1 FROM @T@.county))",
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT 'nation:zcta5', now()
+	       WHERE EXISTS (SELECT 1 FROM @T@.zcta5 WHERE statefp IS NULL))",
+	    // State-level: distinct statefp.
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT DISTINCT 'state:' || statefp || ':place', now()
+	       FROM @T@.place WHERE statefp IS NOT NULL)",
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT DISTINCT 'state:' || statefp || ':cousub', now()
+	       FROM @T@.cousub WHERE statefp IS NOT NULL)",
+	    // Per-county: edges/faces have countyfp directly.
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT DISTINCT 'state:' || statefp || ':county:' || countyfp || ':edges', now()
+	       FROM @T@.edges WHERE statefp IS NOT NULL AND countyfp IS NOT NULL)",
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT DISTINCT 'state:' || statefp || ':county:' || countyfp || ':faces', now()
+	       FROM @T@.faces WHERE statefp IS NOT NULL AND countyfp IS NOT NULL)",
+	    // featnames/addr post-migration: countyfp present.
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT DISTINCT 'state:' || statefp || ':county:' || countyfp || ':featnames', now()
+	       FROM @T@.featnames WHERE statefp IS NOT NULL AND countyfp IS NOT NULL)",
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT DISTINCT 'state:' || statefp || ':county:' || countyfp || ':addr', now()
+	       FROM @T@.addr WHERE statefp IS NOT NULL AND countyfp IS NOT NULL)",
+	    // featnames/addr legacy (countyfp NULL): attribute via tlid→edges.
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT DISTINCT 'state:' || e.statefp || ':county:' || e.countyfp || ':featnames', now()
+	       FROM @T@.edges e
+	       WHERE e.countyfp IS NOT NULL
+	         AND EXISTS (SELECT 1 FROM @T@.featnames f
+	                     WHERE f.statefp = e.statefp AND f.tlid = e.tlid AND f.countyfp IS NULL)
+	       ON CONFLICT (section) DO NOTHING)",
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT DISTINCT 'state:' || e.statefp || ':county:' || e.countyfp || ':addr', now()
+	       FROM @T@.edges e
+	       WHERE e.countyfp IS NOT NULL
+	         AND EXISTS (SELECT 1 FROM @T@.addr a
+	                     WHERE a.statefp = e.statefp AND a.tlid = e.tlid AND a.countyfp IS NULL)
+	       ON CONFLICT (section) DO NOTHING)",
+	    // Derived state-level + edge_containment.
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT DISTINCT 'state:' || statefp || ':derived:zip_state', now()
+	       FROM @T@.zip_state WHERE statefp IS NOT NULL)",
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT DISTINCT 'state:' || statefp || ':derived:zip_state_loc', now()
+	       FROM @T@.zip_state_loc WHERE statefp IS NOT NULL)",
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT DISTINCT 'state:' || statefp || ':derived:zip_lookup_base', now()
+	       FROM @T@.zip_lookup_base WHERE statefp IS NOT NULL)",
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT DISTINCT 'state:' || statefp || ':derived:zcta5_clip', now()
+	       FROM @T@.zcta5 WHERE statefp IS NOT NULL)",
+	    R"(INSERT INTO @T@.loader_progress (section, completed_at)
+	       SELECT DISTINCT 'state:' || statefp || ':edge_containment', now()
+	       FROM @T@.edge_containment WHERE statefp IS NOT NULL)",
+	};
+	for (const char *stmt : kBackfillStmts) {
+		std::string sql = ApplySubstitutions(stmt, {{"@T@", data_loc}});
+		auto result = conn.Query(sql);
+		if (result->HasError()) {
+			fprintf(stderr, "[us_geocoder] WARN: backfill step failed (continuing): %s\n", result->GetError().c_str());
+			fflush(stderr);
+		}
+	}
+	auto count = conn.Query("SELECT count(*) FROM " + data_loc + ".loader_progress");
+	if (!count->HasError() && count->RowCount() > 0) {
+		try {
+			int64_t n = count->Fetch()->GetValue(0, 0).GetValue<int64_t>();
+			fprintf(stderr, "[us_geocoder] backfill: marked %lld sections complete from existing data\n",
+			        static_cast<long long>(n));
+			fflush(stderr);
+		} catch (...) {
+		}
 	}
 }
 
@@ -327,16 +610,18 @@ static void DoLoadNation(ClientContext &context, const LoaderBindData &bind, std
 	const auto &func_loc = bind.func_schema;
 	const std::string year = std::to_string(bind.year);
 	const auto &tmpl = LoaderTemplatesSql();
+	BackfillProgressIfNeeded(conn, data_loc);
 
 	struct NationStep {
 		const char *section;
 		const char *subdir;       // Census URL subdir (e.g. "STATE")
 		const char *zip_base_fmt; // e.g. "tl_<year>_us_state"
+		const char *progress_key; // section key for loader_progress
 	};
 	const NationStep steps[] = {
-	    {"nation_state", "STATE", "tl_YEAR_us_state"},
-	    {"nation_county", "COUNTY", "tl_YEAR_us_county"},
-	    {"nation_zcta5", "ZCTA520", "tl_YEAR_us_zcta520"},
+	    {"nation_state", "STATE", "tl_YEAR_us_state", "nation:state"},
+	    {"nation_county", "COUNTY", "tl_YEAR_us_county", "nation:county"},
+	    {"nation_zcta5", "ZCTA520", "tl_YEAR_us_zcta520", "nation:zcta5"},
 	};
 
 	for (const auto &step : steps) {
@@ -345,11 +630,26 @@ static void DoLoadNation(ClientContext &context, const LoaderBindData &bind, std
 		if (pos != std::string::npos) {
 			zip_base.replace(pos, 4, year);
 		}
-		auto vsi = BuildVsiPath(bind.source, step.subdir, zip_base);
+		const std::string label = std::string(step.section) + " (" + zip_base + ".zip)";
+		if (IsProgressDone(conn, data_loc, step.progress_key)) {
+			fprintf(stderr, "[us_geocoder nation] %s: already loaded (skip)\n", label.c_str());
+			fflush(stderr);
+			out.push_back({std::string(step.section) + ":skipped", 0});
+			continue;
+		}
 		auto section = ExtractSection(tmpl, step.section);
-		auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@VSIPATH@", vsi}});
-		int64_t rows = ExecuteInsert(conn, rendered, step.section);
+		StepTimer t("nation", label);
+		int64_t rows = RetryableExecuteInsert(
+		    conn,
+		    [&](uint64_t cb) {
+			    auto vsi = BuildVsiPath(bind.source, step.subdir, zip_base, "shp", cb);
+			    return RenderTemplate(section,
+			                          {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@VSIPATH@", vsi}});
+		    },
+		    step.section);
 		out.push_back({step.section, rows});
+		t.Done(rows);
+		MarkProgressDone(conn, data_loc, step.progress_key);
 	}
 }
 
@@ -499,6 +799,61 @@ static unique_ptr<FunctionData> LoadTigerAllStatesBind(ClientContext &context, T
 	return std::move(bind_data);
 }
 
+// =====================================================================
+// unload_tiger_state(state_abbrev VARCHAR | VARCHAR[], target_db := NULL,
+//                    target_schema := 'tiger')
+//
+// Force-unload a state: deletes all per-statefp rows from the 13 data
+// tables AND removes the matching loader_progress entries, so a
+// subsequent load_tiger_state* call does a full re-load. Use when a
+// state's existing rows are stale or partially corrupt.
+// =====================================================================
+
+static unique_ptr<FunctionData> UnloadTigerStateBind(ClientContext &context, TableFunctionBindInput &input,
+                                                     vector<LogicalType> &return_types, vector<string> &names) {
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("step");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("rows_loaded");
+	if (input.inputs.empty() || input.inputs[0].IsNull()) {
+		throw BinderException("unload_tiger_state: state abbrev is required");
+	}
+	auto bind_data = make_uniq<LoaderBindData>("tiger");
+	auto abbrevs = AbbrevsFromValue(input.inputs[0], "unload_tiger_state");
+	ApplyTargetParams(*bind_data, input);
+	Connection conn(*context.db);
+	ResolveStates(conn, *bind_data, abbrevs);
+	return std::move(bind_data);
+}
+
+static void UnloadTigerStateExecute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<LoaderBindData>();
+	auto &gstate = data_p.global_state->Cast<LoaderGlobalState>();
+	if (!gstate.executed) {
+		gstate.executed = true;
+		Connection conn(*context.db);
+		BootstrapTargetSchema(conn, bind);
+		const auto &data_loc = bind.data_location;
+		const auto &func_loc = bind.func_schema;
+		const auto &tmpl = LoaderTemplatesSql();
+		auto unload_template = ExtractSection(tmpl, "unload_state");
+		for (const auto &state : bind.states) {
+			StepTimer t(state.abbrev, "unload_state");
+			auto rendered = RenderTemplate(unload_template, {{"@TIGER@", data_loc},
+			                                                  {"@FUNC@", func_loc},
+			                                                  {"@STATEFP@", state.fips}});
+			auto result = conn.Query(rendered);
+			if (result->HasError()) {
+				throw IOException("us_geocoder unload_tiger_state(%s): %s", state.abbrev, result->GetError());
+			}
+			DeleteProgressLike(conn, data_loc, "state:" + state.fips + ":");
+			gstate.results.push_back({"unload:" + state.abbrev, 0});
+			t.Done(0);
+		}
+	}
+	EmitLoaderResults(gstate, output);
+}
+
 static void DoLoadState(ClientContext &context, const LoaderBindData &bind, const LoaderBindData::StatePlan &state,
                         std::vector<LoaderResult> &out) {
 	EnsureHttpfsIfRemote(*context.db, bind.source);
@@ -509,27 +864,21 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, cons
 	const std::string &fips = state.fips;
 	const std::string year = std::to_string(bind.year);
 	const auto &tmpl = LoaderTemplatesSql();
+	BackfillProgressIfNeeded(conn, data_loc);
 
-	// Wipe existing rows for this state so the load is idempotent.
-	{
-		auto sec = ExtractSection(tmpl, "unload_state");
-		auto rendered = RenderTemplate(sec, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", fips}});
-		auto result = conn.Query(rendered);
-		if (result->HasError()) {
-			throw IOException("us_geocoder loader (unload_state): %s", result->GetError());
-		}
-		out.push_back({"unload_state", 0});
-	}
+	const std::string state_pfx = "state:" + fips + ":";
 
-	// State-level files: place, cousub.
+	// State-level files: place, cousub. Per-section progress check; skip
+	// without downloading if already complete.
 	struct StateLevelStep {
 		const char *section;
 		const char *subdir;
 		const char *zip_base;
+		const char *progress_suffix; // appended to state_pfx
 	};
 	const StateLevelStep state_level[] = {
-	    {"state_place", "PLACE", "tl_YEAR_FIPS_place"},
-	    {"state_cousub", "COUSUB", "tl_YEAR_FIPS_cousub"},
+	    {"state_place", "PLACE", "tl_YEAR_FIPS_place", "place"},
+	    {"state_cousub", "COUSUB", "tl_YEAR_FIPS_cousub", "cousub"},
 	};
 	for (const auto &s : state_level) {
 		std::string zip_base = s.zip_base;
@@ -539,11 +888,27 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, cons
 		pos = zip_base.find("FIPS");
 		if (pos != std::string::npos)
 			zip_base.replace(pos, 4, fips);
-		auto vsi = BuildVsiPath(bind.source, s.subdir, zip_base);
+		const std::string section_key = state_pfx + s.progress_suffix;
+		const std::string label = std::string(s.section) + " (" + zip_base + ".zip)";
+		if (IsProgressDone(conn, data_loc, section_key)) {
+			fprintf(stderr, "[us_geocoder %s] %s: already loaded (skip)\n", state.abbrev.c_str(), label.c_str());
+			fflush(stderr);
+			out.push_back({std::string(s.section) + ":skipped", 0});
+			continue;
+		}
 		auto section = ExtractSection(tmpl, s.section);
-		auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@VSIPATH@", vsi}});
-		int64_t rows = ExecuteInsert(conn, rendered, s.section);
+		StepTimer t(state.abbrev, label);
+		int64_t rows = RetryableExecuteInsert(
+		    conn,
+		    [&](uint64_t cb) {
+			    auto vsi = BuildVsiPath(bind.source, s.subdir, zip_base, "shp", cb);
+			    return RenderTemplate(section,
+			                          {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@VSIPATH@", vsi}});
+		    },
+		    s.section);
 		out.push_back({s.section, rows});
+		t.Done(rows);
+		MarkProgressDone(conn, data_loc, section_key);
 	}
 
 	// Enumerate counties for this state from <data_loc>.county (must be loaded first).
@@ -569,14 +934,12 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, cons
 		                  state.abbrev, fips, data_loc);
 	}
 
-	// County-level files. Per (county, table-type): load one shapefile/DBF
-	// via ST_Read. Templates are split into insert-prefix + branch sections
-	// so a future genuinely-parallel loader can UNION ALL across counties;
-	// for now DuckDB UNION ALL + GDAL /vsicurl/ don't parallelize HTTPS
-	// fetches (measured: 8m16s batched vs ~5m serial on NJ via Census),
-	// so we issue one INSERT per (county, table-type). Users who need
-	// faster HTTP loads should pre-download in parallel via curl/xargs
-	// and point at the local directory (see docs/api.md).
+	// County-level files. One INSERT per (county, table-type) — see
+	// CLAUDE.md's loader-perf notes for why UNION-ALL across counties
+	// doesn't pay off here (parse parallelizes; INSERT-write serializes).
+	// Per (statefp, countyfp, table) we keep a loader_progress entry,
+	// which is what gives us partial-restart: a re-run skips counties
+	// already done and only redoes the missing per-table inserts.
 	struct CountyTable {
 		const char *label;
 		const char *subdir;
@@ -584,16 +947,30 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, cons
 		const char *ext;
 		const char *insert_section;
 		const char *branch_section;
+		const char *progress_table; // table name for progress key (lowercase)
 	};
 	const CountyTable county_level[] = {
-	    {"county_edges", "EDGES", "tl_YEAR_FIPSCOUNTY_edges", "shp", "county_edges_insert", "county_edges_branch"},
-	    {"county_faces", "FACES", "tl_YEAR_FIPSCOUNTY_faces", "shp", "county_faces_insert", "county_faces_branch"},
+	    {"county_edges", "EDGES", "tl_YEAR_FIPSCOUNTY_edges", "shp", "county_edges_insert", "county_edges_branch",
+	     "edges"},
+	    {"county_faces", "FACES", "tl_YEAR_FIPSCOUNTY_faces", "shp", "county_faces_insert", "county_faces_branch",
+	     "faces"},
 	    {"county_featnames", "FEATNAMES", "tl_YEAR_FIPSCOUNTY_featnames", "dbf", "county_featnames_insert",
-	     "county_featnames_branch"},
-	    {"county_addr", "ADDR", "tl_YEAR_FIPSCOUNTY_addr", "dbf", "county_addr_insert", "county_addr_branch"},
+	     "county_featnames_branch", "featnames"},
+	    {"county_addr", "ADDR", "tl_YEAR_FIPSCOUNTY_addr", "dbf", "county_addr_insert", "county_addr_branch", "addr"},
 	};
-	for (const auto &cfp : countyfps) {
+	bool any_county_inserted = false;
+	for (size_t ci = 0; ci < countyfps.size(); ++ci) {
+		const auto &cfp = countyfps[ci];
+		auto t0 = std::chrono::steady_clock::now();
+		int n_skipped = 0;
+		int n_loaded = 0;
 		for (const auto &t : county_level) {
+			const std::string section_key = state_pfx + "county:" + cfp + ":" + t.progress_table;
+			if (IsProgressDone(conn, data_loc, section_key)) {
+				++n_skipped;
+				out.push_back({std::string(t.label) + ":" + cfp + ":skipped", 0});
+				continue;
+			}
 			std::string zip_base = t.zip_base;
 			auto pos = zip_base.find("YEAR");
 			if (pos != std::string::npos)
@@ -601,41 +978,98 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, cons
 			pos = zip_base.find("FIPSCOUNTY");
 			if (pos != std::string::npos)
 				zip_base.replace(pos, 10, fips + cfp);
-			auto vsi = BuildVsiPath(bind.source, t.subdir, zip_base, t.ext);
 			auto insert_prefix =
 			    RenderTemplate(ExtractSection(tmpl, t.insert_section), {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}});
-			auto branch = RenderTemplate(ExtractSection(tmpl, t.branch_section), {{"@TIGER@", data_loc},
-			                                                                      {"@FUNC@", func_loc},
-			                                                                      {"@VSIPATH@", vsi},
-			                                                                      {"@STATEFP@", fips},
-			                                                                      {"@COUNTYFP@", cfp}});
-			std::string sql = insert_prefix + branch + ";";
-			int64_t rows = ExecuteInsert(conn, sql, std::string(t.label) + ":" + cfp);
+			auto branch_section = ExtractSection(tmpl, t.branch_section);
+			int64_t rows = RetryableExecuteInsert(
+			    conn,
+			    [&](uint64_t cb) {
+				    auto vsi = BuildVsiPath(bind.source, t.subdir, zip_base, t.ext, cb);
+				    auto branch = RenderTemplate(branch_section, {{"@TIGER@", data_loc},
+				                                                  {"@FUNC@", func_loc},
+				                                                  {"@VSIPATH@", vsi},
+				                                                  {"@STATEFP@", fips},
+				                                                  {"@COUNTYFP@", cfp}});
+				    return insert_prefix + branch + ";";
+			    },
+			    std::string(t.label) + ":" + cfp);
 			out.push_back({std::string(t.label) + ":" + cfp, rows});
+			MarkProgressDone(conn, data_loc, section_key);
+			++n_loaded;
+			any_county_inserted = true;
 		}
+		auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+		if (n_loaded == 0) {
+			fprintf(stderr, "[us_geocoder %s] county %s (%zu/%zu) skipped — already loaded\n", state.abbrev.c_str(),
+			        cfp.c_str(), ci + 1, countyfps.size());
+		} else {
+			fprintf(stderr, "[us_geocoder %s] county %s (%zu/%zu) (%.1fs%s)\n", state.abbrev.c_str(), cfp.c_str(),
+			        ci + 1, countyfps.size(), secs, n_skipped > 0 ? ", partial" : "");
+		}
+		fflush(stderr);
 	}
 
-	// Build per-state derived tables. edge_containment is expensive
-	// (ST_Within on ~150K rows) so it runs last; the zip_* tables are
-	// pure INSERT…SELECT and finish in milliseconds. zcta5_clip is also
-	// fast (one ST_Intersection per ZCTA touching the state, ~30-300 rows
-	// after the area>0 filter rejects zero-area touch artifacts).
-	std::vector<const char *> derived = {
-	    "derived_zip_state",
-	    "derived_zip_state_loc",
-	    "derived_zip_lookup_base",
-	    "derived_zcta5_clip",
+	// Per-state derived tables. Each is INSERT…SELECT keyed on statefp;
+	// progress-tracked individually. If progress entry is absent (fresh
+	// load OR partial-restart that just filled in counties), we DELETE
+	// the prior per-state rows first to avoid duplication, then INSERT.
+	struct DerivedStep {
+		const char *section;
+		const char *table;        // for the pre-INSERT delete (per-statefp scope)
+		const char *progress_key; // suffix appended to state_pfx + "derived:"
 	};
-	if (bind.build_containment) {
-		derived.push_back("derived_edge_containment");
-	}
-	for (const auto *name : derived) {
-		auto section = ExtractSection(tmpl, name);
+	std::vector<DerivedStep> derived = {
+	    {"derived_zip_state", "zip_state", "zip_state"},
+	    {"derived_zip_state_loc", "zip_state_loc", "zip_state_loc"},
+	    {"derived_zip_lookup_base", "zip_lookup_base", "zip_lookup_base"},
+	    {"derived_zcta5_clip", "zcta5", "zcta5_clip"},
+	};
+	for (const auto &d : derived) {
+		const std::string section_key = state_pfx + "derived:" + d.progress_key;
+		if (!any_county_inserted && IsProgressDone(conn, data_loc, section_key)) {
+			out.push_back({std::string(d.section) + ":skipped", 0});
+			continue;
+		}
+		// Idempotent re-run: DELETE pre-existing per-state rows so re-INSERT
+		// doesn't double-up. zcta5 is special — only delete the per-state
+		// clipped rows (statefp NOT NULL); the nation_zcta5 baseline keeps
+		// statefp NULL and must survive.
+		std::string del_sql = "DELETE FROM " + data_loc + "." + d.table + " WHERE statefp = '" + fips + "'";
+		auto del_result = conn.Query(del_sql);
+		if (del_result->HasError()) {
+			throw IOException("us_geocoder loader (pre-derived delete %s): %s", d.table, del_result->GetError());
+		}
+		auto section = ExtractSection(tmpl, d.section);
 		auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", fips}});
-		int64_t rows = ExecuteInsert(conn, rendered, name);
-		out.push_back({name, rows});
+		StepTimer timer(state.abbrev, d.section);
+		int64_t rows = ExecuteInsert(conn, rendered, d.section);
+		out.push_back({d.section, rows});
+		timer.Done(rows);
+		MarkProgressDone(conn, data_loc, section_key);
 	}
-	if (!bind.build_containment) {
+
+	// edge_containment last (expensive: ST_Within over ~150K edges per
+	// state). Same idempotency rules as the other derived steps.
+	if (bind.build_containment) {
+		const std::string section_key = state_pfx + "edge_containment";
+		if (!any_county_inserted && IsProgressDone(conn, data_loc, section_key)) {
+			out.push_back({"derived_edge_containment:skipped", 0});
+		} else {
+			std::string del_sql = "DELETE FROM " + data_loc + ".edge_containment WHERE statefp = '" + fips + "'";
+			auto del_result = conn.Query(del_sql);
+			if (del_result->HasError()) {
+				throw IOException("us_geocoder loader (pre-edge_containment delete): %s", del_result->GetError());
+			}
+			auto section = ExtractSection(tmpl, "derived_edge_containment");
+			auto rendered =
+			    RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", fips}});
+			StepTimer timer(state.abbrev, "derived_edge_containment");
+			int64_t rows = ExecuteInsert(conn, rendered, "derived_edge_containment");
+			out.push_back({"derived_edge_containment", rows});
+			timer.Done(rows);
+			MarkProgressDone(conn, data_loc, section_key);
+		}
+	} else {
 		out.push_back({"skipped:edge_containment", 0});
 	}
 }
@@ -646,12 +1080,22 @@ static void LoadTigerStateExecute(ClientContext &context, TableFunctionInput &da
 
 	if (!gstate.executed) {
 		gstate.executed = true;
-		// Prepend a "begin:<ABBREV>" marker per state so users tailing output
-		// in a long batch (e.g. load_tiger_all_states) can see progress.
-		for (const auto &st : bind.states) {
+		// Per-state begin/done markers in the result stream; LogProgress
+		// also emits them to stderr so users tailing a multi-hour CALL see
+		// real-time progress.
+		for (size_t i = 0; i < bind.states.size(); ++i) {
+			const auto &st = bind.states[i];
+			char counter[64];
+			snprintf(counter, sizeof(counter), "(%zu/%zu)", i + 1, bind.states.size());
+			fprintf(stderr, "[us_geocoder %s] begin %s\n", st.abbrev.c_str(), counter);
+			fflush(stderr);
+			auto t0 = std::chrono::steady_clock::now();
 			gstate.results.push_back({"begin:" + st.abbrev, 0});
 			DoLoadState(context, bind, st, gstate.results);
 			gstate.results.push_back({"done:" + st.abbrev, 0});
+			auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+			fprintf(stderr, "[us_geocoder %s] done %s in %.1fs\n", st.abbrev.c_str(), counter, secs);
+			fflush(stderr);
 		}
 	}
 
@@ -897,7 +1341,13 @@ static void BuildContainmentExecute(ClientContext &context, TableFunctionInput &
 		const auto &tmpl = LoaderTemplatesSql();
 		auto section = ExtractSection(tmpl, "derived_edge_containment");
 
-		for (const auto &state : bind.states) {
+		for (size_t i = 0; i < bind.states.size(); ++i) {
+			const auto &state = bind.states[i];
+			char counter[64];
+			snprintf(counter, sizeof(counter), "(%zu/%zu)", i + 1, bind.states.size());
+			fprintf(stderr, "[us_geocoder %s] begin edge_containment %s\n", state.abbrev.c_str(), counter);
+			fflush(stderr);
+			auto t0 = std::chrono::steady_clock::now();
 			gstate.results.push_back({"begin:" + state.abbrev, 0});
 			// Idempotent: wipe existing rows for this state first, then recompute.
 			auto del_sql = "DELETE FROM " + data_loc + ".edge_containment WHERE statefp = '" + state.fips + "'";
@@ -907,9 +1357,15 @@ static void BuildContainmentExecute(ClientContext &context, TableFunctionInput &
 			}
 			auto rendered =
 			    RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", state.fips}});
+			StepTimer timer(state.abbrev, "edge_containment");
 			int64_t rows = ExecuteInsert(conn, rendered, "edge_containment:" + state.abbrev);
 			gstate.results.push_back({"edge_containment:" + state.abbrev, rows});
 			gstate.results.push_back({"done:" + state.abbrev, 0});
+			timer.Done(rows);
+			auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+			fprintf(stderr, "[us_geocoder %s] done edge_containment %s in %.1fs\n", state.abbrev.c_str(), counter,
+			        secs);
+			fflush(stderr);
 		}
 	}
 
@@ -980,6 +1436,19 @@ void RegisterLoaderFunctions(ExtensionLoader &loader, const std::string &) {
 	                             LoadTigerAllStatesBind, LoaderGlobalState::Init);
 	AddLoaderNamedParams(all_states_fn1);
 	loader.RegisterFunction(all_states_fn1);
+
+	// unload_tiger_state(state_abbrev VARCHAR | VARCHAR[])
+	const auto list_vc_unload = LogicalType::LIST(LogicalType::VARCHAR);
+	TableFunction unload_fn1("unload_tiger_state", {LogicalType::VARCHAR}, UnloadTigerStateExecute,
+	                         UnloadTigerStateBind, LoaderGlobalState::Init);
+	unload_fn1.named_parameters["target_db"] = LogicalType::VARCHAR;
+	unload_fn1.named_parameters["target_schema"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(unload_fn1);
+	TableFunction unload_fn2("unload_tiger_state", {list_vc_unload}, UnloadTigerStateExecute, UnloadTigerStateBind,
+	                         LoaderGlobalState::Init);
+	unload_fn2.named_parameters["target_db"] = LogicalType::VARCHAR;
+	unload_fn2.named_parameters["target_schema"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(unload_fn2);
 
 	// install_tiger_schema(database VARCHAR [, schema VARCHAR DEFAULT 'tiger'])
 	//   Creates the TIGER data tables in a target catalog. Idempotent.

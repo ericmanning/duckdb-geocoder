@@ -732,7 +732,7 @@ geocode(
     reference_db       VARCHAR DEFAULT NULL,        -- default: session setting, else 'main'
     reference_schema   VARCHAR DEFAULT NULL         -- default: session setting, else 'tiger'
 ) → TABLE(
-    addy                    geocode_input,
+    adr                    geocode_input,
     geom                    GEOMETRY,
     rating                  INT,
     block_geoid             VARCHAR,   -- 15-char 2020 block GEOID, always populated

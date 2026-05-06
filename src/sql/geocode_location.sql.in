@@ -1,5 +1,6 @@
 -- Stage B — location-only fallback. Depends on `spatial` (ST_Centroid,
--- ST_Intersects) and `splink_udfs` (soundex). Registered best-effort.
+-- ST_Intersects). Uses our built-in soundex (vendored from splink_udfs;
+-- see src/include/vendored_soundex.hpp). Registered best-effort.
 --
 -- Per geocode_flow.md §8, §11:
 --   * Returns rows with rating >= 100 (strict invariant, keeps Stage B
@@ -49,7 +50,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_location_impl(inp, restrict_geom_4269) A
                 location     := zlb.city,
                 state_abbrev := zlb.state,
                 zip          := zlb.zip
-            )::@TIGER@.geocode_input AS addy,
+            )::@TIGER@.geocode_input AS adr,
             ST_Centroid(z.the_geom) AS geom,
             100 + @TIGER@.levenshtein_ignore_case(zlb.city, p.location) AS rating
         FROM @TIGER@.zcta5 z
@@ -77,7 +78,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_location_impl(inp, restrict_geom_4269) A
                 location     := pl.name,
                 state_abbrev := p.state_abbrev,
                 zip          := NULL::VARCHAR
-            )::@TIGER@.geocode_input AS addy,
+            )::@TIGER@.geocode_input AS adr,
             ST_Centroid(pl.the_geom) AS geom,
             100 + @TIGER@.levenshtein_ignore_case(pl.name, p.location) AS rating
         FROM @TIGER@.place pl
@@ -87,7 +88,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_location_impl(inp, restrict_geom_4269) A
           AND soundex(pl.name) = soundex(p.location)
           AND (restrict_geom_4269 IS NULL OR ST_Intersects(pl.the_geom, restrict_geom_4269))
     )
-    SELECT addy, geom, rating FROM zcta_tier
+    SELECT adr, geom, rating FROM zcta_tier
     UNION ALL
-    SELECT addy, geom, rating FROM place_tier
+    SELECT adr, geom, rating FROM place_tier
 );

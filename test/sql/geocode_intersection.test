@@ -7,7 +7,6 @@ require us_geocoder
 statement ok
 LOAD spatial;
 
-require splink_udfs
 
 # Two streets meeting at node 3001 = (-71.405, 41.826).
 # Meeting St runs east from the shared corner; Benefit St runs north.
@@ -44,7 +43,7 @@ INSERT INTO tiger.addr (statefp, tlid, fromhn, tohn, side, zip, plus4) VALUES
 
 # Exact name match at intersection → low rating, geom at shared node.
 query II
-SELECT (addy).street_name, ST_AsText(geom)
+SELECT (adr).street_name, ST_AsText(geom)
 FROM tiger.geocode_intersection('Meeting', 'Benefit', 'RI', 'Providence', '02903', 5)
 ORDER BY rating
 LIMIT 1;
@@ -53,7 +52,7 @@ Meeting	POINT (-71.405 41.826)
 
 # Returned house number is from the shared end of Meeting St (fromhn=100 or 101).
 query I
-SELECT (addy).address IN (100, 101)
+SELECT (adr).address IN (100, 101)
 FROM tiger.geocode_intersection('Meeting', 'Benefit', 'RI', 'Providence', '02903', 5)
 ORDER BY rating
 LIMIT 1;

@@ -2,29 +2,25 @@
 
 A DuckDB community extension that geocodes US addresses against [Census TIGER/Line](https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html) data. A pure-DuckDB rewrite of PostGIS's [`tiger_geocoder`](https://gitea.osgeo.org/postgis/postgis_tiger_geocoder).
 
-Given a street address, it returns (a) a point in NAD83 coordinates interpolated along the street centerline with a 10m perpendicular side-of-street offset, (b) the 2020 census block / tract / block-group GEOIDs covering that point, and (c) a `rating` that lower-bounds match quality (0 = perfect).
+Given a street address, it returns (a) a point in NAD83 coordinates interpolated along the street centerline with a 10m perpendicular side-of-street offset, (b) the 2025 census block / tract / block-group GEOIDs covering that point, and (c) a `rating` that lower-bounds match quality (0 = perfect).
 
-**Status:** alpha. Core geocoder is functional end-to-end against full TIGER data; see [docs/parity.md](docs/parity.md) for where v0.1 diverges from PostGIS.
+**Status:** alpha. Core geocoder is functional end-to-end against full TIGER data; see [docs/parity.md](docs/parity.md) for where v0.1 diverges from PostGIS. Future versions are likely to further diverge from PostGIS as improvements are made against ground-truth parcel data.
 
 ## Install
 
 ```sql
 INSTALL us_geocoder FROM community;
 INSTALL spatial;
-INSTALL splink_udfs            FROM community;
 INSTALL us_address_standardizer FROM community;  -- optional (for raw-string inputs)
 
 LOAD us_geocoder;
 LOAD spatial;
-LOAD splink_udfs;
 LOAD us_address_standardizer;
 ```
 
-If the extension isn't yet in the community registry, build from source — see [Building](#building).
-
 ## Load TIGER data
 
-From the Census CDN (default — needs `httpfs`):
+From the Census (default — needs core `httpfs` that should be bundled already, as with `spatial`):
 
 ```sql
 CALL load_tiger_nation(year := 2025);          -- one-time: state, county, zcta5
@@ -33,7 +29,7 @@ CALL load_tiger_states(['RI','MA','CT']);      -- several states in one call
 CALL load_tiger_all_states();                  -- 50 states + DC
 ```
 
-`load_tiger_state[s]` must run after `load_tiger_nation`. RI loads in ~45s from the Census CDN, ~25s from a local mirror.
+`load_tiger_state[s]` must run after `load_tiger_nation`. RI loads in ~45s from the Census CDN, ~30s from a local mirror.
 
 Local sources need a **Census-nested** layout (`STATE/`, `COUNTY/`, `EDGES/`, `FACES/`, `FEATNAMES/`, … under a single root) — see [docs/api.md § Local source layout](docs/api.md#local-source-layout) for the full subdirectory map.
 
@@ -43,6 +39,10 @@ CALL load_tiger_states(['RI','MA'], '/data/tiger_2025');
 ```
 
 Pass `build_containment := false` to skip the per-state `edge_containment` precompute (saves ~1–2 min/state) if you don't need block / tract / block-group GEOIDs. Populate later with `CALL build_edge_containment(['RI','MA'])`.
+
+### Resumable loads
+
+Loads checkpoint to `tiger.loader_progress` at per-(state, county, table) granularity, so re-running a `load_tiger_*` call skips work that already completed. Cancel and re-run safely; a partial state (e.g. AK failed mid-load on county 016) resumes by redoing only the missing per-county-per-table pieces — counties that already loaded are skipped, counties whose `edges` made it but `faces`/`featnames`/`addr` didn't get patched up. HTTP fetches retry up to 3× with backoff (2s/5s/15s) and switch to a cache-busting query string on retry to bypass any stale Cloudflare edge response. To force a re-load of a state, `CALL unload_tiger_state('AK')` clears its data + progress entries.
 
 ## Reference databases (attached catalogs)
 
@@ -66,7 +66,7 @@ SELECT * FROM tiger.geocode(...);
 The quickest path — a free-form single-string address:
 
 ```sql
-SELECT rating, (addy).address, (addy).street_name, ST_AsText(geom), block_geoid
+SELECT rating, (adr).address, (adr).street_name, ST_AsText(geom), block_geoid
 FROM tiger.geocode('120 Benefit St, Providence RI 02903');
 ```
 
@@ -75,7 +75,7 @@ This routes through [`tiger.from_pagc()`](docs/api.md) (PAGC standardizer) and d
 For full control, pass a `geocode_input` struct and tune `max_results` / `restrict_geom` / `require_containment`:
 
 ```sql
-SELECT rating, (addy).address, (addy).street_name, (addy).location,
+SELECT rating, (adr).address, (adr).street_name, (adr).location,
        ST_AsText(geom), block_geoid, tract_geoid, containment_guaranteed
 FROM tiger.geocode(
     CAST({
@@ -131,8 +131,9 @@ Working end-to-end scripts in [scripts/demo/](scripts/demo/): `build_nj_db.sql` 
 |---|---|---|
 | `spatial` | core | everything |
 | `httpfs` | core | HTTP source mode only (`load_tiger_*` without a local source) |
-| [`splink_udfs`](https://duckdb.org/community_extensions/extensions/splink_udfs) | community | every geocoder call (`soundex`) |
 | [`us_address_standardizer`](https://duckdb.org/community_extensions) | community | `from_pagc()` + `geocode(VARCHAR)` overload (not strictly required — struct-input always works) |
+
+`soundex` is built in (vendored MIT from [splink_udfs](https://github.com/moj-analytical-services/splink_udfs); see [LICENSE-vendored](LICENSE-vendored)) — no community dep.
 
 ## Building
 
@@ -171,8 +172,10 @@ EOF
 
 The script uses `xargs -P 16 curl` and scrapes the Census directory index for county-level enumeration — no hardcoded per-state FIPS list. See [scripts/parallel_download_state.sh](scripts/parallel_download_state.sh) for knobs (parallelism, year, destination).
 
-A genuinely-parallel HTTP mode inside the loader (`httpfs` + `read_blob()` prefetch, eliminating the need for a shell script) is a v0.2 target.
-
 ## License
 
 GPLv2 — same license as the upstream [postgis_tiger_geocoder](https://gitea.osgeo.org/postgis/postgis_tiger_geocoder). See [LICENSE](LICENSE).
+
+### Vendored third-party code
+
+`src/include/vendored_soundex.hpp` is a Soundex encoder copied verbatim from [splink_udfs](https://github.com/moj-analytical-services/splink_udfs) under MIT (Copyright (c) 2025 Ministry of Justice). Vendoring this single file lets us register `soundex` directly in the extension, dropping the runtime dependency on splink_udfs. Full attribution + permission notice in [LICENSE-vendored](LICENSE-vendored). Inline acknowledgement at the top of the vendored file preserves the upstream credit chain (the splink_udfs implementation itself credits Rob Tillaart's MIT [Arduino Soundex](https://github.com/RobTillaart/Soundex) library as algorithmic inspiration).

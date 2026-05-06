@@ -7,7 +7,6 @@ require us_geocoder
 statement ok
 LOAD spatial;
 
-require splink_udfs
 
 # Reuse the Meeting St / Providence fixture.
 statement ok
@@ -57,7 +56,7 @@ INSERT INTO tiger.addr (statefp, tlid, fromhn, tohn, side, zip, plus4) VALUES
 
 # Exact match: Stage A returns rating 0.
 query II
-SELECT rating, (addy).street_name
+SELECT rating, (adr).street_name
 FROM tiger.geocode(
     CAST({address: 150, street_name: 'Meeting', street_type: 'St', pre_dir: NULL,
           post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}
@@ -82,7 +81,7 @@ true
 # No street name → Stage A returns nothing → Stage B (location fallback) fires.
 # Expect rating >= 100 and location = Providence.
 query II
-SELECT rating >= 100, (addy).location
+SELECT rating >= 100, (adr).location
 FROM tiger.geocode(
     CAST({address: NULL, street_name: NULL, street_type: NULL, pre_dir: NULL,
           post_dir: NULL, location: 'Providence', state_abbrev: 'RI', zip: '02903'}

@@ -31,7 +31,7 @@ file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/loader_templates.sql.in LOADER_TEM
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_input_type.sql.in GEOCODE_INPUT_TYPE_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/from_pagc.sql.in FROM_PAGC_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/pagc_tables.sql.in PAGC_TABLES_SQL)
-file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/pprint_addy.sql.in PPRINT_ADDY_SQL)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/pprint_adr.sql.in PPRINT_ADR_SQL)
 
 set(EMBED_HEADER_BODY "#pragma once
 #include <string>
@@ -121,9 +121,9 @@ ${PAGC_TABLES_SQL}
 )USGSQLBLK\");
   return data;
 }
-inline const std::string &PprintAddySql() {
+inline const std::string &PprintAdrSql() {
   static const std::string data(R\"USGSQLBLK(
-${PPRINT_ADDY_SQL}
+${PPRINT_ADR_SQL}
 )USGSQLBLK\");
   return data;
 }
@@ -147,7 +147,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_input_type.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/from_pagc.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/pagc_tables.sql.in
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/pprint_addy.sql.in)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/pprint_adr.sql.in)
 # -------------------------------------------------------------------------
 
 set(EXTENSION_SOURCES

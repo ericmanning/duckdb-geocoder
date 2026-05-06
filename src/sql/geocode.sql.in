@@ -1,7 +1,7 @@
 -- Public geocode() table macro. Combines Stage A (address match) with a
 -- Stage B (location-only) fallback that runs only when Stage A is empty.
 --
--- Returns 7 columns: addy, geom, rating, block_geoid, tract_geoid,
+-- Returns 7 columns: adr, geom, rating, block_geoid, tract_geoid,
 -- blkgrp_geoid, containment_guaranteed.
 --
 -- Per D7: no rating=0 early-exit short-circuit — we compute all Stage A
@@ -28,11 +28,11 @@ CREATE OR REPLACE MACRO @TIGER@.geocode(
 ) AS TABLE (
     WITH
     stage_a AS (
-        SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
+        SELECT adr, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
         FROM @TIGER@.geocode_address_impl(input_geocode_input, max_results, restrict_geom, 2.0)
     ),
     stage_b AS (
-        SELECT addy, geom, rating,
+        SELECT adr, geom, rating,
                NULL::VARCHAR AS block_geoid,
                NULL::VARCHAR AS tract_geoid,
                NULL::VARCHAR AS blkgrp_geoid,
@@ -45,14 +45,14 @@ CREATE OR REPLACE MACRO @TIGER@.geocode(
         UNION ALL
         SELECT * FROM stage_b
     )
-    SELECT addy, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
+    SELECT adr, geom, rating, block_geoid, tract_geoid, blkgrp_geoid, containment_guaranteed
     FROM combined
     WHERE require_containment IS NULL
        OR require_containment = 'none'
        OR (require_containment IN ('block', 'tract', 'blkgrp') AND containment_guaranteed)
     -- Secondary sort by geom coords keeps tie-breaking deterministic across
     -- runs. e_tlid (used inside geocode_address_impl) isn't visible here
-    -- after the addy struct is packed; the rounded geom string is the next-
+    -- after the adr struct is packed; the rounded geom string is the next-
     -- best stable key and matches the parity harness's output formatting.
     ORDER BY rating, ST_X(geom), ST_Y(geom)
     LIMIT max_results

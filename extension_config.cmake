@@ -6,19 +6,12 @@ duckdb_extension_load(us_geocoder
     LOAD_TESTS
 )
 
-# Test-time dep: splink_udfs is built from source and statically linked into
-# the test runner so `LOAD splink_udfs` resolves without an autoinstall
-# round-trip (the autoinstall path hangs inside the linux_amd64 ci-tools
-# Docker test image). Pinned to the same SHA the community-extensions
-# registry ships (moj-analytical-services/splink_udfs v0.0.11). The repo
-# vendors rapidfuzz-cpp as a git submodule under third_party/rapidfuzz —
-# SUBMODULES makes FetchContent recurse into it at clone time.
+# us_address_standardizer is a C-API extension and can't be embedded into
+# the test runner the way splink_udfs used to be; the one test that
+# exercises it (pg_intersection_regress_pagc) is gated on
+# `require us_address_standardizer` and skipped in CI.
 #
-# us_address_standardizer is a C-API extension and can't be embedded the
-# same way; the one test that exercises it (pg_intersection_regress_pagc)
-# is gated on `require us_address_standardizer` and skipped in CI.
-duckdb_extension_load(splink_udfs
-    GIT_URL https://github.com/moj-analytical-services/splink_udfs
-    GIT_TAG cf00056f887486d0aee0a853a764f9775aa40438
-    SUBMODULES "third_party/rapidfuzz"
-)
+# splink_udfs was previously embedded for its `soundex` function. We now
+# vendor that single function (MIT, see src/include/vendored_soundex.hpp +
+# LICENSE-vendored) and register it directly in LoadInternal, eliminating
+# the dependency.
