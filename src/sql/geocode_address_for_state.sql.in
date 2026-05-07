@@ -277,7 +277,60 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_for_state(statefp_lit, inp, max_
              ON fc.statefp = statefp_lit AND fc.tfid = fae.tfidr
         WHERE fae.side = 'R'
     ),
+    -- Hoist the place/cousub/county/state lookups + the `via_primary`
+    -- predicate up to its own CTE so the predicate is evaluated once per
+    -- row instead of being inlined four times into candidates_a's rating
+    -- expression. via_primary appears in: (a) the address-clamp branch
+    -- in ranked_a, (b) the no-input-ZIP rating constant, (c) the ZIP
+    -- penalty formula, (d) the city penalty formula. Each repeats the
+    -- full `lower(fullname) LIKE … OR soundex_eq` body inline today —
+    -- the comment in candidates_a notes it's a workaround for the same-
+    -- SELECT alias-reference limitation, which is solved by moving the
+    -- predicate into an upstream CTE.
+    fae_faces_a_scored AS NOT MATERIALIZED (
+        SELECT ff.*,
+               pl.name             AS place_name,
+               cs.name             AS cousub_name,
+               ct.name             AS county_name,
+               st.stusps           AS state_abbrev,
+               -- Pre-parsed house-number range. tiger.least_hn / greatest_hn
+               -- are macros that wrap each input in regexp_matches + trim +
+               -- CAST — not cheap. They were called 7+ times per row in
+               -- candidates_a's address penalty CASE and 5+ times in
+               -- ranked_a's address rendering CASE. DuckDB should CSE these,
+               -- but per splink#2929 the optimizer skips CSE inside a CASE
+               -- whose first branch is a NULL guard — exactly our shape.
+               -- Hoisting both into a column once per row sidesteps the
+               -- guard-clause pessimization.
+               @TIGER@.least_hn(ff.fromhn, ff.tohn)    AS hn_min,
+               @TIGER@.greatest_hn(ff.fromhn, ff.tohn) AS hn_max,
+               -- "Primary-shaped" predicate: TRUE iff PG primary would have
+               -- emitted this row. Two conditions:
+               --   1. Name filter (geocode_address.sql:110):
+               --        length>5 → exact_name OR fullname-LIKE-with-predir OR soundex_eq
+               --        length≤5 → exact_name only
+               --   2. Place is non-null. PG primary INNER JOINs tiger.place
+               --      (geocode_address.sql:167), so rows whose face has NULL
+               --      placefp (common in unincorporated CDPs that map to a
+               --      cousub/county) don't appear in primary — only PG fallback
+               --      catches them.
+               (   pl.name IS NOT NULL
+                AND (ff.name_lower = ff.p_street_name_lower
+                     OR (length(ff.p_street_name) > 5 AND (
+                               lower(ff.fullname) LIKE COALESCE(lower(ff.p_pre_dir) || ' ', '') || ff.p_street_name_lower || '%'
+                            OR ff.name_soundex = ff.p_street_name_soundex)))
+               )                    AS via_primary
+        FROM fae_faces_a ff
+        LEFT JOIN @TIGER@.place  pl ON pl.statefp = ff.e_statefp AND pl.placefp  = ff.placefp
+        LEFT JOIN @TIGER@.cousub cs ON cs.statefp = ff.e_statefp AND cs.cousubfp = ff.cousubfp
+        LEFT JOIN @TIGER@.county ct ON ct.statefp = ff.e_statefp AND ct.countyfp = ff.e_countyfp
+        JOIN      @TIGER@.state  st ON st.statefp = ff.e_statefp
+    ),
     candidates_a AS (
+        -- Pure projection over fae_faces_a_scored: every input column comes
+        -- from the upstream CTE, including via_primary (computed once there
+        -- and referenced by the rating CASEs below as a column alias rather
+        -- than re-evaluating the predicate body).
         SELECT
             ff.name             AS f_name,
             ff.fullname         AS f_fullname,
@@ -295,34 +348,16 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_for_state(statefp_lit, inp, max_
             ff.tfidl            AS f_tfidl,
             ff.tfidr            AS f_tfidr,
             ff.e_statefp        AS fc_statefp,
-            pl.name             AS place_name,
-            cs.name             AS cousub_name,
-            ct.name             AS county_name,
-            st.stusps           AS state_abbrev,
+            ff.place_name       AS place_name,
+            ff.cousub_name      AS cousub_name,
+            ff.county_name      AS county_name,
+            ff.state_abbrev     AS state_abbrev,
             ff.p_address        AS p_address,
             ff.p_location       AS p_location,
             ff.p_internal       AS p_internal,
-            -- "Primary-shaped" predicate: TRUE iff PG primary would have
-            -- emitted this row. Two conditions:
-            --   1. Name filter (geocode_address.sql:110):
-            --        length>5 → exact_name OR fullname-LIKE-with-predir OR soundex_eq
-            --        length≤5 → exact_name only
-            --   2. Place is non-null. PG primary INNER JOINs tiger.place
-            --      (geocode_address.sql:167), so rows whose face has NULL
-            --      placefp (common in unincorporated CDPs that map to a
-            --      cousub/county) don't appear in primary — only PG fallback
-            --      catches them. Without this conjunct we'd misapply primary's
-            --      place-only city formula to NULL-place rows and emit
-            --      city_penalty=5 instead of fallback's lev-to-cousub=0.
-            -- Used three places below: (a) no-input-ZIP rating constant,
-            -- (b) ZIP penalty formula, (c) city penalty formula. Also used
-            -- in ranked_a's address rendering (clamp vs NULL).
-            (   pl.name IS NOT NULL
-             AND (ff.name_lower = ff.p_street_name_lower
-                  OR (length(ff.p_street_name) > 5 AND (
-                            lower(ff.fullname) LIKE COALESCE(lower(ff.p_pre_dir) || ' ', '') || ff.p_street_name_lower || '%'
-                         OR ff.name_soundex = ff.p_street_name_soundex)))
-            )                   AS via_primary,
+            ff.via_primary      AS via_primary,
+            ff.hn_min           AS a_hn_min,
+            ff.hn_max           AS a_hn_max,
             @TIGER@.rate_attributes(
                 ff.p_pre_dir, ff.predirabrv,
                 ff.p_street_name, ff.name,
@@ -332,45 +367,27 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_for_state(statefp_lit, inp, max_
             )
             + CASE
                 WHEN ff.p_address IS NULL OR ff.fromhn IS NULL THEN 20
-                WHEN ff.p_address BETWEEN @TIGER@.least_hn(ff.fromhn, ff.tohn) AND @TIGER@.greatest_hn(ff.fromhn, ff.tohn)
-                     AND (ff.p_address % 2) = (@TIGER@.greatest_hn(ff.fromhn, ff.tohn) % 2) THEN 0
-                WHEN ff.p_address BETWEEN @TIGER@.least_hn(ff.fromhn, ff.tohn) AND @TIGER@.greatest_hn(ff.fromhn, ff.tohn) THEN 2
+                WHEN ff.p_address BETWEEN ff.hn_min AND ff.hn_max
+                     AND (ff.p_address % 2) = (ff.hn_max % 2) THEN 0
+                WHEN ff.p_address BETWEEN ff.hn_min AND ff.hn_max THEN 2
                 ELSE ((1.0 - (
-                            LEAST(ff.p_address, @TIGER@.least_hn(ff.fromhn, ff.tohn))::DOUBLE
-                            / GREATEST(1, GREATEST(ff.p_address, @TIGER@.greatest_hn(ff.fromhn, ff.tohn)))
+                            LEAST(ff.p_address, ff.hn_min)::DOUBLE
+                            / GREATEST(1, GREATEST(ff.p_address, ff.hn_max))
                       )) * 5)::INTEGER + 5
               END
             -- ZIP penalty: PG primary uses `LEAST(diff_zip, 20) * penalty`
             -- (geocode_address.sql:125); PG fallback uses
             -- `LEAST(diff_zip * penalty, lev_zip * penalty)`
-            -- (geocode_address.sql:320), which lets near-prefix ZIPs (lev=3
-            -- → penalty 6) score better than they would under the primary's
-            -- numeric-distance formula (213 capped at 20 → penalty 40).
-            -- Discriminate per row via_primary. Closes #1145d-class scoring
-            -- where input ZIP is in a different numeric range from the
-            -- candidate's ZIP but their digit prefixes are close.
-            -- The no-input-ZIP constant (+1 vs +3) uses the same predicate.
-            -- Note: the inline predicates duplicate via_primary's body because
-            -- a column alias defined in the same SELECT can't be referenced
-            -- in sibling expressions without a wrapping subquery. Kept verbatim.
+            -- (geocode_address.sql:320). Discriminate per row via via_primary
+            -- (computed in fae_faces_a_scored). The no-input-ZIP constant
+            -- (+1 vs +3) uses the same flag.
             + CASE
                 WHEN ff.p_zip IS NULL THEN
-                    CASE WHEN pl.name IS NOT NULL
-                              AND (ff.name_lower = ff.p_street_name_lower
-                                   OR (length(ff.p_street_name) > 5 AND (
-                                         lower(ff.fullname) LIKE COALESCE(lower(ff.p_pre_dir) || ' ', '') || ff.p_street_name_lower || '%'
-                                         OR ff.name_soundex = ff.p_street_name_soundex)))
-                         THEN 1 ELSE 3
-                    END
+                    CASE WHEN ff.via_primary THEN 1 ELSE 3 END
                 WHEN ff.a_zip IS NULL THEN 0
-                WHEN pl.name IS NOT NULL
-                     AND (ff.name_lower = ff.p_street_name_lower
-                          OR (length(ff.p_street_name) > 5 AND (
-                                lower(ff.fullname) LIKE COALESCE(lower(ff.p_pre_dir) || ' ', '') || ff.p_street_name_lower || '%'
-                                OR ff.name_soundex = ff.p_street_name_soundex)))
-                THEN -- via_primary: PG primary's formula
+                WHEN ff.via_primary THEN
                     LEAST(@TIGER@.diff_zip(ff.p_zip, ff.a_zip) * zip_penalty, 20 * zip_penalty)::INTEGER
-                ELSE -- fallback-shaped: PG fallback's formula
+                ELSE
                     LEAST(
                         (@TIGER@.diff_zip(ff.p_zip, ff.a_zip) * zip_penalty)::INTEGER,
                         (@TIGER@.levenshtein_ignore_case(ff.p_zip, ff.a_zip) * zip_penalty)::INTEGER
@@ -380,55 +397,41 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_for_state(statefp_lit, inp, max_
             -- (geocode_address.sql:127); PG fallback uses
             -- `LEAST(lev(input, COALESCE(p, cs, zip.city, co)),
             --        lev(input, COALESCE(cs, co))) or 5`
-            -- (geocode_address.sql:322). The fallback formula picks the
-            -- best lev across multiple location sources instead of only
-            -- using place — important when place is NULL on the matched
-            -- face (common in unincorporated areas) and the cousub or
-            -- county provides the actual city match.
+            -- (geocode_address.sql:322).
             + CASE
                 WHEN ff.p_location IS NULL THEN 5
-                WHEN pl.name IS NOT NULL
-                     AND (ff.name_lower = ff.p_street_name_lower
-                          OR (length(ff.p_street_name) > 5 AND (
-                                lower(ff.fullname) LIKE COALESCE(lower(ff.p_pre_dir) || ' ', '') || ff.p_street_name_lower || '%'
-                                OR ff.name_soundex = ff.p_street_name_soundex)))
-                THEN -- via_primary: PG primary's place-only formula
-                    COALESCE(@TIGER@.levenshtein_ignore_case(ff.p_location, pl.name), 5)
-                ELSE -- fallback-shaped: PG fallback's LEAST formula
+                WHEN ff.via_primary THEN
+                    COALESCE(@TIGER@.levenshtein_ignore_case(ff.p_location, ff.place_name), 5)
+                ELSE
                     COALESCE(LEAST(
                         @TIGER@.levenshtein_ignore_case(
                             ff.p_location,
-                            COALESCE(pl.name, cs.name, ct.name)),
+                            COALESCE(ff.place_name, ff.cousub_name, ff.county_name)),
                         @TIGER@.levenshtein_ignore_case(
                             ff.p_location,
-                            COALESCE(cs.name, ct.name))
+                            COALESCE(ff.cousub_name, ff.county_name))
                     ), 5)
               END AS rating
-        FROM fae_faces_a ff
-        LEFT JOIN @TIGER@.place  pl ON pl.statefp = ff.e_statefp AND pl.placefp  = ff.placefp
-        LEFT JOIN @TIGER@.cousub cs ON cs.statefp = ff.e_statefp AND cs.cousubfp = ff.cousubfp
-        LEFT JOIN @TIGER@.county ct ON ct.statefp = ff.e_statefp AND ct.countyfp = ff.e_countyfp
-        JOIN      @TIGER@.state  st ON st.statefp = ff.e_statefp
+        FROM fae_faces_a_scored ff
     ),
     ranked_a AS (
         SELECT
             STRUCT_PACK(
                 address      := CASE
                                   WHEN p_address IS NULL OR a_fromhn IS NULL THEN p_address
-                                  WHEN p_address BETWEEN @TIGER@.least_hn(a_fromhn, a_tohn)
-                                                     AND @TIGER@.greatest_hn(a_fromhn, a_tohn)
-                                       AND (p_address % 2) = (@TIGER@.greatest_hn(a_fromhn, a_tohn) % 2)
+                                  WHEN p_address BETWEEN a_hn_min AND a_hn_max
+                                       AND (p_address % 2) = (a_hn_max % 2)
                                   THEN p_address
                                   -- Out-of-range: PG primary clamps to nearest endpoint
                                   -- (geocode_address.sql:207); PG fallback NULLs it
                                   -- (geocode_address.sql:397). Discriminate per row via
-                                  -- via_primary (set in candidates_a from PG primary's
-                                  -- name filter). Closes #1076h row-2 rendering.
+                                  -- via_primary (set in fae_faces_a_scored from PG
+                                  -- primary's name filter). Closes #1076h row-2 rendering.
                                   WHEN NOT via_primary THEN NULL
-                                  WHEN p_address > @TIGER@.greatest_hn(a_fromhn, a_tohn)
-                                       AND p_address > @TIGER@.least_hn(a_fromhn, a_tohn)
-                                  THEN @TIGER@.greatest_hn(a_fromhn, a_tohn)
-                                  ELSE @TIGER@.least_hn(a_fromhn, a_tohn)
+                                  WHEN p_address > a_hn_max
+                                       AND p_address > a_hn_min
+                                  THEN a_hn_max
+                                  ELSE a_hn_min
                                 END,
                 street_name  := CASE
                                   WHEN f_prequalabr IS NOT NULL
@@ -617,6 +620,15 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_for_state(statefp_lit, inp, max_
              ON fc.statefp = statefp_lit AND fc.tfid = fae.tfidr
         WHERE fae.side = 'R'
     ),
+    -- Pass B doesn't need via_primary, but it has the same NULL-guard-blocks-
+    -- CSE pattern around least_hn/greatest_hn (splink#2929). Hoist hn_min /
+    -- hn_max here so candidates_b and ranked_b reference them as columns.
+    fae_faces_b_scored AS NOT MATERIALIZED (
+        SELECT ff.*,
+               @TIGER@.least_hn(ff.fromhn, ff.tohn)    AS hn_min,
+               @TIGER@.greatest_hn(ff.fromhn, ff.tohn) AS hn_max
+        FROM fae_faces_b ff
+    ),
     candidates_b AS (
         SELECT
             ff.name             AS f_name,
@@ -642,6 +654,8 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_for_state(statefp_lit, inp, max_
             ff.p_address        AS p_address,
             ff.p_location       AS p_location,
             ff.p_internal       AS p_internal,
+            ff.hn_min           AS a_hn_min,
+            ff.hn_max           AS a_hn_max,
             @TIGER@.rate_attributes(
                 ff.p_pre_dir, ff.predirabrv,
                 ff.p_street_name, ff.name,
@@ -651,12 +665,12 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_for_state(statefp_lit, inp, max_
             )
             + CASE
                 WHEN ff.p_address IS NULL OR ff.fromhn IS NULL THEN 20
-                WHEN ff.p_address BETWEEN @TIGER@.least_hn(ff.fromhn, ff.tohn) AND @TIGER@.greatest_hn(ff.fromhn, ff.tohn)
-                     AND (ff.p_address % 2) = (@TIGER@.greatest_hn(ff.fromhn, ff.tohn) % 2) THEN 0
-                WHEN ff.p_address BETWEEN @TIGER@.least_hn(ff.fromhn, ff.tohn) AND @TIGER@.greatest_hn(ff.fromhn, ff.tohn) THEN 2
+                WHEN ff.p_address BETWEEN ff.hn_min AND ff.hn_max
+                     AND (ff.p_address % 2) = (ff.hn_max % 2) THEN 0
+                WHEN ff.p_address BETWEEN ff.hn_min AND ff.hn_max THEN 2
                 ELSE ((1.0 - (
-                            LEAST(ff.p_address, @TIGER@.least_hn(ff.fromhn, ff.tohn))::DOUBLE
-                            / GREATEST(1, GREATEST(ff.p_address, @TIGER@.greatest_hn(ff.fromhn, ff.tohn)))
+                            LEAST(ff.p_address, ff.hn_min)::DOUBLE
+                            / GREATEST(1, GREATEST(ff.p_address, ff.hn_max))
                       )) * 5)::INTEGER + 5
               END
             -- Pass B is the fallback path: use PG fallback's rating formulas
@@ -680,7 +694,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_for_state(statefp_lit, inp, max_
                         COALESCE(cs.name, ct.name))
                 ), 5)
               END AS rating
-        FROM fae_faces_b ff
+        FROM fae_faces_b_scored ff
         LEFT JOIN @TIGER@.place  pl ON pl.statefp = ff.e_statefp AND pl.placefp  = ff.placefp
         LEFT JOIN @TIGER@.cousub cs ON cs.statefp = ff.e_statefp AND cs.cousubfp = ff.cousubfp
         LEFT JOIN @TIGER@.county ct ON ct.statefp = ff.e_statefp AND ct.countyfp = ff.e_countyfp
@@ -694,9 +708,8 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_for_state(statefp_lit, inp, max_
                 -- (geocode_address.sql:397).
                 address      := CASE
                                   WHEN p_address IS NULL OR a_fromhn IS NULL THEN p_address
-                                  WHEN p_address BETWEEN @TIGER@.least_hn(a_fromhn, a_tohn)
-                                                     AND @TIGER@.greatest_hn(a_fromhn, a_tohn)
-                                       AND (p_address % 2) = (@TIGER@.greatest_hn(a_fromhn, a_tohn) % 2)
+                                  WHEN p_address BETWEEN a_hn_min AND a_hn_max
+                                       AND (p_address % 2) = (a_hn_max % 2)
                                   THEN p_address
                                   ELSE NULL
                                 END,
