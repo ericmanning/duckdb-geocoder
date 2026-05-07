@@ -62,7 +62,7 @@ constexpr idx_t kBufferThreshold = 100000;
 // slice into ⌈n/cap⌉ sub-dispatches; each pays its own per-state SQL
 // plan cost but keeps peak spill bounded. Tuned empirically; raise if
 // plan overhead dominates wall-clock on big single-state inputs.
-constexpr idx_t kPerStateSliceCap = 5000;
+constexpr idx_t kPerStateSliceCap = 1000;
 constexpr idx_t kInvalidIdx = static_cast<idx_t>(-1);
 
 // Recognized input column names (Form 1 + Form 2).
