@@ -52,6 +52,7 @@ duckdb_unittest_tempdir/
 .vscode/
 *.swp
 *.swo
+.claude/
 
 # Python (scripts/)
 __pycache__/
