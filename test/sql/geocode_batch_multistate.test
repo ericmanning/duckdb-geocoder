@@ -1,0 +1,122 @@
+# name: test/sql/geocode_batch_multistate.test
+# description: geocode_batch resolves a multi-state ZIP to candidates in every
+#              state and picks the lowest-rated match across them. Pre-fix the
+#              C++ resolution did `LIMIT 1` against zip_lookup_base and could
+#              silently drop matches when an input's correct state was
+#              ordered second.
+# group: [sql]
+
+require us_geocoder
+
+statement ok
+LOAD spatial;
+
+# ZIP 01504 is a real MA/RI border ZIP. Build a 2-state fixture sharing it,
+# with a "Main St" only on the MA side and a different street on the RI side.
+
+statement ok
+INSERT INTO tiger.state (statefp, stusps, name, the_geom) VALUES
+    ('25', 'MA', 'Massachusetts',
+     ST_GeomFromText('POLYGON((-72.0 42.0, -71.5 42.0, -71.5 42.1, -72.0 42.1, -72.0 42.0))')),
+    ('44', 'RI', 'Rhode Island',
+     ST_GeomFromText('POLYGON((-71.9 41.9, -71.4 41.9, -71.4 42.0, -71.9 42.0, -71.9 41.9))'));
+
+statement ok
+INSERT INTO tiger.county (statefp, countyfp, cntyidfp, name, the_geom) VALUES
+    ('25', '027', '25027', 'Worcester',
+     ST_GeomFromText('POLYGON((-71.6 42.00, -71.5 42.00, -71.5 42.05, -71.6 42.05, -71.6 42.00))')),
+    ('44', '007', '44007', 'Providence',
+     ST_GeomFromText('POLYGON((-71.6 41.95, -71.5 41.95, -71.5 42.00, -71.6 42.00, -71.6 41.95))'));
+
+statement ok
+INSERT INTO tiger.place (statefp, placefp, plcidfp, name, the_geom) VALUES
+    ('25', '06365', '2506365', 'Blackstone',
+     ST_GeomFromText('POLYGON((-71.55 42.01, -71.51 42.01, -71.51 42.04, -71.55 42.04, -71.55 42.01))')),
+    ('44', '20020', '4420020', 'Cumberland',
+     ST_GeomFromText('POLYGON((-71.55 41.96, -71.51 41.96, -71.51 41.99, -71.55 41.99, -71.55 41.96))'));
+
+# Same ZIP listed in zip_lookup_base for BOTH states — this is what triggers
+# the multi-state dispatch path.
+statement ok
+INSERT INTO tiger.zip_lookup_base (zip, state, county, city, statefp) VALUES
+    ('01504', 'MA', 'Worcester',  'Blackstone',  '25'),
+    ('01504', 'RI', 'Providence', 'Cumberland', '44');
+
+# featnames: "Main St" only in MA, "Harkness Rd" only in RI.
+statement ok
+INSERT INTO tiger.featnames (statefp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc, name_lower, fullname_norm, name_soundex) VALUES
+    ('25', 2001, 'Main',     'Main St',     NULL, NULL, NULL, 'St', NULL, 'S1400', 'main',     'main st',     soundex('Main')),
+    ('44', 2002, 'Harkness', 'Harkness Rd', NULL, NULL, NULL, 'Rd', NULL, 'S1400', 'harkness', 'harkness rd', soundex('Harkness'));
+
+statement ok
+UPDATE tiger.featnames
+SET numeric_stem     = CASE WHEN name IS NOT NULL
+                              AND length(name) < 10
+                              AND regexp_matches(name, '^[0-9/\s]+')
+                            THEN trim(regexp_extract(name, '^[0-9/\s]+')) END,
+    name_first_5     = substr(name_lower, 1, 5),
+    fullname_first_5 = substr(fullname_norm, 1, 5);
+
+statement ok
+INSERT INTO tiger.edges (statefp, countyfp, tlid, tfidl, tfidr, tnidf, tnidt, mtfcc, fullname, the_geom, zipl, zipr) VALUES
+    ('25', '027', 2001, 3001, 3002, 4001, 4002, 'S1400', 'Main St',
+     ST_GeomFromText('LINESTRING(-71.530 42.020, -71.520 42.020)'), '01504', '01504'),
+    ('44', '007', 2002, 3003, 3004, 4003, 4004, 'S1400', 'Harkness Rd',
+     ST_GeomFromText('LINESTRING(-71.530 41.970, -71.520 41.970)'), '01504', '01504');
+
+statement ok
+INSERT INTO tiger.faces (statefp, countyfp, tfid, placefp, cousubfp, tractce20, blockce20, blkgrpce20, the_geom) VALUES
+    ('25', '027', 3001, '06365', NULL, '000100', '1001', '1',
+     ST_GeomFromText('POLYGON((-71.532 42.021, -71.518 42.021, -71.518 42.020, -71.532 42.020, -71.532 42.021))')),
+    ('25', '027', 3002, '06365', NULL, '000100', '1002', '1',
+     ST_GeomFromText('POLYGON((-71.532 42.020, -71.518 42.020, -71.518 42.019, -71.532 42.019, -71.532 42.020))')),
+    ('44', '007', 3003, '20020', NULL, '000200', '2001', '1',
+     ST_GeomFromText('POLYGON((-71.532 41.971, -71.518 41.971, -71.518 41.970, -71.532 41.970, -71.532 41.971))')),
+    ('44', '007', 3004, '20020', NULL, '000200', '2002', '1',
+     ST_GeomFromText('POLYGON((-71.532 41.970, -71.518 41.970, -71.518 41.969, -71.532 41.969, -71.532 41.969))'));
+
+statement ok
+INSERT INTO tiger.addr (statefp, tlid, fromhn, tohn, side, zip, plus4) VALUES
+    ('25', 2001, '1',   '99',  'L', '01504', NULL),
+    ('25', 2001, '2',   '98',  'R', '01504', NULL),
+    ('44', 2002, '101', '199', 'L', '01504', NULL),
+    ('44', 2002, '102', '198', 'R', '01504', NULL);
+
+# (1) No state_abbrev — input "5 Main St 01504" should resolve via the
+# multi-state ZIP path, dispatch to both MA (25) and RI (44), and pick the
+# only viable candidate (MA's Main St). RI side has no Main St → no match.
+query II
+SELECT id, rating IS NOT NULL
+FROM geocode_batch((SELECT 1 AS id, '5 Main St 01504' AS addr_str));
+----
+1	true
+
+# (2) Same input — confirm the matched address comes back as MA, not RI.
+query II
+SELECT id, adr_text LIKE '%, MA %'
+FROM geocode_batch((SELECT 1 AS id, '5 Main St 01504' AS addr_str));
+----
+1	true
+
+# (3) Force RI explicitly — should return NULL because RI portion of 01504
+# has only Harkness Rd, no Main St.
+query II
+SELECT id, rating IS NULL
+FROM geocode_batch((SELECT 2 AS id, '5 Main St, RI 01504' AS addr_str));
+----
+2	true
+
+# (4) Force MA explicitly — should match Main St identically to (1).
+query II
+SELECT id, adr_text LIKE '%, MA %'
+FROM geocode_batch((SELECT 3 AS id, '5 Main St, MA 01504' AS addr_str));
+----
+3	true
+
+# (5) Sanity: input with no state and no resolvable ZIP returns a NULL row,
+# not a crash, and the input_idx is preserved.
+query II
+SELECT id, rating IS NULL
+FROM geocode_batch((SELECT 4 AS id, '999 Nonexistent St' AS addr_str));
+----
+4	true

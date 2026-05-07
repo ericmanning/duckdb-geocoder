@@ -254,6 +254,19 @@ Standardizer adapter. Parses a free-form address string into a `geocode_input` s
 
 See [§ geocode_input](#tigergeocode_input) for the output shape and the `canon_*` macros for individual field normalization.
 
+### `geocode_batch(input TABLE) → TABLE`
+
+Batch entry point. Takes a table-valued subquery whose columns are either `(id, addr_str)` (free-form) or the parsed `geocode_input` field names (`address`, `street_name`, `street_type`, `pre_dir`, `post_dir`, `internal`, `location`, `state_abbrev`, `zip`). Internally buffers rows, partitions by resolved `statefp`, and dispatches one per-state SQL per state — this lets the planner constant-fold the literal statefp into ART-pushed scans on the big TIGER tables, which is what makes nationwide-scale inputs viable. Output adds `rating`, `lng`, `lat`, `adr_text`, `block_geoid`, `tract_geoid`, `blkgrp_geoid`, `containment_guaranteed` to whatever passthrough columns the input had.
+
+```sql
+SELECT id, rating, lng, lat, adr_text
+FROM geocode_batch((SELECT id, addr_str FROM my_inputs));
+```
+
+**Multi-state ZIPs.** ~7% of US ZIPs cross state lines (mostly metro-area border ZIPs). When an input row has no `state_abbrev` and its ZIP appears in multiple states, the resolver returns *every* candidate `statefp` and the row is dispatched to all of them. The result merge keeps the lowest-rated match across states, so an input "5 Main St 01504" — a real MA/RI border ZIP — correctly returns the MA candidate even when there's no Main St on the RI side. This is bounded by max(distinct states per ZIP), rarely > 3 in TIGER.
+
+When neither `state_abbrev` nor a ZIP-resolvable state is available, the row gets a NULL output preserving its `id`.
+
 ### `tiger.geocode_intersection(road1 VARCHAR, road2 VARCHAR, state VARCHAR, city VARCHAR, zip VARCHAR, max_results INT) → TABLE`
 
 Finds intersections of two streets. Joins candidate edges on shared TIGER node IDs (`tnidf`/`tnidt`) — not `ST_Intersects` — which means intersecting edges are found in O(joins) rather than O(spatial).

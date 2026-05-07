@@ -312,7 +312,12 @@ static std::string RenderParsedRowTuple(idx_t input_idx, const std::vector<Value
 
 struct ResolvedRow {
 	idx_t input_idx;
-	Value statefp; // VARCHAR or NULL
+	// Candidate states for this input. Usually 1 (state_abbrev hit, or
+	// single-state ZIP). For multi-state ZIPs (~7% of US ZIPs cross state
+	// lines, mostly in metro areas), the resolution returns every candidate
+	// statefp and we dispatch the input to all of them; the result merge
+	// keeps the lowest-rated match. Empty = no resolvable state, skip.
+	std::vector<std::string> candidate_statefps;
 	std::vector<Value> struct_fields; // 9 fields in geocode_input order
 };
 
@@ -332,9 +337,14 @@ static std::vector<ResolvedRow> RunResolution(Connection &conn, const BatchBindD
 		    << " s['address'], s['street_name'], s['street_type'], s['internal'],"
 		    << " s['pre_dir'], s['post_dir'], s['location'], s['state_abbrev'], s['zip'],"
 		    << " COALESCE("
-		    << "(SELECT statefp FROM tiger.state_lookup WHERE abbrev = s['state_abbrev'] LIMIT 1),"
-		    << "(SELECT statefp FROM tiger.zip_lookup_base WHERE zip = s['zip'] LIMIT 1)"
-		    << ") AS resolved_statefp"
+		    // 1-state happy path: known state_abbrev → 1-elem list.
+		    << "(SELECT [statefp] FROM tiger.state_lookup WHERE abbrev = s['state_abbrev'] LIMIT 1),"
+		    // ZIP fallback: a multi-state ZIP returns N statefps; we
+		    // dispatch to all and let the rating decide. DISTINCT in case
+		    // zip_lookup_base has dup rows for the same (zip, state).
+		    << "(SELECT list(DISTINCT statefp) FROM tiger.zip_lookup_base WHERE zip = s['zip']),"
+		    << "[]::VARCHAR[]"
+		    << ") AS candidate_statefps"
 		    << " FROM parsed ORDER BY input_idx";
 	} else {
 		// Form 2 SQL: VALUES of (idx, address, ..., zip), then resolve.
@@ -348,9 +358,10 @@ static std::vector<ResolvedRow> RunResolution(Connection &conn, const BatchBindD
 		    << " SELECT input_idx, address, street_name, street_type, internal,"
 		    << " pre_dir, post_dir, location, state_abbrev, zip,"
 		    << " COALESCE("
-		    << "(SELECT statefp FROM tiger.state_lookup WHERE abbrev = state_abbrev LIMIT 1),"
-		    << "(SELECT statefp FROM tiger.zip_lookup_base WHERE input.zip = zip_lookup_base.zip LIMIT 1)"
-		    << ") AS resolved_statefp"
+		    << "(SELECT [statefp] FROM tiger.state_lookup WHERE abbrev = state_abbrev LIMIT 1),"
+		    << "(SELECT list(DISTINCT statefp) FROM tiger.zip_lookup_base WHERE input.zip = zip_lookup_base.zip),"
+		    << "[]::VARCHAR[]"
+		    << ") AS candidate_statefps"
 		    << " FROM input ORDER BY input_idx";
 	}
 
@@ -368,7 +379,18 @@ static std::vector<ResolvedRow> RunResolution(Connection &conn, const BatchBindD
 			for (idx_t f = 1; f <= 9; f++) {
 				rr.struct_fields.emplace_back(row->GetValue(f, r));
 			}
-			rr.statefp = row->GetValue(10, r);
+			// candidate_statefps is a VARCHAR[] — flatten to vector<string>,
+			// dropping NULLs (defensive; SELECT side already filters).
+			auto list_val = row->GetValue(10, r);
+			if (!list_val.IsNull()) {
+				auto &children = ListValue::GetChildren(list_val);
+				rr.candidate_statefps.reserve(children.size());
+				for (auto &c : children) {
+					if (!c.IsNull()) {
+						rr.candidate_statefps.emplace_back(c.GetValue<std::string>());
+					}
+				}
+			}
 			out.push_back(std::move(rr));
 		}
 	}
@@ -456,12 +478,21 @@ static void FlushBuffer(ClientContext &context, const BatchBindData &bind_data, 
 	// Step 1: resolve struct fields + statefp for every buffered row.
 	auto resolved = RunResolution(conn, bind_data, gstate.buffered);
 
-	// Step 2: partition by statefp (NULL statefp = no anchor → no match,
-	// matches the existing macro's behavior).
+	// Step 2: partition by statefp. A row with multiple candidate states
+	// (multi-state ZIP, no state_abbrev given) is pushed into every bucket;
+	// the result merge in Step 4 keeps the lowest-rated candidate across
+	// states. Empty candidate_statefps = no resolvable state, skipped (matches
+	// the prior NULL-statefp drop behavior).
 	std::unordered_map<std::string, std::vector<ResolvedRow>> by_statefp;
 	for (auto &r : resolved) {
-		if (r.statefp.IsNull()) continue;
-		by_statefp[r.statefp.GetValue<std::string>()].push_back(std::move(r));
+		const auto &cands = r.candidate_statefps;
+		if (cands.empty()) continue;
+		// Copy into all but the last bucket; move into the last so the row is
+		// preserved per-bucket without N-way clones for the common N=1 case.
+		for (size_t i = 0; i + 1 < cands.size(); i++) {
+			by_statefp[cands[i]].push_back(r);
+		}
+		by_statefp[cands.back()].push_back(std::move(r));
 	}
 
 	// Step 3: per-state dispatch. Slice big states into kPerStateSliceCap-
@@ -481,13 +512,25 @@ static void FlushBuffer(ClientContext &context, const BatchBindData &bind_data, 
 		}
 	}
 
-	// Step 4: index results by input_idx for fast pairing with the buffered
-	// passthrough values. A row that produced no geocode output (e.g. NULL
-	// statefp, or no candidate above gate) gets a NULL result row so the
-	// caller still sees their input_idx in the output.
+	// Step 4: index results by input_idx, keeping the lowest-rated candidate
+	// when an input was dispatched to multiple states (multi-state-ZIP path).
+	// A row that produced no geocode output (e.g. empty candidate_statefps,
+	// or no candidate cleared the gate in any state) gets a NULL result row
+	// so the caller still sees their input_idx in the output.
 	std::unordered_map<idx_t, GeocodeResult> by_input_idx;
 	for (auto &g : all_results) {
-		by_input_idx[g.input_idx] = std::move(g);
+		auto it = by_input_idx.find(g.input_idx);
+		if (it == by_input_idx.end()) {
+			by_input_idx[g.input_idx] = std::move(g);
+			continue;
+		}
+		const bool incumbent_null = it->second.rating.IsNull();
+		const bool challenger_null = g.rating.IsNull();
+		if (challenger_null) continue;
+		if (incumbent_null
+		    || g.rating.GetValue<int64_t>() < it->second.rating.GetValue<int64_t>()) {
+			it->second = std::move(g);
+		}
 	}
 
 	gstate.pending_output.clear();
