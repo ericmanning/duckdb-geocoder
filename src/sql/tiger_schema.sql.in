@@ -121,11 +121,35 @@ CREATE TABLE IF NOT EXISTS @TIGER@.featnames (
     -- src/include/vendored_soundex.hpp).
     name_lower    VARCHAR,
     fullname_norm VARCHAR,
-    name_soundex  VARCHAR
+    name_soundex  VARCHAR,
+    -- Hash-joinable equi-keys that replace row-by-row predicate evaluation
+    -- in geocode_address_for_state's name_match_tlids_a/b CTEs. Without
+    -- these the planner falls back to BLOCKWISE_NL_JOIN on
+    -- numeric_streets_equal regex / LIKE-prefix patterns, which dominates
+    -- wall-clock at nationwide scale.
+    --   * numeric_stem      — trim(regexp_extract(name, '^[0-9/\s]+'))
+    --                         when length(name) < 10 and name has a
+    --                         numeric/slash/space prefix; NULL otherwise.
+    --                         Replaces numeric_streets_equal NL.
+    --   * name_first_5      — substr(name_lower, 1, 5). Equi-key for
+    --                         "name_lower LIKE input_prefix || '%'" when
+    --                         input length ≥ 5.
+    --   * fullname_first_5  — substr(fullname_norm, 1, 5). Same idea for
+    --                         the fullname-prefix branch.
+    numeric_stem      VARCHAR,
+    name_first_5      VARCHAR,
+    fullname_first_5  VARCHAR
 );
 -- countyfp added in May 2026 to support per-county restart. Existing rows
 -- (loaded before the migration) have countyfp = NULL until backfilled.
 ALTER TABLE @TIGER@.featnames ADD COLUMN IF NOT EXISTS countyfp VARCHAR;
+-- Perf-precompute columns (May 2026); idempotent ALTERs so existing DBs
+-- get the columns on next LoadInternal. Backfill happens at next per-state
+-- (re)load via loader_templates; pre-existing data needs an explicit
+-- UPDATE to populate.
+ALTER TABLE @TIGER@.featnames ADD COLUMN IF NOT EXISTS numeric_stem     VARCHAR;
+ALTER TABLE @TIGER@.featnames ADD COLUMN IF NOT EXISTS name_first_5     VARCHAR;
+ALTER TABLE @TIGER@.featnames ADD COLUMN IF NOT EXISTS fullname_first_5 VARCHAR;
 
 CREATE TABLE IF NOT EXISTS @TIGER@.addr (
     statefp  VARCHAR,

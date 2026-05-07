@@ -143,7 +143,15 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
             -- are still found.
             @TIGER@.normalize_street_name(
                 COALESCE(inp['pre_dir'] || ' ', '') || COALESCE(inp['street_name'], '')
-            )                               AS fullname_prefix_input
+            )                               AS fullname_prefix_input,
+            -- Numeric-stem extracted from input street_name for the
+            -- featnames.numeric_stem equi-join (replaces numeric_streets_equal NL).
+            CASE
+                WHEN inp['street_name'] IS NOT NULL
+                 AND length(inp['street_name']) < 10
+                 AND regexp_matches(inp['street_name'], '^[0-9/\s]+')
+                THEN trim(regexp_extract(inp['street_name'], '^[0-9/\s]+'))
+            END                             AS street_name_numeric_stem
     ),
     -- =========================================================================
     -- Pass A: current always-on candidate pipeline (length-gated branches).
@@ -187,9 +195,10 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                p.window_zips, p.street_name, p.street_name_lower, p.street_name_soundex,
                p.street_type, p.zip,
                p.pre_dir, p.post_dir, p.location, p.address, p.internal
-        FROM @TIGER@.featnames f, p
-        WHERE f.statefp = p.statefp
-          AND p.street_name IS NOT NULL
+        FROM @TIGER@.featnames f JOIN p
+             ON f.statefp = p.statefp
+            AND f.name_first_5 = substr(p.street_name_lower, 1, 5)
+        WHERE p.street_name IS NOT NULL
           AND length(p.street_name) > 5
           AND f.name_lower LIKE p.street_name_lower || '%'
 
@@ -200,9 +209,10 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                p.window_zips, p.street_name, p.street_name_lower, p.street_name_soundex,
                p.street_type, p.zip,
                p.pre_dir, p.post_dir, p.location, p.address, p.internal
-        FROM @TIGER@.featnames f, p
-        WHERE f.statefp = p.statefp
-          AND p.street_name IS NOT NULL
+        FROM @TIGER@.featnames f JOIN p
+             ON f.statefp = p.statefp
+            AND f.fullname_first_5 = substr(p.fullname_prefix_input, 1, 5)
+        WHERE p.street_name IS NOT NULL
           AND length(p.street_name) > 5
           AND f.fullname_norm LIKE p.fullname_prefix_input || '%'
 
@@ -226,10 +236,12 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
                p.window_zips, p.street_name, p.street_name_lower, p.street_name_soundex,
                p.street_type, p.zip,
                p.pre_dir, p.post_dir, p.location, p.address, p.internal
-        FROM @TIGER@.featnames f, p
-        WHERE f.statefp = p.statefp
-          AND p.street_name IS NOT NULL
-          AND @TIGER@.numeric_streets_equal(f.name, p.street_name)
+        FROM @TIGER@.featnames f JOIN p
+             ON f.statefp = p.statefp
+            AND f.numeric_stem = p.street_name_numeric_stem
+        WHERE p.street_name IS NOT NULL
+          AND f.numeric_stem IS NOT NULL
+          AND p.street_name_numeric_stem IS NOT NULL
     ),
     fae_a AS (
         SELECT
@@ -512,19 +524,23 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         WHERE p.street_name IS NOT NULL
 
         UNION ALL
-        -- Name prefix LIKE (no length gate).
+        -- Name prefix LIKE: equi-join on first-5 prefix when input is long;
+        -- BLOCKWISE_NL fallback for short inputs (preserves PG fallback's
+        -- ungated parity).
         SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
                f.pretypabrv, f.sufdirabrv, f.prequalabr,
                COALESCE(p.window_zips, []::VARCHAR[]) || COALESCE(p.city_zips, []::VARCHAR[]),
                p.street_name, p.street_type, p.zip,
                p.pre_dir, p.post_dir, p.location, p.address, p.internal
-        FROM @TIGER@.featnames f, p, gate
-        WHERE f.statefp = p.statefp
-          AND p.street_name IS NOT NULL
+        FROM @TIGER@.featnames f JOIN p
+             ON f.statefp = p.statefp
+            AND f.name_first_5 = substr(p.street_name_lower, 1, 5)
+        CROSS JOIN gate
+        WHERE p.street_name IS NOT NULL
+          AND length(p.street_name) >= 5
           AND f.name_lower LIKE p.street_name_lower || '%'
 
         UNION ALL
-        -- Fullname-prefix LIKE (no length gate).
         SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
                f.pretypabrv, f.sufdirabrv, f.prequalabr,
                COALESCE(p.window_zips, []::VARCHAR[]) || COALESCE(p.city_zips, []::VARCHAR[]),
@@ -533,6 +549,34 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         FROM @TIGER@.featnames f, p, gate
         WHERE f.statefp = p.statefp
           AND p.street_name IS NOT NULL
+          AND length(p.street_name) < 5
+          AND f.name_lower LIKE p.street_name_lower || '%'
+
+        UNION ALL
+        -- Fullname-prefix LIKE: equi-join + short fallback.
+        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
+               f.pretypabrv, f.sufdirabrv, f.prequalabr,
+               COALESCE(p.window_zips, []::VARCHAR[]) || COALESCE(p.city_zips, []::VARCHAR[]),
+               p.street_name, p.street_type, p.zip,
+               p.pre_dir, p.post_dir, p.location, p.address, p.internal
+        FROM @TIGER@.featnames f JOIN p
+             ON f.statefp = p.statefp
+            AND f.fullname_first_5 = substr(p.fullname_prefix_input, 1, 5)
+        CROSS JOIN gate
+        WHERE p.street_name IS NOT NULL
+          AND length(p.fullname_prefix_input) >= 5
+          AND f.fullname_norm LIKE p.fullname_prefix_input || '%'
+
+        UNION ALL
+        SELECT f.tlid, f.statefp, f.name, f.fullname, f.predirabrv, f.suftypabrv,
+               f.pretypabrv, f.sufdirabrv, f.prequalabr,
+               COALESCE(p.window_zips, []::VARCHAR[]) || COALESCE(p.city_zips, []::VARCHAR[]),
+               p.street_name, p.street_type, p.zip,
+               p.pre_dir, p.post_dir, p.location, p.address, p.internal
+        FROM @TIGER@.featnames f, p, gate
+        WHERE f.statefp = p.statefp
+          AND p.street_name IS NOT NULL
+          AND length(p.fullname_prefix_input) < 5
           AND f.fullname_norm LIKE p.fullname_prefix_input || '%'
     ),
     fae_b AS (

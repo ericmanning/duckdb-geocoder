@@ -63,6 +63,16 @@ INSERT INTO tiger.featnames (statefp, tlid, fullname, name, predirabrv, suftypab
      'schools',   'schools',         soundex('Schools'));
 
 statement ok
+UPDATE tiger.featnames
+SET numeric_stem     = CASE WHEN name IS NOT NULL
+                              AND length(name) < 10
+                              AND regexp_matches(name, '^[0-9/\s]+')
+                            THEN trim(regexp_extract(name, '^[0-9/\s]+')) END,
+    name_first_5     = substr(name_lower, 1, 5),
+    fullname_first_5 = substr(fullname_norm, 1, 5);
+
+
+statement ok
 INSERT INTO tiger.addr (statefp, tlid, fromhn, tohn, side, zip) VALUES
     ('48', 1001, '100', '198', 'L', '75019'),
     ('48', 1002, '0',   '0',   'L', '75019'),

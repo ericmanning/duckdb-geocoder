@@ -66,11 +66,13 @@ SELECT '@STATEFP@', '@COUNTYFP@', TFID,
 FROM ST_Read('@VSIPATH@')
 
 -- @SECTION:county_featnames_insert@
--- name_lower, fullname_norm, and name_soundex are precomputed equi-join
--- keys used by geocode_address_impl (name match), cutting the Stage A
--- filter from ~15s to ~50ms on a full-state batch. soundex is a built-in
--- scalar function registered by LoadInternal (see vendored_soundex.hpp).
-INSERT INTO @TIGER@.featnames (statefp, countyfp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc, name_lower, fullname_norm, name_soundex)
+-- name_lower, fullname_norm, name_soundex, numeric_stem, name_first_5,
+-- and fullname_first_5 are precomputed equi-join keys used by
+-- geocode_address_for_state (name match). Without these the Stage A
+-- filter falls back to BLOCKWISE_NL_JOIN on regex / LIKE-prefix
+-- predicates and dominates wall-clock at nationwide scale. soundex is
+-- vendored (see vendored_soundex.hpp) and registered by LoadInternal.
+INSERT INTO @TIGER@.featnames (statefp, countyfp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr, suftypabrv, sufdirabrv, mtfcc, name_lower, fullname_norm, name_soundex, numeric_stem, name_first_5, fullname_first_5)
 
 -- @SECTION:county_featnames_branch@
 SELECT '@STATEFP@', '@COUNTYFP@', TLID, NAME, FULLNAME,
@@ -78,7 +80,14 @@ SELECT '@STATEFP@', '@COUNTYFP@', TLID, NAME, FULLNAME,
        NULLIF(SUFTYPABRV, ''), NULLIF(SUFDIRABRV, ''), MTFCC,
        lower(NAME),
        @FUNC@.normalize_street_name(FULLNAME),
-       soundex(NAME)
+       soundex(NAME),
+       CASE WHEN NAME IS NOT NULL
+                AND length(NAME) < 10
+                AND regexp_matches(NAME, '^[0-9/\s]+')
+            THEN trim(regexp_extract(NAME, '^[0-9/\s]+'))
+       END,
+       substr(lower(NAME), 1, 5),
+       substr(@FUNC@.normalize_street_name(FULLNAME), 1, 5)
 FROM ST_Read('@VSIPATH@')
 
 -- @SECTION:county_addr_insert@

@@ -38,6 +38,16 @@ INSERT INTO tiger.featnames (statefp, tlid, name, fullname, predirabrv, pretypab
     ('44', 1001, 'Meeting', 'Meeting St', NULL, NULL, NULL, 'St', NULL, 'S1400', 'meeting', 'meeting st', soundex('Meeting'));
 
 statement ok
+UPDATE tiger.featnames
+SET numeric_stem     = CASE WHEN name IS NOT NULL
+                              AND length(name) < 10
+                              AND regexp_matches(name, '^[0-9/\s]+')
+                            THEN trim(regexp_extract(name, '^[0-9/\s]+')) END,
+    name_first_5     = substr(name_lower, 1, 5),
+    fullname_first_5 = substr(fullname_norm, 1, 5);
+
+
+statement ok
 INSERT INTO tiger.edges (statefp, countyfp, tlid, tfidl, tfidr, tnidf, tnidt, mtfcc, fullname, the_geom, zipl, zipr) VALUES
     ('44', '007', 1001, 2001, 2002, 3001, 3002, 'S1400', 'Meeting St',
      ST_GeomFromText('LINESTRING(-71.405 41.826, -71.403 41.826)'), '02903', '02903');

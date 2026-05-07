@@ -26,6 +26,16 @@ INSERT INTO tiger.featnames (statefp, tlid, name, fullname, predirabrv, pretypab
     ('44', 1002, 'Benefit', 'Benefit St', NULL, NULL, NULL, 'St', NULL, 'S1400', 'benefit', 'benefit st', soundex('Benefit'));
 
 statement ok
+UPDATE tiger.featnames
+SET numeric_stem     = CASE WHEN name IS NOT NULL
+                              AND length(name) < 10
+                              AND regexp_matches(name, '^[0-9/\s]+')
+                            THEN trim(regexp_extract(name, '^[0-9/\s]+')) END,
+    name_first_5     = substr(name_lower, 1, 5),
+    fullname_first_5 = substr(fullname_norm, 1, 5);
+
+
+statement ok
 INSERT INTO tiger.edges (statefp, countyfp, tlid, tfidl, tfidr, tnidf, tnidt, mtfcc, fullname, the_geom, zipl, zipr) VALUES
     -- Meeting St runs from shared node 3001 east to 3002
     ('44', '007', 1001, 2001, 2002, 3001, 3002, 'S1400', 'Meeting St',
