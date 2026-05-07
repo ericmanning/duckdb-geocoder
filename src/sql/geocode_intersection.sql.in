@@ -102,7 +102,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_intersection(
                  AND lower(f.fullname) LIKE (SELECT sfull FROM road1_keys) || '%')
               )
           AND ((SELECT zw FROM zip_window) IS NULL
-               OR ad.zip IN (SELECT UNNEST((SELECT zw FROM zip_window))))
+               OR list_contains((SELECT zw FROM zip_window), ad.zip))
     ),
     a2 AS (
         SELECT f.tlid, f.statefp, f.name, f.fullname, ad.side

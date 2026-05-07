@@ -248,7 +248,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         WHERE e.mtfcc LIKE 'S%'
           AND (restrict_geom_4269 IS NULL OR ST_Intersects(e.the_geom, restrict_geom_4269))
           AND (f.window_zips IS NULL
-               OR a.zip IN (SELECT UNNEST(f.window_zips)))
+               OR list_contains(f.window_zips, a.zip))
     ),
     fae_faces_a AS (
         SELECT fae.*, fc.tfid AS fc_tfid, fc.placefp, fc.cousubfp
@@ -550,7 +550,7 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_address_impl(inp, max_results, restrict_
         WHERE e.mtfcc LIKE 'S%'
           AND (restrict_geom_4269 IS NULL OR ST_Intersects(e.the_geom, restrict_geom_4269))
           AND (f.p_zip IS NULL
-               OR a.zip IN (SELECT UNNEST(f.window_zips)))
+               OR list_contains(f.window_zips, a.zip))
     ),
     fae_faces_b AS (
         SELECT fae.*, fc.tfid AS fc_tfid, fc.placefp, fc.cousubfp
