@@ -185,7 +185,7 @@ static std::string ZeroPad(const std::string &s, size_t width) {
 // "Request Rejected" HTML cached at the edge, served instead of the zip.
 // Cache-bust per-call sidesteps that without depending on edge eviction.
 static uint64_t MakeCacheBust() {
-	static std::atomic<uint64_t> counter{0};
+	static std::atomic<uint64_t> counter {0};
 	auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
 	auto bump = counter.fetch_add(1, std::memory_order_relaxed);
 	return static_cast<uint64_t>(now_ns) + bump;
@@ -252,10 +252,23 @@ static int64_t ExecuteInsert(Connection &conn, const std::string &sql, const std
 // missed case to silently fail the whole load.
 static bool IsRetriableLoaderError(const std::string &msg) {
 	static const char *const kHints[] = {
-	    "gdal",          "/vsicurl/", "/vsizip/",      "http",       "curl",
-	    "timeout",       "timed out", "connection",    "decompression failed",
-	    "z_err",         "cpl_vsil",  "premature end", "unexpected end of",
-	    "ssl",           "tls",       "reset by peer", "broken pipe",
+	    "gdal",
+	    "/vsicurl/",
+	    "/vsizip/",
+	    "http",
+	    "curl",
+	    "timeout",
+	    "timed out",
+	    "connection",
+	    "decompression failed",
+	    "z_err",
+	    "cpl_vsil",
+	    "premature end",
+	    "unexpected end of",
+	    "ssl",
+	    "tls",
+	    "reset by peer",
+	    "broken pipe",
 	};
 	std::string lower;
 	lower.reserve(msg.size());
@@ -676,8 +689,7 @@ static void DoLoadNation(ClientContext &context, const LoaderBindData &bind, std
 		    conn,
 		    [&](uint64_t cb) {
 			    auto vsi = BuildVsiPath(bind.source, step.subdir, zip_base, "shp", cb);
-			    return RenderTemplate(section,
-			                          {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@VSIPATH@", vsi}});
+			    return RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@VSIPATH@", vsi}});
 		    },
 		    step.section);
 		out.push_back({step.section, rows});
@@ -873,9 +885,8 @@ static void UnloadTigerStateExecute(ClientContext &context, TableFunctionInput &
 		auto unload_template = ExtractSection(tmpl, "unload_state");
 		for (const auto &state : bind.states) {
 			StepTimer t(state.abbrev, "unload_state");
-			auto rendered = RenderTemplate(unload_template, {{"@TIGER@", data_loc},
-			                                                  {"@FUNC@", func_loc},
-			                                                  {"@STATEFP@", state.fips}});
+			auto rendered = RenderTemplate(unload_template,
+			                               {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", state.fips}});
 			auto result = conn.Query(rendered);
 			if (result->HasError()) {
 				throw IOException("us_geocoder unload_tiger_state(%s): %s", state.abbrev, result->GetError());
@@ -936,8 +947,7 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, cons
 		    conn,
 		    [&](uint64_t cb) {
 			    auto vsi = BuildVsiPath(bind.source, s.subdir, zip_base, "shp", cb);
-			    return RenderTemplate(section,
-			                          {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@VSIPATH@", vsi}});
+			    return RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@VSIPATH@", vsi}});
 		    },
 		    s.section);
 		out.push_back({s.section, rows});
@@ -1095,8 +1105,7 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, cons
 				throw IOException("us_geocoder loader (pre-edge_containment delete): %s", del_result->GetError());
 			}
 			auto section = ExtractSection(tmpl, "derived_edge_containment");
-			auto rendered =
-			    RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", fips}});
+			auto rendered = RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", fips}});
 			StepTimer timer(state.abbrev, "derived_edge_containment");
 			int64_t rows = ExecuteInsert(conn, rendered, "derived_edge_containment");
 			out.push_back({"derived_edge_containment", rows});

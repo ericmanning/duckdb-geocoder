@@ -97,7 +97,7 @@ struct BatchBindData : public TableFunctionData {
 
 struct BufferedRow {
 	std::vector<Value> passthrough_values;
-	std::string addr_str;        // Form 1
+	std::string addr_str;             // Form 1
 	std::vector<Value> parsed_fields; // Form 2 (9 fields, ordered)
 };
 
@@ -182,17 +182,15 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 	}
 
 	bool has_addr_str = bind_data->addr_str_idx != kInvalidIdx;
-	bool has_any_part =
-	    (bind_data->address_idx != kInvalidIdx || bind_data->street_name_idx != kInvalidIdx ||
-	     bind_data->street_type_idx != kInvalidIdx || bind_data->internal_idx != kInvalidIdx ||
-	     bind_data->pre_dir_idx != kInvalidIdx || bind_data->post_dir_idx != kInvalidIdx ||
-	     bind_data->location_idx != kInvalidIdx || bind_data->state_abbrev_idx != kInvalidIdx ||
-	     bind_data->zip_idx != kInvalidIdx);
+	bool has_any_part = (bind_data->address_idx != kInvalidIdx || bind_data->street_name_idx != kInvalidIdx ||
+	                     bind_data->street_type_idx != kInvalidIdx || bind_data->internal_idx != kInvalidIdx ||
+	                     bind_data->pre_dir_idx != kInvalidIdx || bind_data->post_dir_idx != kInvalidIdx ||
+	                     bind_data->location_idx != kInvalidIdx || bind_data->state_abbrev_idx != kInvalidIdx ||
+	                     bind_data->zip_idx != kInvalidIdx);
 	if (!has_addr_str && !has_any_part) {
-		throw BinderException(
-		    "tiger.geocode_batch: input must include either 'addr_str' (VARCHAR) "
-		    "OR some of the geocode_input fields {address INTEGER, street_name, street_type, "
-		    "internal, pre_dir, post_dir, location, state_abbrev, zip — all VARCHAR}");
+		throw BinderException("tiger.geocode_batch: input must include either 'addr_str' (VARCHAR) "
+		                      "OR some of the geocode_input fields {address INTEGER, street_name, street_type, "
+		                      "internal, pre_dir, post_dir, location, state_abbrev, zip — all VARCHAR}");
 	}
 	bind_data->form_freeform = has_addr_str;
 
@@ -201,14 +199,14 @@ unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, ve
 	// pre-parsed field) should select it under a different name. Everything
 	// else passes through unchanged.
 	auto is_consumed = [&](idx_t i) {
-		return i == bind_data->addr_str_idx || i == bind_data->address_idx ||
-		       i == bind_data->street_name_idx || i == bind_data->street_type_idx ||
-		       i == bind_data->internal_idx || i == bind_data->pre_dir_idx ||
-		       i == bind_data->post_dir_idx || i == bind_data->location_idx ||
-		       i == bind_data->state_abbrev_idx || i == bind_data->zip_idx;
+		return i == bind_data->addr_str_idx || i == bind_data->address_idx || i == bind_data->street_name_idx ||
+		       i == bind_data->street_type_idx || i == bind_data->internal_idx || i == bind_data->pre_dir_idx ||
+		       i == bind_data->post_dir_idx || i == bind_data->location_idx || i == bind_data->state_abbrev_idx ||
+		       i == bind_data->zip_idx;
 	};
 	for (idx_t i = 0; i < input.input_table_names.size(); i++) {
-		if (is_consumed(i)) continue;
+		if (is_consumed(i))
+			continue;
 		bind_data->passthrough_input_indices.push_back(i);
 		return_types.emplace_back(input.input_table_types[i]);
 		names.emplace_back(input.input_table_names[i]);
@@ -328,7 +326,8 @@ static std::vector<ResolvedRow> RunResolution(Connection &conn, const BatchBindD
 		// Form 1 SQL: VALUES of (idx, addr_str), parse + resolve.
 		sql << "WITH input(input_idx, addr_str) AS (VALUES ";
 		for (idx_t i = 0; i < buffered.size(); i++) {
-			if (i > 0) sql << ",";
+			if (i > 0)
+				sql << ",";
 			sql << "(" << i << "," << EscapeSqlLiteral(buffered[i].addr_str) << ")";
 		}
 		sql << "),"
@@ -351,7 +350,8 @@ static std::vector<ResolvedRow> RunResolution(Connection &conn, const BatchBindD
 		sql << "WITH input(input_idx, address, street_name, street_type, internal,"
 		    << " pre_dir, post_dir, location, state_abbrev, zip) AS (VALUES ";
 		for (idx_t i = 0; i < buffered.size(); i++) {
-			if (i > 0) sql << ",";
+			if (i > 0)
+				sql << ",";
 			sql << RenderParsedRowTuple(i, buffered[i].parsed_fields);
 		}
 		sql << ")"
@@ -413,15 +413,14 @@ static std::string RenderGeocodeInputCast(const std::vector<Value> &fields) {
 	   << "'post_dir':" << ValueAsSqlLiteral(fields[5]) << ","
 	   << "'location':" << ValueAsSqlLiteral(fields[6]) << ","
 	   << "'state_abbrev':" << ValueAsSqlLiteral(fields[7]) << ","
-	   << "'zip':" << ValueAsSqlLiteral(fields[8])
-	   << "} AS tiger.geocode_input)";
+	   << "'zip':" << ValueAsSqlLiteral(fields[8]) << "} AS tiger.geocode_input)";
 	return os.str();
 }
 
 static void RunPerStateGeocode(Connection &conn, const std::string &statefp_lit,
-                               const std::vector<ResolvedRow> &state_rows,
-                               std::vector<GeocodeResult> &out) {
-	if (state_rows.empty()) return;
+                               const std::vector<ResolvedRow> &state_rows, std::vector<GeocodeResult> &out) {
+	if (state_rows.empty())
+		return;
 
 	// Build VALUES of (input_idx, struct_arg) for this state. Then LATERAL
 	// the macro per row — the planner constant-folds statefp_lit and uses
@@ -429,9 +428,9 @@ static void RunPerStateGeocode(Connection &conn, const std::string &statefp_lit,
 	std::ostringstream sql;
 	sql << "WITH input(input_idx, struct_arg) AS (VALUES ";
 	for (idx_t i = 0; i < state_rows.size(); i++) {
-		if (i > 0) sql << ",";
-		sql << "(" << state_rows[i].input_idx << ", "
-		    << RenderGeocodeInputCast(state_rows[i].struct_fields) << ")";
+		if (i > 0)
+			sql << ",";
+		sql << "(" << state_rows[i].input_idx << ", " << RenderGeocodeInputCast(state_rows[i].struct_fields) << ")";
 	}
 	sql << ")"
 	    << " SELECT input.input_idx,"
@@ -441,8 +440,8 @@ static void RunPerStateGeocode(Connection &conn, const std::string &statefp_lit,
 	    << " g.block_geoid, g.tract_geoid, g.blkgrp_geoid,"
 	    << " g.containment_guaranteed"
 	    << " FROM input,"
-	    << " LATERAL tiger.geocode_address_for_state("
-	    << EscapeSqlLiteral(statefp_lit) << ", struct_arg, 1, NULL, 2.0) g"
+	    << " LATERAL tiger.geocode_address_for_state(" << EscapeSqlLiteral(statefp_lit)
+	    << ", struct_arg, 1, NULL, 2.0) g"
 	    << " QUALIFY ROW_NUMBER() OVER (PARTITION BY input.input_idx ORDER BY g.rating) = 1";
 
 	auto result = conn.Query(sql.str());
@@ -471,7 +470,8 @@ static void RunPerStateGeocode(Connection &conn, const std::string &statefp_lit,
 // ---------------------------------------------------------------------------
 
 static void FlushBuffer(ClientContext &context, const BatchBindData &bind_data, BatchGlobalState &gstate) {
-	if (gstate.buffered.empty()) return;
+	if (gstate.buffered.empty())
+		return;
 
 	Connection conn(*context.db);
 
@@ -486,7 +486,8 @@ static void FlushBuffer(ClientContext &context, const BatchBindData &bind_data, 
 	std::unordered_map<std::string, std::vector<ResolvedRow>> by_statefp;
 	for (auto &r : resolved) {
 		const auto &cands = r.candidate_statefps;
-		if (cands.empty()) continue;
+		if (cands.empty())
+			continue;
 		// Copy into all but the last bucket; move into the last so the row is
 		// preserved per-bucket without N-way clones for the common N=1 case.
 		for (size_t i = 0; i + 1 < cands.size(); i++) {
@@ -526,9 +527,9 @@ static void FlushBuffer(ClientContext &context, const BatchBindData &bind_data, 
 		}
 		const bool incumbent_null = it->second.rating.IsNull();
 		const bool challenger_null = g.rating.IsNull();
-		if (challenger_null) continue;
-		if (incumbent_null
-		    || g.rating.GetValue<int64_t>() < it->second.rating.GetValue<int64_t>()) {
+		if (challenger_null)
+			continue;
+		if (incumbent_null || g.rating.GetValue<int64_t>() < it->second.rating.GetValue<int64_t>()) {
 			it->second = std::move(g);
 		}
 	}
@@ -542,7 +543,7 @@ static void FlushBuffer(ClientContext &context, const BatchBindData &bind_data, 
 		if (it != by_input_idx.end()) {
 			gr = std::move(it->second);
 			gr.input_idx = i; // re-stamp after move (paranoia)
-		} // else: leave defaults (all-NULL Values).
+		}                     // else: leave defaults (all-NULL Values).
 		gstate.pending_output.push_back(std::move(gr));
 	}
 
@@ -645,8 +646,7 @@ OperatorResultType Execute(ExecutionContext &context, TableFunctionInput &data, 
 
 	FlushBuffer(context.client, bind_data, gstate);
 	EmitFromQueue(bind_data, gstate, output);
-	return gstate.pending_output.empty() ? OperatorResultType::NEED_MORE_INPUT
-	                                     : OperatorResultType::HAVE_MORE_OUTPUT;
+	return gstate.pending_output.empty() ? OperatorResultType::NEED_MORE_INPUT : OperatorResultType::HAVE_MORE_OUTPUT;
 }
 
 OperatorFinalizeResultType Finalize(ExecutionContext &context, TableFunctionInput &data, DataChunk &output) {

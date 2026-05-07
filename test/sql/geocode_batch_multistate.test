@@ -1,10 +1,11 @@
 # name: test/sql/geocode_batch_multistate.test
 # description: geocode_batch resolves a multi-state ZIP to candidates in every
+# group: [sql]
+
 #              state and picks the lowest-rated match across them. Pre-fix the
 #              C++ resolution did `LIMIT 1` against zip_lookup_base and could
 #              silently drop matches when an input's correct state was
 #              ordered second.
-# group: [sql]
 
 require us_geocoder
 
