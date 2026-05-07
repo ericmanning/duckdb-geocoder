@@ -577,6 +577,40 @@ static std::string LookupStateFips(Connection &conn, const std::string &schema, 
 	return row->GetValue(0, 0).GetValue<std::string>();
 }
 
+// Refresh DuckDB's per-table sample stats so the planner stops misestimating
+// joins through the wide tiger.* fan-outs (we observed 179M-row estimates
+// vs 1.2M actual on featnames-side joins, picking suboptimal strategies).
+// One ANALYZE pass over the 13 data tables is cheap (~20s nationwide) and
+// shaves another ~37% off geocode wall-clock once stats are populated.
+// Called once at the end of every loader entry point — running per-state
+// would just re-do the same work N times.
+static void RunAnalyzeOnTigerTables(ClientContext &context, const LoaderBindData &bind,
+                                    std::vector<LoaderResult> &out) {
+	static const char *const kAnalyzeTables[] = {
+	    "state",           "county", "place", "cousub",    "zcta5", "zip_state",        "zip_state_loc",
+	    "zip_lookup_base", "edges",  "faces", "featnames", "addr",  "edge_containment",
+	};
+	Connection conn(*context.db);
+	const auto &data_loc = bind.data_location;
+	auto t0 = std::chrono::steady_clock::now();
+	fprintf(stderr, "[us_geocoder] analyze: refreshing planner stats on %s.*\n", data_loc.c_str());
+	fflush(stderr);
+	for (auto *tbl : kAnalyzeTables) {
+		auto sql = std::string("ANALYZE ") + data_loc + "." + tbl;
+		auto result = conn.Query(sql);
+		if (result->HasError()) {
+			// Don't fail the load — stats are an optimization, not correctness.
+			fprintf(stderr, "[us_geocoder] WARN: ANALYZE %s.%s failed: %s\n", data_loc.c_str(), tbl,
+			        result->GetError().c_str());
+			fflush(stderr);
+		}
+	}
+	auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+	fprintf(stderr, "[us_geocoder] analyze: done in %.1fs\n", secs);
+	fflush(stderr);
+	out.push_back({"analyze", 0});
+}
+
 // =====================================================================
 // load_tiger_nation(source VARCHAR, year INTEGER DEFAULT 2025)
 // =====================================================================
@@ -659,6 +693,7 @@ static void LoadTigerNationExecute(ClientContext &context, TableFunctionInput &d
 	if (!gstate.executed) {
 		gstate.executed = true;
 		DoLoadNation(context, bind, gstate.results);
+		RunAnalyzeOnTigerTables(context, bind, gstate.results);
 	}
 
 	EmitLoaderResults(gstate, output);
@@ -1096,6 +1131,7 @@ static void LoadTigerStateExecute(ClientContext &context, TableFunctionInput &da
 			fprintf(stderr, "[us_geocoder %s] done %s in %.1fs\n", st.abbrev.c_str(), counter, secs);
 			fflush(stderr);
 		}
+		RunAnalyzeOnTigerTables(context, bind, gstate.results);
 	}
 
 	EmitLoaderResults(gstate, output);
