@@ -4,7 +4,9 @@ A DuckDB community extension that geocodes US addresses against [Census TIGER/Li
 
 Given a street address, it returns (a) a point in NAD83 coordinates interpolated along the street centerline with a 10m perpendicular side-of-street offset, (b) the 2025 census block / tract / block-group GEOIDs covering that point, and (c) a `rating` that lower-bounds match quality (0 = perfect).
 
-**Status:** alpha. Core geocoder is functional end-to-end against full TIGER data; see [docs/parity.md](docs/parity.md) for where v0.1 diverges from PostGIS. Future versions are likely to further diverge from PostGIS as improvements are made against ground-truth parcel data.
+**Status:** alpha. Core geocoder is functional end-to-end against full TIGER data; see [docs/pg_parity.md](docs/pg_parity.md) for where v0.1 diverges from PostGIS. Future versions are likely to further diverge from PostGIS as improvements are made against ground-truth parcel data.
+
+**Docs:** [quickstart](docs/quickstart.md) · [API reference](docs/api.md) · [PG parity + design decisions](docs/pg_parity.md).
 
 ## Install
 
@@ -143,7 +145,7 @@ Two DuckDB binder quirks worth knowing for the LATERAL form:
 - **Reference the column unqualified inside the LATERAL call** (`tiger.geocode(_raw)`, not `tiger.geocode(inputs._raw)`). When the outer source is a CTE, DuckDB mis-parses `alias.col` as struct-field access on a row.
 - **Don't reuse the CSV column name as an output alias.** `SELECT ... address` while the input column is also `address` triggers "column cannot be referenced before it is defined." Rename one side (the CTE column, above) to avoid the clash.
 
-Working end-to-end scripts in [scripts/demo/](scripts/demo/): `build_nj_db.sql` builds a portable NJ reference DB from the Census CDN, then `geocode_addresses.sql` (structured input) and `geocode_raw.sql` (free-form single-string input) each read a CSV and write a geocoded CSV.
+For an end-to-end walkthrough including TIGER data load and batch geocoding, see [docs/quickstart.md](docs/quickstart.md).
 
 ## Runtime dependencies
 
@@ -160,23 +162,25 @@ Working end-to-end scripts in [scripts/demo/](scripts/demo/): `build_nj_db.sql` 
 ```sh
 git submodule update --init --recursive
 make release                   # ~10 min first time (builds duckdb from source)
-make test                      # 218 assertions across 14 sqllogictest files
+make test                      # 328 assertions across 21 sqllogictest files
 ```
 
 The build produces a loadable extension at `build/release/extension/us_geocoder/us_geocoder.duckdb_extension` and a DuckDB CLI at `build/release/duckdb` with the extension statically linked.
 
 ## Performance
 
-Benchmarked on TIGER 2025 Rhode Island (136K edges, 126K featnames, 105K addr) on a 2024 M4 Max:
+Benchmarked on a 2024 M4 Max with 32 GB RAM. TIGER 2025 reference data.
 
-| operation | time |
-|---|---|
-| single geocode (warm) | 130–200 ms |
-| batch of 100 addresses | 20 ms/addr |
-| batch of 1,000 addresses | 17 ms/addr (~60/sec/thread) |
-| full state load (local source, RI) | ~25 s |
-| full state load (Census HTTP, RI) | ~45 s |
-| full state load (Census HTTP, NJ) | ~5–8 min |
+| operation | data | time |
+|---|---|---|
+| single geocode (warm, RI) | RI only | 130–200 ms |
+| batch of 1,000 addresses (LATERAL, RI) | RI only | 17 ms/addr (~60/sec/thread) |
+| **`geocode_batch`, 100K mixed addresses** (nationwide) | full nation | **~205 s, 0 GB tmp spill** |
+| full state load (local source, RI) | shapefile mirror | ~25 s |
+| full state load (Census HTTP, RI) | from CDN | ~45 s |
+| full state load (Census HTTP, NJ) | from CDN | ~5–8 min |
+
+The nationwide batch number is ~3× faster than what the same workload took before the May 2026 perf push (was ~630 s + 10 GB tmp). See [docs/api.md § geocode_batch](docs/api.md#geocode_batchinput-table--table) for the tunables (`us_geocoder_slice_cap`, `us_geocoder_disable_join_order`) and [CLAUDE.md § Geocoder performance](CLAUDE.md#geocoder-performance-findings) for the engineering history.
 
 ### Faster HTTP loads
 

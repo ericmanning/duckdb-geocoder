@@ -1,6 +1,6 @@
 -- geocode_intersection(road1, road2, state, city, zip, max_results) → TABLE
 --
--- Per geocode_flow.md §9 + PG src/geocode/geocode_intersection.sql L42-L74:
+-- Per pg_parity.md § PG cascade reference §9 + PG src/geocode/geocode_intersection.sql L42-L74:
 -- pre-normalizes each road by synthesizing a fake address ('0 ' || road1
 -- || ', ' || city || ', ' || state) and running it through tiger.from_pagc(),
 -- then joins on featnames using both the parsed components and the raw input

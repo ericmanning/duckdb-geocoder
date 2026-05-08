@@ -1,6 +1,6 @@
 # Parity inputs
 
-Hand-transcribed CSV mirroring PG's `geocode_regress.sql` test queries. One row per geocode call: `test_id, raw_address, max_n`. Used by [`scripts/parity/run_geocode_regress.sh`](../../../scripts/parity/run_geocode_regress.sh) instead of regex-extracting from the SQL — robust against PG SQL syntax variations and easier to extend.
+Hand-transcribed CSV mirroring PG's `geocode_regress.sql` test queries. One row per geocode call: `test_id, raw_address, max_n`. Used by [`benchmark/regress/run_geocode_regress.sh`](../../../benchmark/regress/run_geocode_regress.sh) instead of regex-extracting from the SQL — robust against PG SQL syntax variations and easier to extend.
 
 ## Coverage
 

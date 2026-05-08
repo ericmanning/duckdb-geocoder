@@ -1,5 +1,5 @@
 # name: test/sql/loader_zcta_clip.test
-# description: Per-state ZCTA clipping invariants (geocode_flow.md §14.9 +
+# description: Per-state ZCTA clipping invariants (pg_parity.md § Roadmap +
 # group: [sql]
 
 #   loader_templates.sql.in :derived_zcta5_clip:). The loader runs against

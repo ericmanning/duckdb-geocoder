@@ -317,7 +317,7 @@ FROM tiger.reverse_geocode(ST_Point(-71.40882, 41.82993), 5)
 ORDER BY rank;
 ```
 
-Returns one row per candidate edge with a `rank` column (1 = nearest), distance in meters, interpolated house number, and the geocode_input struct populated from state/place/zip containing the point. Per geocode_flow.md D6, this is one-row-per-candidate rather than PG's parallel-array output.
+Returns one row per candidate edge with a `rank` column (1 = nearest), distance in meters, interpolated house number, and the geocode_input struct populated from state/place/zip containing the point. Per [docs/pg_parity.md § D6](pg_parity.md#d6-reverse_geocode-output-shape), this is one-row-per-candidate rather than PG's parallel-array output.
 
 ---
 
@@ -393,4 +393,14 @@ The guarantee is only valid at the default 10m offset and the default 0.5 interp
 
 All tables in the `tiger` schema. See [src/sql/tiger_schema.sql.in](../src/sql/tiger_schema.sql.in) for the full DDL. Geometry is stored in EPSG:4269 (NAD83). User-supplied geometry passed to `geocode`/`reverse_geocode` is auto-transformed to 4269; SRID 0 is treated as "assume 4269".
 
-The reference tables (`featnames`, `edges`, `faces`, `addr`, `state`, `county`, `place`, `cousub`, `zcta5`) carry the minimum columns the geocoder reads, plus a handful of loader-precomputed acceleration columns on `featnames` (`name_lower`, `fullname_norm`, `name_soundex`). The derived tables (`zip_state`, `zip_state_loc`, `zip_lookup_base`, `edge_containment`) are built per-state at load time.
+The reference tables (`featnames`, `edges`, `faces`, `addr`, `state`, `county`, `place`, `cousub`, `zcta5`) carry the minimum columns the geocoder reads, plus six loader-precomputed acceleration columns on `featnames`:
+
+- `name_lower`, `fullname_norm`, `name_soundex` — equi-key replacements for `lower(name)` / `normalize_street_name(fullname)` / `soundex(name)` recomputed per row.
+- `numeric_stem` (May 2026) — `trim(regexp_extract(name, '^[0-9/\s]+'))` when `length(name) < 10` and the name has a numeric/slash/space prefix; NULL otherwise. Replaces the row-by-row `numeric_streets_equal(...)` `BLOCKWISE_NL_JOIN`. ~6700× faster on that one predicate at CA scale.
+- `name_first_5`, `fullname_first_5` (May 2026) — `substr(name_lower, 1, 5)` / `substr(fullname_norm, 1, 5)`. Equi-keys for the prefix-LIKE branches; the macro post-filters with the actual `LIKE` to preserve recall.
+
+Why these six exist: without them, name-match in `geocode_address_for_state` falls back to nested-loop joins on regex / LIKE patterns, which dominate wall-clock at nationwide scale. See [CLAUDE.md § Geocoder performance](../CLAUDE.md#geocoder-performance-findings) for the engineering history.
+
+The derived tables (`zip_state`, `zip_state_loc`, `zip_lookup_base`, `edge_containment`) are built per-state at load time.
+
+**Test fixtures must populate all six precompute columns** — fixture INSERTs that omit them silently miss matches. Either populate inline in `VALUES` or backfill via an `UPDATE` block; see `test/sql/geocode_batch_multistate.test` for the canonical pattern.

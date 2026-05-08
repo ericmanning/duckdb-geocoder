@@ -2,7 +2,7 @@
 -- ST_Intersects). Uses our built-in soundex (vendored from splink_udfs;
 -- see src/include/vendored_soundex.hpp). Registered best-effort.
 --
--- Per geocode_flow.md §8, §11:
+-- Per pg_parity.md § PG cascade reference §8, §11:
 --   * Returns rows with rating >= 100 (strict invariant, keeps Stage B
 --     always below any Stage A match).
 --   * First tier: zcta5 ⨝ zip_lookup_base on matching zip OR soundex(city).

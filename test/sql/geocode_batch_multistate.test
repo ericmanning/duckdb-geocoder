@@ -104,7 +104,7 @@ FROM geocode_batch((SELECT 1 AS id, '5 Main St 01504' AS addr_str));
 # candidate set contributes MA, so we dispatch to both — the cross-state
 # typo case. Match comes from MA. (PG returns NULL here because it lets a
 # valid-but-wrong state_abbrev silently shadow the ZIP. Documented "us > PG"
-# divergence — see docs/parity.md.)
+# divergence — see docs/pg_parity.md.)
 query II
 SELECT id, adr_text LIKE '%, MA %'
 FROM geocode_batch((SELECT 2 AS id, '5 Main St, RI 01504' AS addr_str));

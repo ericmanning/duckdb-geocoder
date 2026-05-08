@@ -10,7 +10,7 @@
 # drift (block reshuffles, new addresses, etc.).
 #
 # Usage:
-#   ./scripts/parity/run_geocode_regress.sh <reference_db.duckdb>
+#   ./benchmark/regress/run_geocode_regress.sh <reference_db.duckdb>
 #
 # Prerequisites:
 #   - Built extension: ./build/release/duckdb exists

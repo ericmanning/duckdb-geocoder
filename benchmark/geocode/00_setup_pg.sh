@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Build (if needed) and start the pgparity Docker container with PG 16 +
 # PostGIS + address_standardizer + postgis_tiger_geocoder. Reuses the existing
-# image at scripts/parity/pg_compare/.
+# image at benchmark/pg/.
 #
 # Idempotent: re-running just verifies the container is up.
 source "$(dirname "$0")/../config.sh"
 
 echo "=== PostgreSQL (Docker) Setup ==="
 
-DOCKERFILE_DIR="$REPO_DIR/scripts/parity/pg_compare"
+DOCKERFILE_DIR="$REPO_DIR/benchmark/pg"
 
 # 1. Build the image if absent.
 if ! docker image inspect "$PG_IMAGE" >/dev/null 2>&1; then

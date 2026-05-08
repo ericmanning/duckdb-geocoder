@@ -1,5 +1,5 @@
 -- TIGER parent tables. All geometry columns are stored in EPSG:4269 (NAD83).
--- Minimum columns per geocode_flow.md §14.2. Populated by the loader
+-- Minimum columns per pg_parity.md § Locked design decisions (D1, D2). Populated by the loader
 -- (Phase 5); these CREATE TABLE IF NOT EXISTS statements just stand up
 -- the schema so the macros in later phases compile.
 --

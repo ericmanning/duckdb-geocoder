@@ -1,9 +1,0 @@
-id,address_num,street_name,street_type,location,state,zip
-1,1,Nassau,Hall,Princeton,NJ,08544
-2,65,Witherspoon,St,Princeton,NJ,08542
-3,300,Alexander,St,Princeton,NJ,08540
-4,400,Witherspoon,St,Princeton,NJ,08540
-5,122,Nassau,St,Princeton,NJ,08542
-6,1,Raymond,Plz,Newark,NJ,07102
-7,125,W State,St,Trenton,NJ,08608
-8,169,Nassau,St,Princeton,NJ,08542

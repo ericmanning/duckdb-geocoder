@@ -4,7 +4,7 @@
 #
 # Mirrors the layout of the duckdb-address-standardizer benchmark/ tree, but
 # adapted to the geocoder's reality:
-#   - PG side runs inside the existing scripts/parity/pg_compare/ Docker image
+#   - PG side runs inside the existing benchmark/pg/ Docker image
 #     (PG 16 + PostGIS + tiger_geocoder + address_standardizer); building
 #     PostGIS from source via brew is a 1-3hr ordeal we avoid.
 #   - TIGER data must be loaded into both engines before any geocode call.

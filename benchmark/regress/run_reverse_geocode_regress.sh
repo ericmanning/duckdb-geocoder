@@ -3,11 +3,11 @@
 # tiger.reverse_geocode() and compare output against PG's expected file.
 #
 # Companion to run_geocode_regress.sh — same shape, different test set.
-# Source inputs: scripts/parity/pg_compare/tiger_geocoder/src/regress/reverse_geocode_regress.sql
+# Source inputs: benchmark/pg/tiger_geocoder/src/regress/reverse_geocode_regress.sql
 #   (8 ST_Point() calls; 5 unnamed → T1–T5, 3 ticketed → #1913 #2927 #3806).
 #
 # Usage:
-#   ./scripts/parity/run_reverse_geocode_regress.sh <reference_db.duckdb>
+#   ./benchmark/regress/run_reverse_geocode_regress.sh <reference_db.duckdb>
 #
 # Prerequisites:
 #   - Built extension: ./build/release/duckdb exists

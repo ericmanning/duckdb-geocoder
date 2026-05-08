@@ -1,5 +1,5 @@
 -- The 9-field public input contract for geocode().
--- See geocode_flow.md §14 for the full format contract.
+-- See pg_parity.md § Locked design decisions for the full format contract.
 --
 -- `internal` is the unit/suite/apt number — PAGC's `unit` field, with the
 -- leading '#' stripped. Matches PG's `norm_addy.internal`. Captured so

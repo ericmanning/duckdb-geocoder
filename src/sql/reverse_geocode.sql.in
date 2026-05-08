@@ -6,7 +6,7 @@
 -- vectorize it into a CTE chain that preserves the load-bearing predicates
 -- and ordering.
 --
--- Logic mapping (PG line numbers in scripts/parity/pg_compare/.../reverse_geocode.sql):
+-- Logic mapping (PG line numbers in benchmark/pg/tiger_geocoder/.../reverse_geocode.sql):
 --   - L49–93   coverage: state → county → place|cousub → ZIP        → coverage CTEs.
 --   - L107–123 face-side narrowing: faces ⨝ edges, eside = side
 --               of edge facing the point                            → face_hits, candidates.
@@ -27,7 +27,7 @@
 --               array-of-snapshots PG produces.
 --
 -- Spec carve-outs (`reverse_geocode_numbered_roads` highway preference and
--- the cross-street array) are deferred — geocode_flow.md §10. Distance is
+-- the cross-street array) are deferred — pg_parity.md § PG cascade reference §10. Distance is
 -- computed via UTM ST_Transform meters rather than ST_DistanceSphere; the
 -- two agree to <1 m at TIGER scales.
 --

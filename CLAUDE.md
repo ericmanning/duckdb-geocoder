@@ -2,8 +2,8 @@
 
 DuckDB community extension `us_geocoder`: a pure-DuckDB port of PostGIS's `postgis_tiger_geocoder`. Geocodes US addresses against Census TIGER/Line data.
 
-- **Spec:** [geocode_flow.md](geocode_flow.md) — 1,093-line semantic spec, locked design decisions D1–D14. This is the source of truth; consult it before making architectural changes.
-- **Public docs:** [README.md](README.md), [docs/api.md](docs/api.md), [docs/parity.md](docs/parity.md).
+- **PG comparison + design decisions D1–D14:** [docs/pg_parity.md](docs/pg_parity.md). The locked design ledger + per-test divergence audit + condensed PG cascade reference all live here.
+- **Public docs:** [README.md](README.md) (overview + quickstart pointer), [docs/quickstart.md](docs/quickstart.md), [docs/api.md](docs/api.md) (function reference), [docs/pg_parity.md](docs/pg_parity.md).
 - **License:** GPLv2 (matches upstream).
 - **DuckDB pin:** 1.5.2 (submodule `duckdb/`).
 
@@ -14,8 +14,8 @@ src/
   us_geocoder_extension.cpp    # ExtensionLoader entrypoint; registers macros + C++ table fns
   loader.cpp                    # TIGER loader + set_tiger_reference + install_tiger_schema
   sql/*.sql.in                  # embedded SQL (macros, lookup seeds, schema DDL, loader templates)
-test/sql/*.test                 # sqllogictest — 216 assertions, all deterministic (hand-built fixtures)
-docs/                           # api.md, parity.md
+test/sql/*.test                 # sqllogictest — 328 assertions, all deterministic (hand-built fixtures)
+docs/                           # quickstart.md, api.md, pg_parity.md, UPDATING.md
 ```
 
 Embedded SQL is inlined at build time via the CMake pipeline in [CMakeLists.txt](CMakeLists.txt) — each `.sql.in` becomes `us_geocoder::<Name>Sql()`. Token `@TIGER@` (data location) and `@FUNC@` (local-macro location) are substituted at runtime.
@@ -35,7 +35,7 @@ The built CLI `build/release/duckdb` statically links the extension, so no `INST
 - **Macros always live in local `tiger` schema.** They reference `tiger.<table>` unqualified. The 13 TIGER data tables (`state`, `county`, `place`, `cousub`, `zcta5`, `zip_state`, `zip_state_loc`, `zip_lookup_base`, `edges`, `faces`, `featnames`, `addr`, `edge_containment`) can be either base tables or views over an attached catalog — see [`set_tiger_reference`](docs/api.md#set_tiger_referencedatabase-varchar-schema-varchar-default-tiger--table).
 - **Macro overloading syntax** is `CREATE OR REPLACE MACRO name (args1) AS body1, (args2) AS body2;` (single statement, comma-separated). Separate `CREATE MACRO` calls error on "already exists."
 - **Struct fields in macros** must use bracket notation (`inp['zip']`), not dot. Dot gets parsed as `table.column`.
-- **`soundex`** lives in the `splink_udfs` community extension (auto-loaded best-effort in `LoadInternal`).
+- **`soundex`** is **vendored** at `src/include/vendored_soundex.hpp` (MIT, originally from splink_udfs). Registered unconditionally by `LoadInternal`. No community-extension dependency for it; the macros and the loader's `name_soundex` precompute both call the locally-registered scalar.
 - **`st_read` + `/vsizip//vsicurl/`** is the HTTP ingestion path. UNION-ALL batching across counties does **not** parallelize in practice (measured 8m batched vs ~5m serial for NJ on DuckDB 1.5 + spatial) — serial per-county INSERTs is the shipped loop.
 - **Local source layout is Census-nested only.** `BuildVsiPath` uses `<source>/<SUBDIR>/<zip>.zip/<inner>` for both HTTP and local — no flat-layout fallback. Users point the loader at a mirror of `TIGER<year>/`.
 - **Loader state-list API.** `load_tiger_state(VARCHAR)` and `load_tiger_states(VARCHAR[])` share one bind-data structure (`std::vector<StatePlan>`); `load_tiger_all_states()` resolves the 50+DC list at bind time from `state_lookup WHERE statefp::INT BETWEEN 1 AND 56`.
@@ -116,7 +116,7 @@ Wins shipped during the May 2026 perf push (`perf/geocode-batch-planning` + foll
 
 **8. Multi-state-ZIP + state-abbrev/ZIP union resolution** — `RunResolution` unions the state_lookup result with the zip_lookup_base result (DISTINCT) and dispatches to all candidates. Two layered improvements over PG:
 - ZIP-only inputs in multi-state ZIPs (~7% of US ZIPs cross state lines) — PG uses `LIMIT 1`, arbitrary state wins, real match silently lost when ordered second. We dispatch to all candidate states.
-- `state_abbrev` typo'd to a valid-but-wrong code while ZIP correctly resolves — PG's `COALESCE(state_lookup, zip_lookup_base)` lets state_abbrev win authoritatively. We dispatch to both. Mitigated for placeholder ZIPs (12345/99999/etc.): when ZIP-derived list size > 3 AND state_abbrev resolves, drop the ZIP set as unreliable. See [docs/parity.md](docs/parity.md) divergences D and E.
+- `state_abbrev` typo'd to a valid-but-wrong code while ZIP correctly resolves — PG's `COALESCE(state_lookup, zip_lookup_base)` lets state_abbrev win authoritatively. We dispatch to both. Mitigated for placeholder ZIPs (12345/99999/etc.): when ZIP-derived list size > 3 AND state_abbrev resolves, drop the ZIP set as unreliable. See [docs/pg_parity.md](docs/pg_parity.md) divergences D and E.
 
 **Architectural lessons:**
 - **Cardinality misestimates on synthesized columns (decorrelation residue) aren't fixable by `ANALYZE`.** The planner's estimate on `#1 IS NOT DISTINCT FROM #17` joins is on anonymous correlation columns, not real table stats. The misestimate has to be neutered at the optimizer-rule level (or via SQL rewrite that avoids the decorrelation).
@@ -131,21 +131,26 @@ Wins shipped during the May 2026 perf push (`perf/geocode-batch-planning` + foll
 - **`information_schema.tables` returns rows from all attached catalogs.** Filter by `table_catalog = current_catalog()` when writing cross-DB tests.
 - **LATERAL + LEFT JOIN + correlated CTE** is not supported by DuckDB's planner in some shapes — restructure as CTEs-before-join.
 - **Stage A 5B-row cartesian** has a known shape: `OR`-based face-side join. Split L/R into `UNION ALL` branches (see `geocode_address.sql.in`).
-- **Test fixtures must populate precomputed columns** (`name_lower`, `fullname_norm`, `name_soundex` on `featnames`) or name-match branches silently miss.
+- **Test fixtures must populate precomputed columns** on `featnames` — six in total: `name_lower`, `fullname_norm`, `name_soundex` (used by all branches) plus `numeric_stem`, `name_first_5`, `fullname_first_5` (used by the equi-join replacements for `numeric_streets_equal` regex and prefix-LIKE `BLOCKWISE_NL_JOIN`s). Fixture INSERTs in `test/sql/*.test` either populate them inline or backfill via an `UPDATE` block — see e.g. `geocode_batch_multistate.test`.
 
 ## Workflow preferences
 
 - Prefer editing `.sql.in` over regenerating macros from scratch.
 - Run the full sqllogic suite after any SQL change; individual file runs miss regression interactions.
 - Don't change rating weights or the "location ratings ≥ 100" invariant without an explicit spec amendment — downstream consumers depend on the total order.
-- Small focused commits per phase/feature. Commit messages reference phase numbers from [geocode_flow.md](geocode_flow.md) where applicable.
+- Small focused commits per phase/feature. Commit messages reference design decisions D1–D14 from [docs/pg_parity.md](docs/pg_parity.md) where applicable.
 
 ## Roadmap / deferred
 
-See end of [geocode_flow.md § 14.9](geocode_flow.md). Active deferred work:
-- Phase 12: PG-regress parity ports + 10k-row random-sample corpus.
-- Phase 14: cross-platform CI via [.github/workflows/MainDistributionPipeline.yml](.github/workflows/MainDistributionPipeline.yml) + community-extensions submission.
+Active deferred work:
+- 10k-row random-sample parity corpus from a loaded TIGER state — catches scoring/parser regressions outside the curated 51-case stress set.
+- Submit `description.yml` to `duckdb/community-extensions` so users can `INSTALL us_geocoder FROM community`. CI matrix already builds the 5 platforms the registry expects (linux_amd64/arm64, osx_arm64, windows_amd64, windows_amd64_mingw).
+- File DuckDB upstream issue for the 179 M `IS NOT DISTINCT FROM` cardinality misestimate that the join_order workaround currently sidesteps. Same shape as splink#3023 / splink#2929.
 - Real parallel HTTPS loads at the loader layer — only viable path left is upstream `UNION ALL` + `ST_Read` parallelization in DuckDB/spatial. `read_blob` prefetch / parallel INSERT / parallel CTAS were all tried and reverted (see Loader performance notes above).
-- Parquet distribution (prebuilt per-state parquet for faster first-run UX).
-- ~~**v0.2: per-state TIGER tables (storage sharding).**~~ **Falsified May 2026.** Tested empirically on a `perf/per-state-tables` branch (deleted): 12% wall-clock gain over unified+ART-pushdown but **2× peak RSS** due to inter-state pipeline parallelism. ART pushdown gives equivalent scan shape without the schema refactor cost. See `project_perstate_sharding_falsified.md` and the "Geocoder performance" section above.
-- All-states pre-download → local-ingest → cleanup wrapper. Loop [`scripts/parallel_download_state.sh`](scripts/parallel_download_state.sh) over 50+DC, ingesting each state then `rm -rf` of its zips before the next, so disk stays bounded by `max(state_size)` (~10 GB worst case for TX). With resumable loads + retry-with-backoff already shipped, a failed state just resumes on next pass. ~30-line wrapper around the existing script. Queue after parity benchmark.
+- Parquet distribution (prebuilt per-state parquet for faster first-run UX) — bypasses shapefile-parse + INSERT-write entirely. Only remaining path to >3× loader speedup.
+- All-states pre-download → local-ingest → cleanup wrapper. Loop [`scripts/parallel_download_state.sh`](scripts/parallel_download_state.sh) over 50+DC, ingesting each state then `rm -rf` of its zips before the next, so disk stays bounded by `max(state_size)` (~10 GB worst case for TX).
+
+Falsified hypotheses (don't re-attempt without new information):
+- **Per-state TIGER tables (storage sharding).** Tested May 2026 on `perf/per-state-tables` (deleted): 12% wall-clock gain over unified+ART-pushdown but **2× peak RSS** because inter-state pipeline parallelism multiplies hash builds. ART pushdown gives equivalent scan shape without the schema refactor. See project memory `project_perstate_sharding_falsified.md`.
+- **Removing per-state dispatch entirely.** With the join_order workaround on, runtime-statefp queries spilled 21.8 GB at 73 s on 100K mixed before being killed by watchdog. Per-state dispatch + literal statefp + ART pushdown is the architectural floor.
+- **Smaller slice cap = safer on smaller-RAM machines.** Inverse turned out to be true: at `memory_limit='8GB'`, cap=5000 OOM'd on Texas dispatch while cap=10000 ran fine. Fewer-larger dispatches stream more cleanly than many-smaller through a constrained buffer pool. Default ships at 10000.

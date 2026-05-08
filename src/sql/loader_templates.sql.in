@@ -140,7 +140,7 @@ CROSS JOIN LATERAL (VALUES (ef.zipl), (ef.zipr)) AS z(zip)
 WHERE z.zip IS NOT NULL;
 
 -- @SECTION:derived_zcta5_clip@
--- Per-state ZCTA clipping (geocode_flow.md §14.9). For each ZCTA whose
+-- Per-state ZCTA clipping (pg_parity.md § Roadmap). For each ZCTA whose
 -- nation polygon shares interior with this state's polygon, INSERT a row
 -- carrying the within-state slice of the polygon and statefp populated.
 -- USPS ZCTAs legitimately cross state lines (e.g. 03579 Errol NH spilling
@@ -168,7 +168,7 @@ WHERE zr.statefp IS NULL
   AND NOT ST_Touches(zr.the_geom, st.the_geom);
 
 -- @SECTION:derived_edge_containment@
--- Per-edge-per-side containment precomputation (geocode_flow.md §14.3).
+-- Per-edge-per-side containment precomputation (pg_parity.md § Locked design decisions (D14) + docs/api.md § Containment).
 -- The guaranteed_* flags are the v0.1 single-midpoint approximation:
 -- project to UTM, interpolate at 0.5, offset 10m perpendicular via
 -- interpolate_from_address, then check ST_Within the adjacent face.

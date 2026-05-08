@@ -1,6 +1,6 @@
 -- Canonicalization macros for geocode_input fields.
 -- Coerce free-form user input into TIGER's abbreviation vocabulary so
--- rate_attributes scores accurately. See geocode_flow.md §14 for the contract.
+-- rate_attributes scores accurately. See pg_parity.md § Locked design decisions for the contract.
 
 CREATE OR REPLACE MACRO @TIGER@.canon_street_type(t) AS (
     COALESCE(

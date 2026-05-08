@@ -15,8 +15,8 @@ CALL load_tiger_states(['MA','MN'], build_containment := false);
 EOF
 
 # Run harnesses:
-./scripts/parity/run_geocode_regress.sh         ~/pg_parity.duckdb > test/parity/baseline/geocode_regress.txt
-./scripts/parity/run_reverse_geocode_regress.sh ~/pg_parity.duckdb > test/parity/baseline/reverse_geocode_regress.txt
+./benchmark/regress/run_geocode_regress.sh         ~/pg_parity.duckdb > test/parity/baseline/geocode_regress.txt
+./benchmark/regress/run_reverse_geocode_regress.sh ~/pg_parity.duckdb > test/parity/baseline/reverse_geocode_regress.txt
 ```
 
 ## geocode_regress (forward geocode)
@@ -45,7 +45,7 @@ Same address, rating off by 1-2. Likely ZIP-penalty / Levenshtein cumulative rou
 
 #### Tier 3 — relaxed Stage A/B short-circuit (D7) — we return more candidates (8 cases)
 
-For partial / fuzzy queries we list additional cities PG doesn't because we relaxed PG's `if best rating < 30 → skip Stage B` short-circuit. Documented deviation in [docs/parity.md](../../../docs/parity.md) D7.
+For partial / fuzzy queries we list additional cities PG doesn't because we relaxed PG's `if best rating < 30 → skip Stage B` short-circuit. Documented deviation in [docs/pg_parity.md](../../../docs/pg_parity.md) D7.
 
 `T6, T9, T12, T13, T16, #1087b, #1073b`
 
@@ -62,7 +62,7 @@ For partial / fuzzy queries we list additional cities PG doesn't because we rela
 8 PG test points (5 anonymous → T1–T5; 3 ticketed → #1913 #2927 #3806). The
 parity oracle is `test/parity/upstream/reverse_geocode_regress_pg2025` — PG's
 *current* output against TIGER 2025, captured byte-for-byte from the running
-container. (The historical regress file `scripts/parity/pg_compare/.../reverse_geocode_regress`
+container. (The historical regress file `benchmark/pg/tiger_geocoder/src/regress/reverse_geocode_regress`
 was captured against ~2010-era TIGER and drifts under TIGER 2025 even when
 running PG itself; the current snapshot is the right comparison target.)
 
@@ -87,7 +87,7 @@ not. For interstate points (no `addr.zip`), the fallback is what fills the
 ZIP — PG's fallback fails for these two points (likely a missing-state-clip
 in their ZCTA load); ours succeeds because we don't filter ZCTA by `statefp`
 (our loader leaves `tiger.zcta5.statefp = NULL` until per-state clip is
-implemented; see `loader_templates.sql.in :nation_zcta5:` + geocode_flow.md
+implemented; see `loader_templates.sql.in :nation_zcta5:` + pg_parity.md
 §14.9).
 
 ### Note on the historical expected file

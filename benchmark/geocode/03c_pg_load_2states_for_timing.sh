@@ -43,7 +43,7 @@ SQL
 # Run the same loader the real benchmark would have used, scoped to 2 states.
 # load_tiger_via_pg.sh accepts a comma-separated state list; we pass CA,KY.
 PG_DB="$PG_DB_TIMING" \
-    "$REPO_DIR/scripts/parity/pg_compare/load_tiger_via_pg.sh" "CA,KY" 2>&1 | tee -a "$LOG"
+    "$REPO_DIR/benchmark/pg/load_tiger_via_pg.sh" "CA,KY" 2>&1 | tee -a "$LOG"
 
 echo "" | tee -a "$LOG"
 echo "=== PG load-timing run complete ===" | tee -a "$LOG"

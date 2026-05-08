@@ -8,7 +8,7 @@ License:  GPL v2 (same as us_geocoder)
 Copyright the PostGIS project / individual contributors.
 
 These files are vendored verbatim — no modifications — so the parity
-harness in scripts/parity/ can compare our geocoder's output against
+harness in benchmark/regress/ can compare our geocoder's output against
 PostGIS's reference behavior.
 
 Files:

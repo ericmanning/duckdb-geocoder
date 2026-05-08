@@ -1,5 +1,5 @@
 -- Stage A — vectorized address-match macro.
--- See geocode_flow.md §7 for the PostGIS cascade we're collapsing and §14.1
+-- See pg_parity.md § PG cascade reference §7 for the PostGIS cascade we're collapsing and §14.1
 -- for the D7 "single vectorized pass, LIMIT at end" spec.
 --
 -- Depends on spatial (ST_Intersects, interpolate_from_address). Uses our

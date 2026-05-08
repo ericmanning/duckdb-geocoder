@@ -84,7 +84,7 @@ INSERT INTO tiger.addr (statefp, tlid, fromhn, tohn, side, zip) VALUES
 # PG expected: 100 N Belt Line Rd, Coppell, TX 75019  rating=5
 # Resolved street + house number match PG. Rating differs (we return 8) because
 # our scoring sums fullname+name levenshtein rather than PG's max-of-fullname-
-# OR-name. Documented in docs/parity.md.
+# OR-name. Documented in docs/pg_parity.md.
 
 query II
 SELECT (adr).address, (adr).street_name

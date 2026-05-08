@@ -10,7 +10,7 @@
 #              NOT a PG-parity test. Asserts our own behavior is consistent
 #              and exercises each branch of the geocode_address_impl macro
 #              with a minimum input set. For real PG-output mirroring see
-#              scripts/parity/run_geocode_regress.sh, which runs PG's
+#              benchmark/regress/run_geocode_regress.sh, which runs PG's
 #              vendored test inputs against our geocoder + a real TIGER
 #              reference DB and diffs against PG's expected outputs.
 

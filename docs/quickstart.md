@@ -1,13 +1,13 @@
-# Quickstart: geocode New Jersey addresses
+# Quickstart
 
-End-to-end recipe for a single state, fetching TIGER over HTTP from Census directly. No local mirror.
+End-to-end recipe for a single state, no local mirror.
 
 ## 1. Install + load extensions
 
 One-time per machine:
 
 ```sql
-INSTALL us_geocoder             FROM community;
+INSTALL '/path/to/geocoder_extension/file'; -- needed until published
 INSTALL us_address_standardizer FROM community;
 ```
 
@@ -17,16 +17,14 @@ Each session:
 LOAD us_geocoder;
 ```
 
-`spatial`, `httpfs`, and `us_address_standardizer` auto-load. `soundex` is vendored — no `splink_udfs` dependency.
-
 ## 2. Persist into a real DB
 
 ```sql
-ATTACH '/path/to/nj_geocoder.duckdb' AS db;
+ATTACH 'tiger.duckdb' AS db;
 USE db;
 ```
 
-In-memory works for one-off runs but you'll refetch ~835 MB of shapefiles every session.
+In-memory works for one-off runs but you'll refetch ~835 MB of shapefiles every session unless you persist or mirror.
 
 ## 3. Bootstrap nation-level lookups
 
@@ -43,8 +41,6 @@ No `source` argument → defaults to `https://www2.census.gov/geo/tiger/TIGER202
 ```sql
 CALL load_tiger_state('NJ');
 ```
-
-~5–8 min on a fast connection. NJ is 21 counties, ~835 MB of shapefile zips total.
 
 The loader is resumable: kill it mid-run and re-call — it skips already-completed work via the `loader_progress` table. `ANALYZE` runs at the end automatically so the planner has stats.
 
@@ -107,13 +103,9 @@ FROM geocode_batch((
 
 ```
 <your passthrough columns>,
-rating BIGINT,                  -- lower is better; 0 is exact, ≥100 is location-only
+rating BIGINT,                   -- lower is better; 0 is exact, ≥100 is location-only
 lng DOUBLE, lat DOUBLE,
 adr_text VARCHAR,                -- pretty-printed canonical address
 block_geoid VARCHAR,             -- 15-digit Census block GEOID
-tract_geoid VARCHAR,             -- 11-digit
-blkgrp_geoid VARCHAR,            -- 12-digit
 containment_guaranteed BOOLEAN   -- true ⇒ block_geoid is correct without spatial test
 ```
-
-See [api.md](api.md) for full reference, [parity.md](parity.md) for PostGIS-comparison notes.

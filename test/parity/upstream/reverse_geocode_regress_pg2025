@@ -1,7 +1,7 @@
 # PG reverse_geocode_regress canonicalized to <test_id>|<pprint_addy(rank=1)>.
 #
 # This file captures PG's CURRENT output against TIGER 2025 — the actual parity
-# oracle. The historical file (scripts/parity/pg_compare/.../regress/reverse_geocode_regress)
+# oracle. The historical file (benchmark/pg/tiger_geocoder/src/regress/reverse_geocode_regress)
 # was captured against ~2010-era TIGER and drifted: 5 of its 8 cases now resolve
 # to different addresses under PG itself when run against TIGER 2025. We compare
 # us against current-PG, not historical-PG.

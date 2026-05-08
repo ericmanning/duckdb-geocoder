@@ -22,12 +22,12 @@
 #   ./scripts/regenerate_pagc_tables.sh
 #
 # Prereq: the postgis_tiger_geocoder mirror cloned into
-#   scripts/parity/pg_compare/tiger_geocoder/  (per .gitignore note)
+#   benchmark/pg/tiger_geocoder/  (per .gitignore note)
 
 set -eu -o pipefail
 cd "$(dirname "$0")/.."
 
-PG_SRC=scripts/parity/pg_compare/tiger_geocoder/src/pagc_normalize/pagc_tables.sql
+PG_SRC=benchmark/pg/tiger_geocoder/src/pagc_normalize/pagc_tables.sql
 OUT=src/sql/pagc_tables.sql.in
 
 [[ -f "$PG_SRC" ]] || { echo "ERROR: $PG_SRC not found. Clone the mirror first." >&2; exit 2; }
@@ -51,7 +51,7 @@ cat > "$OUT" <<'HEADER'
 CREATE TABLE IF NOT EXISTS @TIGER@.pagc_lex (
     id INTEGER PRIMARY KEY,
     seq INTEGER,
-    word VARCHAR,
+
     stdword VARCHAR,
     token INTEGER
 );
