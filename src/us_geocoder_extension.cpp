@@ -83,6 +83,26 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto &db = loader.GetDatabaseInstance();
 	Connection conn(db);
 
+	// User-tunable knob read by tiger.geocode_batch on each Bind. Default
+	// 10000 was the empirical wall-clock optimum on a 5-run sweep at
+	// 100K mixed input on 32-GB-RAM hardware (also robust under
+	// memory_limit=8GB; cap=5000 OOM'd in a similar test where cap=10000
+	// completed cleanly because fewer-larger dispatches stream more
+	// cleanly than many-smaller through the buffer pool). Override via:
+	//   SET us_geocoder_slice_cap = 5000;        -- session-wide
+	//   SET LOCAL us_geocoder_slice_cap = 5000;  -- single statement
+	// Power users on tighter RAM may want a smaller value; on big-RAM
+	// (≥64 GB) machines, slightly larger may help.
+	{
+		auto &config = DBConfig::GetConfig(db);
+		if (!config.HasExtensionOption("us_geocoder_slice_cap")) {
+			config.AddExtensionOption(
+			    "us_geocoder_slice_cap",
+			    "Per-state slice cap for tiger.geocode_batch (input rows per per-state SQL dispatch).",
+			    LogicalType::INTEGER, Value::INTEGER(10000));
+		}
+	}
+
 	// core_functions provides lpad, regexp_matches, etc. — required by
 	// canon_macros, scoring_macros, and lookup_tables. Enable autoinstall
 	// + autoload so DuckDB loads core_functions on-demand when our SQL

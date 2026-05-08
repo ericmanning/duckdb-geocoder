@@ -50,19 +50,25 @@ namespace {
 // Rows we accumulate before forcing an early flush during the input
 // stream. Bigger is better for amortizing per-state SQL plan cost across
 // more rows; spill control is handled separately by the per-state slice
-// cap (kPerStateSliceCap), which splits a single big state's per-flush
+// cap (BatchBindData::slice_cap, default kPerStateSliceCapDefault),
+// which splits a single big state's per-flush
 // rows into multiple smaller dispatches so peak hash builds + intermediate
 // joins stay bounded regardless of state skew.
 constexpr idx_t kBufferThreshold = 100000;
 
-// Max input rows fed to a single per-state SQL dispatch. Caps the peak
-// hash-build / intermediate-join cost on heavily-populated states (CA,
-// TX, FL, NY) where one buffer flush can route 10K+ rows to a single
-// state's pipeline. When a state's per-flush bucket exceeds this, we
-// slice into ⌈n/cap⌉ sub-dispatches; each pays its own per-state SQL
-// plan cost but keeps peak spill bounded. Tuned empirically; raise if
-// plan overhead dominates wall-clock on big single-state inputs.
-constexpr idx_t kPerStateSliceCap = 1000;
+// Default max input rows fed to a single per-state SQL dispatch. Caps
+// the peak hash-build / intermediate-join cost on heavily-populated
+// states (CA, TX, FL, NY) where one buffer flush can route 10K+ rows
+// to a single state's pipeline. When a state's per-flush bucket exceeds
+// this, we slice into ⌈n/cap⌉ sub-dispatches.
+//
+// 10000 was the median-fastest value on a 5-run sweep at 100K mixed
+// input on 32 GB-RAM hardware (also fastest under memory_limit=8GB —
+// fewer-larger dispatches stream more cleanly than many-smaller because
+// they reduce contention on the buffer pool). Overridable per-session
+// via `SET us_geocoder_slice_cap = N;`. Read once in Bind into
+// BatchBindData::slice_cap; runtime reads use that value, not the const.
+constexpr idx_t kPerStateSliceCapDefault = 10000;
 constexpr idx_t kInvalidIdx = static_cast<idx_t>(-1);
 
 // Recognized input column names (Form 1 + Form 2).
@@ -78,6 +84,7 @@ constexpr const char *kStateAbbrevCol = "state_abbrev";
 constexpr const char *kZipCol = "zip";
 
 struct BatchBindData : public TableFunctionData {
+	idx_t slice_cap = kPerStateSliceCapDefault; // overridable via SET us_geocoder_slice_cap
 	idx_t addr_str_idx = kInvalidIdx;
 	idx_t address_idx = kInvalidIdx;
 	idx_t street_name_idx = kInvalidIdx;
@@ -136,9 +143,24 @@ void RequireType(const std::string &col_name, const LogicalType &got, LogicalTyp
 	}
 }
 
-unique_ptr<FunctionData> Bind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
+unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types,
                               vector<string> &names) {
 	auto bind_data = make_uniq<BatchBindData>();
+
+	// Pick up the user-set per-session slice cap (registered as an
+	// extension option in LoadInternal). Falls back to the default
+	// constant if unset or if the lookup fails for any reason.
+	{
+		Value v;
+		if (context.TryGetCurrentSetting("us_geocoder_slice_cap", v) && !v.IsNull()) {
+			auto raw = v.GetValue<int64_t>();
+			if (raw <= 0) {
+				throw BinderException("us_geocoder_slice_cap must be positive (got %lld)",
+				                      static_cast<long long>(raw));
+			}
+			bind_data->slice_cap = static_cast<idx_t>(raw);
+		}
+	}
 
 	for (idx_t i = 0; i < input.input_table_names.size(); i++) {
 		const auto &col_name = input.input_table_names[i];
@@ -496,17 +518,18 @@ static void FlushBuffer(ClientContext &context, const BatchBindData &bind_data, 
 		by_statefp[cands.back()].push_back(std::move(r));
 	}
 
-	// Step 3: per-state dispatch. Slice big states into kPerStateSliceCap-
+	// Step 3: per-state dispatch. Slice big states into bind_data.slice_cap-
 	// sized sub-dispatches so a state with 10K+ rows in this flush doesn't
 	// drive one massive hash build / huge intermediate. Small states still
 	// get a single dispatch (slice loop runs once when n ≤ cap).
+	const idx_t cap = bind_data.slice_cap;
 	std::vector<GeocodeResult> all_results;
 	all_results.reserve(resolved.size());
 	for (auto &kv : by_statefp) {
 		const auto &statefp = kv.first;
 		auto &rows = kv.second;
-		for (idx_t off = 0; off < rows.size(); off += kPerStateSliceCap) {
-			idx_t end = MinValue<idx_t>(off + kPerStateSliceCap, rows.size());
+		for (idx_t off = 0; off < rows.size(); off += cap) {
+			idx_t end = MinValue<idx_t>(off + cap, rows.size());
 			std::vector<ResolvedRow> slice(std::make_move_iterator(rows.begin() + off),
 			                               std::make_move_iterator(rows.begin() + end));
 			RunPerStateGeocode(conn, statefp, slice, all_results);

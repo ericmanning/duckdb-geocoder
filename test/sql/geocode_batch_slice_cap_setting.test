@@ -1,0 +1,51 @@
+# name: test/sql/geocode_batch_slice_cap_setting.test
+# description: us_geocoder_slice_cap is registered as an extension option,
+#              defaults to 10000, and rejects non-positive values when the
+#              batch function is invoked.
+# group: [sql]
+
+require us_geocoder
+
+statement ok
+LOAD spatial;
+
+# Default value is 10000.
+query I
+SELECT current_setting('us_geocoder_slice_cap');
+----
+10000
+
+# Overriding works (session scope).
+statement ok
+SET us_geocoder_slice_cap = 7500;
+
+query I
+SELECT current_setting('us_geocoder_slice_cap');
+----
+7500
+
+# Setting back to default is OK.
+statement ok
+SET us_geocoder_slice_cap = 10000;
+
+# Zero / negative values are rejected when the batch function is invoked.
+# (The setting itself accepts INTEGER, so the typecheck happens at use.)
+statement ok
+SET us_geocoder_slice_cap = 0;
+
+statement error
+SELECT * FROM geocode_batch((SELECT 1 AS id, 'unused' AS addr_str));
+----
+us_geocoder_slice_cap must be positive
+
+statement ok
+SET us_geocoder_slice_cap = -1;
+
+statement error
+SELECT * FROM geocode_batch((SELECT 1 AS id, 'unused' AS addr_str));
+----
+us_geocoder_slice_cap must be positive
+
+# Reset for any subsequent tests in this session.
+statement ok
+SET us_geocoder_slice_cap = 10000;

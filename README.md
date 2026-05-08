@@ -105,7 +105,25 @@ See [docs/api.md](docs/api.md) for the full reference, including `geocode_inters
 
 ### Batch: a table of addresses
 
-Vectorize across a whole table via `CROSS JOIN LATERAL`:
+For nationwide-scale batches use `geocode_batch`, a C++ table function that buffers input rows, partitions by resolved state, and dispatches one per-state SQL per state — letting the planner prune the big TIGER tables to one state at a time:
+
+```sql
+SELECT id, rating, lng, lat, adr_text, block_geoid, containment_guaranteed
+FROM geocode_batch((SELECT id, address AS addr_str FROM my_table));
+```
+
+Two input shapes are accepted: free-form `addr_str` (parsed via `tiger.from_pagc` internally) or pre-parsed columns matching `tiger.geocode_input` field names. Any non-recognized columns pass through to the output.
+
+**Tunable: `us_geocoder_slice_cap`.** Per-state SQL dispatch is sliced when a single state's input bucket exceeds this cap (default 10000). Lowering helps on tight-RAM machines that hit `memory_limit` blockers; raising rarely helps because the wall-clock-vs-cap curve is U-shaped (memory pressure rises faster past the optimum than plan-overhead falls).
+
+```sql
+SET us_geocoder_slice_cap = 5000;     -- session
+SET LOCAL us_geocoder_slice_cap = 5000;  -- single statement
+```
+
+See [docs/api.md](docs/api.md#geocode_batchinput-table--table) for the full reference.
+
+Alternative for one-off / interactive queries: `tiger.geocode` via `CROSS JOIN LATERAL`. It's slower at scale (no per-state dispatch — DuckDB can't push a runtime statefp into the unified TIGER tables) but works fine for small inputs:
 
 ```sql
 WITH inputs AS (
@@ -118,7 +136,7 @@ FROM inputs
 CROSS JOIN LATERAL tiger.geocode(_raw) AS g;
 ```
 
-Two DuckDB binder quirks worth knowing:
+Two DuckDB binder quirks worth knowing for the LATERAL form:
 
 - **Reference the column unqualified inside the LATERAL call** (`tiger.geocode(_raw)`, not `tiger.geocode(inputs._raw)`). When the outer source is a CTE, DuckDB mis-parses `alias.col` as struct-field access on a row.
 - **Don't reuse the CSV column name as an output alias.** `SELECT ... address` while the input column is also `address` triggers "column cannot be referenced before it is defined." Rename one side (the CTE column, above) to avoid the clash.

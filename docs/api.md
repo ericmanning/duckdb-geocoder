@@ -267,6 +267,21 @@ FROM geocode_batch((SELECT id, addr_str FROM my_inputs));
 
 When neither `state_abbrev` nor a ZIP-resolvable state is available, the row gets a NULL output preserving its `id`.
 
+**Tunable: `us_geocoder_slice_cap`** (extension setting, INTEGER, default 10000). Maximum input rows fed to a single per-state SQL dispatch. When a state's per-flush bucket exceeds this, `geocode_batch` slices into ⌈n/cap⌉ sub-dispatches — bounding peak hash-build memory + intermediate-join cost on heavily-populated states (CA, TX, FL, NY).
+
+The default was empirically tuned on a 5-run sweep at 100K mixed input on a 32 GB-RAM machine; it was also the only value that completed cleanly under `memory_limit='8GB'` in a constrained-RAM test (cap=5000 OOM'd on the Texas dispatch in that environment because more concurrent per-state dispatches contend harder for buffer-pool pages).
+
+```sql
+-- Override per-session (e.g. on a small-RAM machine if you observe OOMs):
+SET us_geocoder_slice_cap = 5000;
+
+-- Or only for a single statement:
+SET LOCAL us_geocoder_slice_cap = 20000;
+SELECT * FROM geocode_batch(…);
+```
+
+Values must be positive — 0 or negative is rejected at `Bind` time with a `Binder Error`. Larger values amortize per-dispatch plan overhead better; smaller values cap per-dispatch memory. The relationship to wall-clock is U-shaped (we measured a regression past 10000 on this workload), so tuning above the default rarely helps.
+
 ### `tiger.geocode_intersection(road1 VARCHAR, road2 VARCHAR, state VARCHAR, city VARCHAR, zip VARCHAR, max_results INT) → TABLE`
 
 Finds intersections of two streets. Joins candidate edges on shared TIGER node IDs (`tnidf`/`tnidt`) — not `ST_Intersects` — which means intersecting edges are found in O(joins) rather than O(spatial).
