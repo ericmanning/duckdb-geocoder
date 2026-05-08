@@ -101,6 +101,25 @@ static void LoadInternal(ExtensionLoader &loader) {
 			    "Per-state slice cap for tiger.geocode_batch (input rows per per-state SQL dispatch).",
 			    LogicalType::INTEGER, Value::INTEGER(10000));
 		}
+		// Workaround for a planner cardinality misestimate that causes
+		// the join_order optimizer to pick a strategy that spills 17 GB
+		// to disk on 100K mixed input. With the join_order optimizer
+		// disabled inside the per-flush Connection, geocode_batch runs
+		// in 196 s with 0 GB spill (vs 370 s with 17 GB spill at the
+		// default). Affects only geocode_batch's transient Connection,
+		// not the user's main session. Disable the override via:
+		//   SET us_geocoder_disable_join_order = false;
+		// Should be revisited when DuckDB's join-order estimator improves
+		// for IS-NOT-DISTINCT-FROM joins arising from LATERAL+macro
+		// decorrelation (see splink#3023 / splink#2929 for similar
+		// patterns DuckDB has been working through).
+		if (!config.HasExtensionOption("us_geocoder_disable_join_order")) {
+			config.AddExtensionOption("us_geocoder_disable_join_order",
+			                          "Disable DuckDB's join_order optimizer inside tiger.geocode_batch's "
+			                          "per-flush Connection (workaround for a 179M-vs-1.2M cardinality "
+			                          "misestimate that drives a spill-heavy plan).",
+			                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
+		}
 	}
 
 	// core_functions provides lpad, regexp_matches, etc. — required by

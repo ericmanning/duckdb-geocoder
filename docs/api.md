@@ -282,6 +282,18 @@ SELECT * FROM geocode_batch(…);
 
 Values must be positive — 0 or negative is rejected at `Bind` time with a `Binder Error`. Larger values amortize per-dispatch plan overhead better; smaller values cap per-dispatch memory. The relationship to wall-clock is U-shaped (we measured a regression past 10000 on this workload), so tuning above the default rarely helps.
 
+**Tunable: `us_geocoder_disable_join_order`** (extension setting, BOOLEAN, default `true`). Disables DuckDB's `join_order` optimizer inside `geocode_batch`'s per-flush Connection.
+
+This is a workaround for a planner cardinality misestimate (a `IS NOT DISTINCT FROM` join arising from LATERAL+macro decorrelation gets estimated at 179 M rows when actual is ~1.2 M, ~149× off). Acting on that estimate, `join_order` picks a strategy that builds an oversized hash table and spills 17 GB to disk on a 100 K mixed input. With the optimizer disabled, DuckDB falls back to the SQL clause order, which on our query shape happens to be near-optimal. Empirically: 370 s → 196 s wall-clock, 17 GB → 0 GB peak tmp.
+
+`disabled_optimizers` is a DuckDB DEBUG SETTING — not officially supported for production. We apply it only to the transient per-flush Connection (not the user's main session) and expose this knob as the escape hatch in case a future DuckDB version improves the join-order estimator and the override becomes counterproductive.
+
+```sql
+-- Turn off the workaround if you want DuckDB's default behavior (e.g. on
+-- a future release where the underlying misestimate has been fixed):
+SET us_geocoder_disable_join_order = false;
+```
+
 ### `tiger.geocode_intersection(road1 VARCHAR, road2 VARCHAR, state VARCHAR, city VARCHAR, zip VARCHAR, max_results INT) → TABLE`
 
 Finds intersections of two streets. Joins candidate edges on shared TIGER node IDs (`tnidf`/`tnidt`) — not `ST_Intersects` — which means intersecting edges are found in O(joins) rather than O(spatial).

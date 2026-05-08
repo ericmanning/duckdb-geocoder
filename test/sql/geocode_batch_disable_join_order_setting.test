@@ -1,0 +1,48 @@
+# name: test/sql/geocode_batch_disable_join_order_setting.test
+# description: us_geocoder_disable_join_order is registered as an extension
+#              option, defaults to true, and is honored by the geocode_batch
+#              Bind callback (validated by reading the setting; the runtime
+#              effect is a planner-level optimization toggle that's hard to
+#              assert from sqllogic without comparing query plans).
+# group: [sql]
+
+require us_geocoder
+
+statement ok
+LOAD spatial;
+
+# Default value is true.
+query I
+SELECT current_setting('us_geocoder_disable_join_order');
+----
+true
+
+# Overriding to false works.
+statement ok
+SET us_geocoder_disable_join_order = false;
+
+query I
+SELECT current_setting('us_geocoder_disable_join_order');
+----
+false
+
+# Reset.
+statement ok
+SET us_geocoder_disable_join_order = true;
+
+# geocode_batch still functions with the setting overridden either way.
+# (No featnames/edges fixture needed; the function shape is what we test.)
+query II
+SELECT id, rating IS NULL
+FROM geocode_batch((SELECT 1 AS id, 'no resolvable state' AS addr_str));
+----
+1	true
+
+statement ok
+SET us_geocoder_disable_join_order = false;
+
+query II
+SELECT id, rating IS NULL
+FROM geocode_batch((SELECT 1 AS id, 'no resolvable state' AS addr_str));
+----
+1	true

@@ -85,6 +85,7 @@ constexpr const char *kZipCol = "zip";
 
 struct BatchBindData : public TableFunctionData {
 	idx_t slice_cap = kPerStateSliceCapDefault; // overridable via SET us_geocoder_slice_cap
+	bool disable_join_order = true;             // overridable via SET us_geocoder_disable_join_order
 	idx_t addr_str_idx = kInvalidIdx;
 	idx_t address_idx = kInvalidIdx;
 	idx_t street_name_idx = kInvalidIdx;
@@ -159,6 +160,13 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 				                      static_cast<long long>(raw));
 			}
 			bind_data->slice_cap = static_cast<idx_t>(raw);
+		}
+	}
+	// Same for the join_order-disable workaround.
+	{
+		Value v;
+		if (context.TryGetCurrentSetting("us_geocoder_disable_join_order", v) && !v.IsNull()) {
+			bind_data->disable_join_order = v.GetValue<bool>();
 		}
 	}
 
@@ -496,6 +504,25 @@ static void FlushBuffer(ClientContext &context, const BatchBindData &bind_data, 
 		return;
 
 	Connection conn(*context.db);
+
+	// Disable DuckDB's join_order optimizer for this Connection if the
+	// us_geocoder_disable_join_order setting is on (default: yes). The
+	// per-state geocode SQL has a 179M-vs-1.2M cardinality misestimate
+	// on a `IS NOT DISTINCT FROM` join (decorrelation residue from
+	// LATERAL+macro+correlated-subquery), and join_order acts on that
+	// estimate to pick a spill-heavy strategy. Letting DuckDB use the
+	// SQL clause order instead avoids the misestimate entirely
+	// (measured: 370s → 196s wall-clock at 100K mixed, 17 GB → 0 GB
+	// spill). disabled_optimizers is a session-level setting; the
+	// Connection here is local to FlushBuffer so the override doesn't
+	// leak into the user's main session.
+	if (bind_data.disable_join_order) {
+		auto r = conn.Query("SET disabled_optimizers='join_order'");
+		if (r->HasError()) {
+			fprintf(stderr, "[us_geocoder] WARN: failed to disable join_order: %s\n", r->GetError().c_str());
+			fflush(stderr);
+		}
+	}
 
 	// Step 1: resolve struct fields + statefp for every buffered row.
 	auto resolved = RunResolution(conn, bind_data, gstate.buffered);

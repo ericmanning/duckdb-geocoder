@@ -121,6 +121,8 @@ SET us_geocoder_slice_cap = 5000;     -- session
 SET LOCAL us_geocoder_slice_cap = 5000;  -- single statement
 ```
 
+**Tunable: `us_geocoder_disable_join_order`** (BOOLEAN, default `true`). Disables DuckDB's `join_order` optimizer inside `geocode_batch`'s transient per-flush Connection — workaround for a planner cardinality misestimate that otherwise pushes a spill-heavy plan (370 s + 17 GB tmp → 196 s + 0 GB tmp at 100K mixed). Set to `false` to let DuckDB's default behavior win, e.g. on a future DuckDB release that fixes the underlying misestimate.
+
 See [docs/api.md](docs/api.md#geocode_batchinput-table--table) for the full reference.
 
 Alternative for one-off / interactive queries: `tiger.geocode` via `CROSS JOIN LATERAL`. It's slower at scale (no per-state dispatch — DuckDB can't push a runtime statefp into the unified TIGER tables) but works fine for small inputs:
