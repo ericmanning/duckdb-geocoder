@@ -156,8 +156,7 @@ unique_ptr<FunctionData> Bind(ClientContext &context, TableFunctionBindInput &in
 		if (context.TryGetCurrentSetting("us_geocoder_slice_cap", v) && !v.IsNull()) {
 			auto raw = v.GetValue<int64_t>();
 			if (raw <= 0) {
-				throw BinderException("us_geocoder_slice_cap must be positive (got %lld)",
-				                      static_cast<long long>(raw));
+				throw BinderException("us_geocoder_slice_cap must be positive (got %lld)", static_cast<long long>(raw));
 			}
 			bind_data->slice_cap = static_cast<idx_t>(raw);
 		}

@@ -1,8 +1,9 @@
 # name: test/sql/geocode_batch_slice_cap_setting.test
 # description: us_geocoder_slice_cap is registered as an extension option,
+# group: [sql]
+
 #              defaults to 10000, and rejects non-positive values when the
 #              batch function is invoked.
-# group: [sql]
 
 require us_geocoder
 

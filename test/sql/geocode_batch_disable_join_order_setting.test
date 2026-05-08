@@ -1,10 +1,11 @@
 # name: test/sql/geocode_batch_disable_join_order_setting.test
 # description: us_geocoder_disable_join_order is registered as an extension
+# group: [sql]
+
 #              option, defaults to true, and is honored by the geocode_batch
 #              Bind callback (validated by reading the setting; the runtime
 #              effect is a planner-level optimization toggle that's hard to
 #              assert from sqllogic without comparing query plans).
-# group: [sql]
 
 require us_geocoder
 
