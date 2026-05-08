@@ -99,10 +99,14 @@ FROM geocode_batch((SELECT 1 AS id, '5 Main St 01504' AS addr_str));
 ----
 1	true
 
-# (3) Force RI explicitly — should return NULL because RI portion of 01504
-# has only Harkness Rd, no Main St.
+# (3) State_abbrev='RI' but ZIP=01504 spans MA+RI. Even though state_abbrev
+# resolves to RI (which has only Harkness Rd, no Main St), the ZIP-derived
+# candidate set contributes MA, so we dispatch to both — the cross-state
+# typo case. Match comes from MA. (PG returns NULL here because it lets a
+# valid-but-wrong state_abbrev silently shadow the ZIP. Documented "us > PG"
+# divergence — see docs/parity.md.)
 query II
-SELECT id, rating IS NULL
+SELECT id, adr_text LIKE '%, MA %'
 FROM geocode_batch((SELECT 2 AS id, '5 Main St, RI 01504' AS addr_str));
 ----
 2	true

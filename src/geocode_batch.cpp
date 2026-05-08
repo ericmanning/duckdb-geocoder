@@ -365,15 +365,35 @@ static std::vector<ResolvedRow> RunResolution(Connection &conn, const BatchBindD
 		    << " SELECT input_idx,"
 		    << " s['address'], s['street_name'], s['street_type'], s['internal'],"
 		    << " s['pre_dir'], s['post_dir'], s['location'], s['state_abbrev'], s['zip'],"
-		    << " COALESCE("
-		    // 1-state happy path: known state_abbrev → 1-elem list.
-		    << "(SELECT [statefp] FROM tiger.state_lookup WHERE abbrev = s['state_abbrev'] LIMIT 1),"
-		    // ZIP fallback: a multi-state ZIP returns N statefps; we
-		    // dispatch to all and let the rating decide. DISTINCT in case
-		    // zip_lookup_base has dup rows for the same (zip, state).
-		    << "(SELECT list(DISTINCT statefp) FROM tiger.zip_lookup_base WHERE zip = s['zip']),"
-		    << "[]::VARCHAR[]"
-		    << ") AS candidate_statefps"
+		    // Union state_abbrev's resolved statefp with the ZIP's resolved
+		    // statefps (DISTINCT). Both contributing → dispatch to all
+		    // candidate states, rating step picks the best match.
+		    //
+		    // Why we don't just COALESCE(state, zip) like PG does:
+		    // PG treats a valid-but-wrong state_abbrev as authoritative and
+		    // ignores the ZIP, so an input like "60 Washington St NY 07030"
+		    // (Hoboken NJ with a typo'd state) silently misses its match.
+		    // Union'ing both sources is a deliberate "us > PG" mechanism
+		    // (alongside from_pagc T18a validation and unconditional
+		    // numeric_streets_equal — see project memory).
+		    //
+		    // Mitigation for placeholder ZIPs (12345/99999/etc., which
+		    // resolve to many states): when state_abbrev resolves AND the
+		    // ZIP-derived list has > 3 candidate states, treat the ZIP as
+		    // unreliable and drop it. Bounds worst-case dispatch cost on
+		    // garbage data.
+		    << " list_distinct(COALESCE("
+		    << "  (SELECT [statefp] FROM tiger.state_lookup WHERE abbrev = s['state_abbrev'] LIMIT 1), []::VARCHAR[]"
+		    << " ) || COALESCE("
+		    << "  (WITH zs AS (SELECT list(DISTINCT statefp) AS lst"
+		    << "               FROM tiger.zip_lookup_base WHERE zip = s['zip'])"
+		    << "   SELECT CASE"
+		    << "     WHEN list_count(zs.lst) > 3"
+		    << "          AND EXISTS (SELECT 1 FROM tiger.state_lookup WHERE abbrev = s['state_abbrev'])"
+		    << "     THEN []::VARCHAR[]"
+		    << "     ELSE zs.lst END"
+		    << "   FROM zs), []::VARCHAR[]"
+		    << " )) AS candidate_statefps"
 		    << " FROM parsed ORDER BY input_idx";
 	} else {
 		// Form 2 SQL: VALUES of (idx, address, ..., zip), then resolve.
@@ -387,11 +407,19 @@ static std::vector<ResolvedRow> RunResolution(Connection &conn, const BatchBindD
 		sql << ")"
 		    << " SELECT input_idx, address, street_name, street_type, internal,"
 		    << " pre_dir, post_dir, location, state_abbrev, zip,"
-		    << " COALESCE("
-		    << "(SELECT [statefp] FROM tiger.state_lookup WHERE abbrev = state_abbrev LIMIT 1),"
-		    << "(SELECT list(DISTINCT statefp) FROM tiger.zip_lookup_base WHERE input.zip = zip_lookup_base.zip),"
-		    << "[]::VARCHAR[]"
-		    << ") AS candidate_statefps"
+		    // See Form 1 above for the design rationale (union + placeholder-ZIP mitigation).
+		    << " list_distinct(COALESCE("
+		    << "  (SELECT [statefp] FROM tiger.state_lookup WHERE abbrev = state_abbrev LIMIT 1), []::VARCHAR[]"
+		    << " ) || COALESCE("
+		    << "  (WITH zs AS (SELECT list(DISTINCT statefp) AS lst"
+		    << "               FROM tiger.zip_lookup_base WHERE input.zip = zip_lookup_base.zip)"
+		    << "   SELECT CASE"
+		    << "     WHEN list_count(zs.lst) > 3"
+		    << "          AND EXISTS (SELECT 1 FROM tiger.state_lookup WHERE abbrev = input.state_abbrev)"
+		    << "     THEN []::VARCHAR[]"
+		    << "     ELSE zs.lst END"
+		    << "   FROM zs), []::VARCHAR[]"
+		    << " )) AS candidate_statefps"
 		    << " FROM input ORDER BY input_idx";
 	}
 

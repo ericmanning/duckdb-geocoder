@@ -129,11 +129,13 @@ The Docker image at [scripts/parity/pg_compare/](../scripts/parity/pg_compare/) 
 
 ### Documented improvements over PG (deliberate divergences)
 
-Three mechanisms produce *better* results than PG-with-PAGC on certain inputs. All intentional; **don't remove in any "match PG bit-for-bit" cleanup**. See [parity-divergences.md](parity-divergences.md) for per-test detail.
+Five mechanisms produce *better* results than PG-with-PAGC on certain inputs. All intentional; **don't remove in any "match PG bit-for-bit" cleanup**. See [parity-divergences.md](parity-divergences.md) for per-test detail.
 
 - **A. `from_pagc` post-PAGC validation** — when PAGC misparses a street-type word as the city (e.g. `"26 Court Street, 02109"` → `city='STREET'`), our adapter infers `street_type` from that word and nulls location. PG's `pagc_normalize_address` accepts the misparse verbatim. Resolves T18a-class.
 - **B. Unconditional `numeric_streets_equal` in candidate-finding** — PAGC strips ordinal suffixes (`27th` → `27`); PG's primary stage_a only exact-matches short names, so it misses TIGER's `name='27th'`. Our `name_match_tlids_a` always runs the `numeric_streets_equal` branch. Resolves #1145a/b/e-class.
 - **C. PAGC numeric-suffix recombination** — for inputs like `"35W"` PAGC over-splits to `name='35', sufdir='W'`, and `soundex('35')` collides with every digit-stem street; we detect and recombine. Net positive vs PG's plpgsql LOOP short-circuit.
+- **D. Multi-state-ZIP fallback** — when an input has no `state_abbrev` and the ZIP appears in `zip_lookup_base` for multiple states (~7% of US ZIPs cross state lines), `geocode_batch` dispatches to *every* candidate state and the result merge keeps the lowest-rated match. PG uses `LIMIT 1` against `zip_lookup_base` and silently picks an arbitrary state. Closes the entire family of "address ordered second in zip_lookup_base" misroutes.
+- **E. State-abbrev / ZIP union for cross-state typos** — when both `state_abbrev` and `zip` resolve, `geocode_batch` unions both sources' candidate states (DISTINCT) and dispatches to all. PG uses `COALESCE(state_lookup, zip_lookup_base LIMIT 1)` — state_abbrev wins authoritatively, so a typo'd state code like `"60 Washington St NY 07030"` (Hoboken NJ) silently misses its real match in NJ. Mitigated for placeholder ZIPs (12345/99999/etc.): when ZIP-derived candidates exceed 3 states *and* state_abbrev resolves, we drop the ZIP set as unreliable.
 
 ### Status
 
