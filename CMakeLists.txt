@@ -15,13 +15,17 @@ include_directories(src/include)
 # standard). The @TIGER@ placeholder is substituted at runtime via
 # ApplySubstitutions() in us_geocoder_embed.hpp.
 #
-# MSVC caps individual string literals at 64 KB (error C2026). Several
+# MSVC caps individual string literals at 16,380 single-byte chars (error
+# C2026 — yes, much smaller than the C standard's effective 64 KB). Several
 # of our .sql.in files exceed that — lookup_tables.sql.in (~1300 INSERTs)
 # and the macro files are well past it. emit_chunked_literals() splits
-# each file's content into <=16 KB pieces and emits them as adjacent
-# C++ raw string literals; the preprocessor concatenates them at compile
-# time, so the resulting std::string contents are identical on every
-# compiler. Pure build-time fix; no runtime impact.
+# each file's content into ~8 KB pieces and emits them as adjacent C++ raw
+# string literals; the preprocessor concatenates them at compile time, so
+# the resulting std::string contents are identical on every compiler.
+# Target is held well under 16,380 to leave headroom for the +1024 newline
+# scan AND CRLF expansion on Windows runners (where checked-out .sql.in
+# files may have CRLF endings, doubling the byte count of each newline in
+# the embedded literal). Pure build-time fix; no runtime impact.
 set(GEN_DIR ${CMAKE_BINARY_DIR}/generated)
 file(MAKE_DIRECTORY ${GEN_DIR})
 
@@ -34,7 +38,7 @@ function(emit_chunked_literals INPUT_VAR OUT_VAR)
     string(LENGTH "${content}" total_len)
     set(result "")
     set(pos 0)
-    set(target 16384)
+    set(target 8000)
     while(pos LESS total_len)
         math(EXPR remaining "${total_len} - ${pos}")
         if(remaining LESS_EQUAL ${target})
