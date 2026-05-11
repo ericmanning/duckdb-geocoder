@@ -25,12 +25,16 @@ jobs:
       # windows_amd64 (MSVC). us_address_standardizer ships MSVC builds
       # so the from_pagc test no longer auto-skips on that target.
       exclude_archs: wasm_mvp;wasm_eh;wasm_threads;osx_amd64
-      # Point the test runner at the build's local extension repo so
-      # `require splink_udfs` (which our test files use) resolves to the
-      # splink_udfs.duckdb_extension that extension_config.cmake builds at
-      # configure time. Without this the test runner has autoload off by
-      # default and require falls back to a disk-cache lookup that fails.
-      test_config: '{"test_env_variables": {"LOCAL_EXTENSION_REPO": "/duckdb_build_dir/build/release/repository"}}'
+      # Make `require us_geocoder` actually load our extension in CI.
+      # The runner gates on TWO independent things:
+      #   1. autoloading mode != NONE — without this, `require <non-core ext>`
+      #      short-circuits to MISSING and EVERY test skips, regardless of
+      #      static linkage. Setting "autoloading": "available" makes the
+      #      runner perform INSTALL+LOAD from LOCAL_EXTENSION_REPO.
+      #   2. LOCAL_EXTENSION_REPO pointing at the build's repo dir so the
+      #      INSTALL finds the just-built us_geocoder.duckdb_extension.
+      # Both are needed; either alone leaves us skipped.
+      test_config: '{"autoloading": "available", "test_env_variables": {"LOCAL_EXTENSION_REPO": "/duckdb_build_dir/build/release/repository"}}'
 
   code-quality-check:
     name: Code Quality Check
