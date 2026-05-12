@@ -26,15 +26,19 @@ jobs:
       # so the from_pagc test no longer auto-skips on that target.
       exclude_archs: wasm_mvp;wasm_eh;wasm_threads;osx_amd64
       # Make `require us_geocoder` actually load our extension in CI.
-      # The runner gates on TWO independent things:
-      #   1. autoloading mode != NONE — without this, `require <non-core ext>`
-      #      short-circuits to MISSING and EVERY test skips, regardless of
-      #      static linkage. Setting "autoloading": "available" makes the
-      #      runner perform INSTALL+LOAD from LOCAL_EXTENSION_REPO.
+      # The runner gates on TWO independent things, BOTH set via env vars
+      # (extension-ci-tools only forwards `test_env_variables` keys from
+      # test_config to the test process — top-level keys here are dropped):
+      #   1. DUCKDB_TEST_AUTOLOADING=available — TestConfiguration reads
+      #      env vars of the form DUCKDB_TEST_<OPTION_UPPER> at startup.
+      #      Without this the runner's CheckRequire() short-circuits
+      #      `require <non-core-ext>` to MISSING and EVERY test skips,
+      #      regardless of static linkage. AVAILABLE makes the runner do
+      #      INSTALL+LOAD from LOCAL_EXTENSION_REPO.
       #   2. LOCAL_EXTENSION_REPO pointing at the build's repo dir so the
       #      INSTALL finds the just-built us_geocoder.duckdb_extension.
       # Both are needed; either alone leaves us skipped.
-      test_config: '{"autoloading": "available", "test_env_variables": {"LOCAL_EXTENSION_REPO": "/duckdb_build_dir/build/release/repository"}}'
+      test_config: '{"test_env_variables": {"DUCKDB_TEST_AUTOLOADING": "available", "LOCAL_EXTENSION_REPO": "/duckdb_build_dir/build/release/repository"}}'
 
   code-quality-check:
     name: Code Quality Check
