@@ -25,6 +25,11 @@ jobs:
       # windows_amd64 (MSVC). us_address_standardizer ships MSVC builds
       # so the from_pagc test no longer auto-skips on that target.
       exclude_archs: wasm_mvp;wasm_eh;wasm_threads;osx_amd64
+      # spatial is built as a test dep (via DEFAULT_TEST_EXTENSION_DEPS in
+      # the Makefile) so `LOAD spatial` works in CI sqllogic. Spatial needs
+      # vcpkg deps (zlib, etc) that aren't in our vcpkg.json — merging at
+      # build time lets the spatial extension's own manifest contribute.
+      use_merged_vcpkg_manifest: "1"
       # Make `require us_geocoder` actually load our extension in CI.
       # The runner gates on TWO independent things, BOTH set via env vars
       # (extension-ci-tools only forwards `test_env_variables` keys from
