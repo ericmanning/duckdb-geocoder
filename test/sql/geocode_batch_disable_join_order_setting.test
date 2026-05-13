@@ -9,6 +9,10 @@
 
 require us_geocoder
 
+require spatial
+
+require us_address_standardizer
+
 statement ok
 LOAD spatial;
 

@@ -6,6 +6,8 @@
 
 require us_geocoder
 
+require spatial
+
 statement ok
 LOAD spatial;
 
