@@ -11,6 +11,12 @@
 
 require us_geocoder
 
+# Line 128 onward creates a tiger.geocode stub whose recursive body references
+# the extension's own tiger.geocode internals — those internals use spatial
+# (st_intersects), so we gate the whole file on TIGER_TEST_EXTENSIONS even
+# though the from_pagc mocks themselves don't need the standardizer ext.
+require-env TIGER_TEST_EXTENSIONS
+
 # geocode_input type is auto-registered regardless of standardizer presence.
 # Cast to the named struct type; verify the fields are preserved.
 query II
