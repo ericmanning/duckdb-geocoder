@@ -14,7 +14,7 @@ src/
   us_geocoder_extension.cpp    # ExtensionLoader entrypoint; registers macros + C++ table fns
   loader.cpp                    # TIGER loader + set_tiger_reference + install_tiger_schema
   sql/*.sql.in                  # embedded SQL (macros, lookup seeds, schema DDL, loader templates)
-test/sql/*.test                 # sqllogictest — 328 assertions, all deterministic (hand-built fixtures)
+test/sql/*.test                 # sqllogictest — 331 assertions, all deterministic (hand-built fixtures)
 docs/                           # quickstart.md, api.md, pg_parity.md, UPDATING.md
 ```
 
@@ -24,9 +24,12 @@ Embedded SQL is inlined at build time via the CMake pipeline in [CMakeLists.txt]
 
 ```sh
 make release                    # ~10 min cold (builds DuckDB); ~30s hot
-./build/release/test/unittest "test/sql/*"       # full suite
-./build/release/test/unittest "test/sql/X.test"  # single file
+TIGER_TEST_EXTENSIONS=1 ./build/release/test/unittest "test/sql/*"  # full suite (331 assertions, 21 cases)
+./build/release/test/unittest "test/sql/*"                          # CI-equivalent subset (93 assertions, 6 cases)
+./build/release/test/unittest "test/sql/X.test"                     # single file
 ```
+
+The `TIGER_TEST_EXTENSIONS=1` sentinel gates the 15 tests that `LOAD spatial` or exercise `tiger.from_pagc()` (which calls into `us_address_standardizer`). CI doesn't set it — building those extensions in the matrix is fraught (spatial's vcpkg deps differ per platform; us_address_standardizer is a C-API community extension). Locally, dev machines typically have both pre-installed in `~/.duckdb/extensions/`, so set the env var to run the full suite. Without it, you see the same 6-test subset CI runs.
 
 The built CLI `build/release/duckdb` statically links the extension, so no `INSTALL`/`LOAD` needed for manual smoke tests.
 

@@ -17,7 +17,7 @@
 
 require us_geocoder
 
-require spatial
+require-env TIGER_TEST_EXTENSIONS
 
 statement ok
 LOAD spatial;

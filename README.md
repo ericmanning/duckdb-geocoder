@@ -162,7 +162,8 @@ For an end-to-end walkthrough including TIGER data load and batch geocoding, see
 ```sh
 git submodule update --init --recursive
 make release                   # ~10 min first time (builds duckdb from source)
-make test                      # 328 assertions across 21 sqllogictest files
+TIGER_TEST_EXTENSIONS=1 make test   # 331 assertions across 21 sqllogictest files
+make test                           # CI subset: 93 assertions, 6 cases (skips spatial/standardizer tests)
 ```
 
 The build produces a loadable extension at `build/release/extension/us_geocoder/us_geocoder.duckdb_extension` and a DuckDB CLI at `build/release/duckdb` with the extension statically linked.

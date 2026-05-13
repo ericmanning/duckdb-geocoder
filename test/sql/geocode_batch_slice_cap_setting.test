@@ -7,9 +7,8 @@
 
 require us_geocoder
 
-require spatial
+require-env TIGER_TEST_EXTENSIONS
 
-require us_address_standardizer
 
 statement ok
 LOAD spatial;
