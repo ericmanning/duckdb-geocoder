@@ -182,9 +182,31 @@ struct LoaderGlobalState : public GlobalTableFunctionState {
 // Drain `gstate.results` into `output` a vector-size chunk at a time.
 // Shared by every loader execute function; DuckDB re-invokes the execute
 // callback until SetCardinality(0).
+//
+// Historical note: this used to be `EmitLoaderResults(gstate, output);`
+// (recursive self-call). On macOS/Linux clang at -O2 silently optimized
+// that to a `ret` since the body had no side effects, so every CALL
+// load_tiger_* returned `0 rows` with no one noticing. On Windows MSVC
+// the optimizer kept the loop and the function hung after analyze
+// completed — fix applied May 2026.
 template <typename State>
 static void EmitLoaderResults(State &gstate, DataChunk &output) {
-	EmitLoaderResults(gstate, output);
+	const idx_t total = gstate.results.size();
+	if (gstate.row_idx >= total) {
+		output.SetCardinality(0);
+		return;
+	}
+	const idx_t avail = total - gstate.row_idx;
+	const idx_t n = std::min<idx_t>(STANDARD_VECTOR_SIZE, avail);
+	auto step_data = FlatVector::GetData<string_t>(output.data[0]);
+	auto rows_data = FlatVector::GetData<int64_t>(output.data[1]);
+	for (idx_t i = 0; i < n; ++i) {
+		auto &r = gstate.results[gstate.row_idx + i];
+		step_data[i] = StringVector::AddString(output.data[0], r.step);
+		rows_data[i] = r.rows;
+	}
+	gstate.row_idx += n;
+	output.SetCardinality(n);
 }
 
 // =====================================================================
