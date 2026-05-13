@@ -725,7 +725,9 @@ static void DoLoadNationImpl(ClientContext &context, const LoaderBindData &bind,
 
 // Build the 3 nation-level download targets (STATE, COUNTY, ZCTA520).
 // Filenames are known; no scraping needed.
-static std::vector<DownloadTarget> BuildNationDownloadTargets(const LoaderBindData &bind,
+// URLs use forward slashes (HTTP standard); local paths go through
+// fs.JoinPath so Windows gets OS-correct separators.
+static std::vector<DownloadTarget> BuildNationDownloadTargets(FileSystem &fs, const LoaderBindData &bind,
                                                               const std::string &dest_root) {
 	const std::string year = std::to_string(bind.year);
 	auto src_base = bind.source;
@@ -744,8 +746,9 @@ static std::vector<DownloadTarget> BuildNationDownloadTargets(const LoaderBindDa
 	std::vector<DownloadTarget> targets;
 	targets.reserve(files.size());
 	for (const auto &f : files) {
-		targets.push_back(
-		    {src_base + "/" + f.subdir + "/" + f.filename, dest_root + "/" + f.subdir + "/" + f.filename});
+		std::string url = src_base + "/" + f.subdir + "/" + f.filename;
+		std::string local = fs.JoinPath(dest_root, fs.JoinPath(f.subdir, f.filename));
+		targets.push_back({url, local});
 	}
 	return targets;
 }
@@ -758,43 +761,60 @@ static void DoLoadNation(ClientContext &context, const LoaderBindData &bind, std
 		return;
 	}
 
+	// Entry-point diagnostic — if even THIS doesn't reach the user, the
+	// crash is in bind, not execute. A Windows MSVC user reported a silent
+	// no-stderr crash on `CALL load_tiger_nation()`; this print + the
+	// try/catch fallback below should surface where exactly things die.
+	fprintf(stderr, "[us_geocoder nation] starting parallel download path\n");
+	fflush(stderr);
+
 	EnsureHttpfsIfRemote(*context.db, bind.source);
 	auto &fs = FileSystem::GetFileSystem(context);
-	auto temp_base = ResolveTempBase(context, bind.temp_dir);
-	auto state_dir = MakeStateTempDir(context, temp_base, "nation", bind.year);
-	StateDirCleanup raii(fs, state_dir);
 
-	auto t0 = std::chrono::steady_clock::now();
-	auto targets = BuildNationDownloadTargets(bind, state_dir);
+	// Wrap the parallel prelude so a thrown exception (e.g. failed temp-dir
+	// creation on a weird Windows path) becomes a stderr message + fallback
+	// to the legacy /vsicurl/ path, rather than a silent crash.
+	try {
+		auto temp_base = ResolveTempBase(context, bind.temp_dir);
+		auto state_dir = MakeStateTempDir(context, temp_base, "nation", bind.year);
+		StateDirCleanup raii(fs, state_dir);
 
-	ParallelDownloadOptions opts;
-	// Only 3 files; cap workers at 3 to avoid pointless thread overhead.
-	opts.workers = std::min(bind.parallel_workers, 3);
-	opts.max_attempts = 3;
-	opts.backoff_seconds = {2, 5};
-	opts.log_prefix = "nation";
-	auto result = ParallelDownload(context, targets, opts);
-	auto dl_secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-	fprintf(stderr,
-	        "[us_geocoder nation] parallel_download: %zu files (%zu downloaded, %zu skipped) "
-	        "%.1f MB in %.1fs\n",
-	        result.files_total, result.files_downloaded, result.files_skipped,
-	        static_cast<double>(result.bytes_downloaded) / (1024.0 * 1024.0), dl_secs);
-	fflush(stderr);
-	out.push_back({"parallel_download:nation", static_cast<int64_t>(result.files_total)});
+		auto t0 = std::chrono::steady_clock::now();
+		auto targets = BuildNationDownloadTargets(fs, bind, state_dir);
 
-	LoaderBindData local_bind(bind.func_schema);
-	local_bind.data_location = bind.data_location;
-	local_bind.target_schema = bind.target_schema;
-	local_bind.target_db = bind.target_db;
-	local_bind.source = state_dir;
-	local_bind.year = bind.year;
-	local_bind.states = bind.states;
-	local_bind.build_containment = bind.build_containment;
-	local_bind.parallel = false;
-	local_bind.temp_dir = bind.temp_dir;
-	local_bind.parallel_workers = bind.parallel_workers;
-	DoLoadNationImpl(context, local_bind, out);
+		ParallelDownloadOptions opts;
+		opts.workers = std::min(bind.parallel_workers, 3);
+		opts.max_attempts = 3;
+		opts.backoff_seconds = {2, 5};
+		opts.log_prefix = "nation";
+		auto result = ParallelDownload(context, targets, opts);
+		auto dl_secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+		fprintf(stderr,
+		        "[us_geocoder nation] parallel_download: %zu files (%zu downloaded, %zu skipped) "
+		        "%.1f MB in %.1fs\n",
+		        result.files_total, result.files_downloaded, result.files_skipped,
+		        static_cast<double>(result.bytes_downloaded) / (1024.0 * 1024.0), dl_secs);
+		fflush(stderr);
+		out.push_back({"parallel_download:nation", static_cast<int64_t>(result.files_total)});
+
+		LoaderBindData local_bind(bind.func_schema);
+		local_bind.data_location = bind.data_location;
+		local_bind.target_schema = bind.target_schema;
+		local_bind.target_db = bind.target_db;
+		local_bind.source = state_dir;
+		local_bind.year = bind.year;
+		local_bind.states = bind.states;
+		local_bind.build_containment = bind.build_containment;
+		local_bind.parallel = false;
+		local_bind.temp_dir = bind.temp_dir;
+		local_bind.parallel_workers = bind.parallel_workers;
+		DoLoadNationImpl(context, local_bind, out);
+	} catch (std::exception &ex) {
+		fprintf(stderr, "[us_geocoder nation] parallel path failed: %s\n", ex.what());
+		fprintf(stderr, "[us_geocoder nation] falling back to legacy /vsicurl/ path\n");
+		fflush(stderr);
+		DoLoadNationImpl(context, bind, out);
+	}
 }
 
 static void DoLoadNationImpl(ClientContext &context, const LoaderBindData &bind, std::vector<LoaderResult> &out) {
@@ -1052,7 +1072,10 @@ static void UnloadTigerStateExecute(ClientContext &context, TableFunctionInput &
 // `dest_root` is the local state-temp-dir; output paths land at
 // <dest_root>/<SUBDIR>/<zip>.zip. Counties are scraped from the Census HTML
 // directory index for each per-county SUBDIR (EDGES, FACES, FEATNAMES, ADDR).
-static std::vector<DownloadTarget> BuildStateDownloadTargets(ClientContext &context, const LoaderBindData &bind,
+// URLs use forward slashes (HTTP standard); local paths go through fs.JoinPath
+// so Windows gets OS-correct separators.
+static std::vector<DownloadTarget> BuildStateDownloadTargets(ClientContext &context, FileSystem &fs,
+                                                             const LoaderBindData &bind,
                                                              const LoaderBindData::StatePlan &state,
                                                              const std::string &dest_root) {
 	const std::string &fips = state.fips;
@@ -1073,8 +1096,9 @@ static std::vector<DownloadTarget> BuildStateDownloadTargets(ClientContext &cont
 	    {"COUSUB", "tl_" + year + "_" + fips + "_cousub.zip"},
 	};
 	for (const auto &sf : state_files) {
-		targets.push_back(
-		    {src_base + "/" + sf.subdir + "/" + sf.filename, dest_root + "/" + sf.subdir + "/" + sf.filename});
+		std::string url = src_base + "/" + sf.subdir + "/" + sf.filename;
+		std::string local = fs.JoinPath(dest_root, fs.JoinPath(sf.subdir, sf.filename));
+		targets.push_back({url, local});
 	}
 
 	// Per-county (scraped): EDGES, FACES, FEATNAMES, ADDR.
@@ -1097,7 +1121,9 @@ static std::vector<DownloadTarget> BuildStateDownloadTargets(ClientContext &cont
 			                  state.abbrev, idx_url, pattern_str);
 		}
 		for (const auto &n : names) {
-			targets.push_back({src_base + "/" + sub + "/" + n, dest_root + "/" + sub + "/" + n});
+			std::string url = src_base + "/" + sub + "/" + n;
+			std::string local = fs.JoinPath(dest_root, fs.JoinPath(sub, n));
+			targets.push_back({url, local});
 		}
 	}
 	return targets;
@@ -1119,49 +1145,63 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, cons
 		return;
 	}
 
-	// Parallel prelude: download all this state's zips into a temp dir, then
-	// dispatch the existing local-source ingest against that dir.
+	// Entry-point diagnostic. If even this doesn't print, the crash is
+	// before execute (in bind, or in DLL load on a buggy platform).
+	fprintf(stderr, "[us_geocoder %s] starting parallel download path\n", state.abbrev.c_str());
+	fflush(stderr);
+
 	EnsureHttpfsIfRemote(*context.db, bind.source);
 	auto &fs = FileSystem::GetFileSystem(context);
-	auto temp_base = ResolveTempBase(context, bind.temp_dir);
-	auto state_dir = MakeStateTempDir(context, temp_base, state.abbrev, bind.year);
-	StateDirCleanup raii(fs, state_dir);
 
-	auto t0 = std::chrono::steady_clock::now();
-	auto targets = BuildStateDownloadTargets(context, bind, state, state_dir);
+	// Wrap in try/catch so a thrown exception in the parallel prelude
+	// surfaces as a clear stderr message + fallback to the legacy
+	// /vsicurl/ path, rather than a silent crash.
+	try {
+		auto temp_base = ResolveTempBase(context, bind.temp_dir);
+		auto state_dir = MakeStateTempDir(context, temp_base, state.abbrev, bind.year);
+		StateDirCleanup raii(fs, state_dir);
 
-	ParallelDownloadOptions opts;
-	opts.workers = bind.parallel_workers;
-	opts.max_attempts = 3;
-	opts.backoff_seconds = {2, 5};
-	opts.log_prefix = state.abbrev;
-	auto result = ParallelDownload(context, targets, opts);
+		auto t0 = std::chrono::steady_clock::now();
+		auto targets = BuildStateDownloadTargets(context, fs, bind, state, state_dir);
 
-	auto dl_secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-	fprintf(stderr,
-	        "[us_geocoder %s] parallel_download: %zu files (%zu downloaded, %zu skipped) "
-	        "%.1f MB in %.1fs\n",
-	        state.abbrev.c_str(), result.files_total, result.files_downloaded, result.files_skipped,
-	        static_cast<double>(result.bytes_downloaded) / (1024.0 * 1024.0), dl_secs);
-	fflush(stderr);
-	out.push_back({"parallel_download:" + state.abbrev, static_cast<int64_t>(result.files_total)});
+		ParallelDownloadOptions opts;
+		opts.workers = bind.parallel_workers;
+		opts.max_attempts = 3;
+		opts.backoff_seconds = {2, 5};
+		opts.log_prefix = state.abbrev;
+		auto result = ParallelDownload(context, targets, opts);
 
-	// Re-enter the existing ingest body with bind.source patched to the local
-	// temp dir. Mutating via a local copy keeps the outer call's bind read-only.
-	LoaderBindData local_bind(bind.func_schema);
-	local_bind.data_location = bind.data_location;
-	local_bind.target_schema = bind.target_schema;
-	local_bind.target_db = bind.target_db;
-	local_bind.source = state_dir; // <-- swap to local
-	local_bind.year = bind.year;
-	local_bind.states = bind.states;
-	local_bind.build_containment = bind.build_containment;
-	local_bind.parallel = false; // belt-and-suspenders
-	local_bind.temp_dir = bind.temp_dir;
-	local_bind.parallel_workers = bind.parallel_workers;
-	DoLoadStateImpl(context, local_bind, state, out);
+		auto dl_secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+		fprintf(stderr,
+		        "[us_geocoder %s] parallel_download: %zu files (%zu downloaded, %zu skipped) "
+		        "%.1f MB in %.1fs\n",
+		        state.abbrev.c_str(), result.files_total, result.files_downloaded, result.files_skipped,
+		        static_cast<double>(result.bytes_downloaded) / (1024.0 * 1024.0), dl_secs);
+		fflush(stderr);
+		out.push_back({"parallel_download:" + state.abbrev, static_cast<int64_t>(result.files_total)});
 
-	// Successful ingest — let the RAII destructor clean up the temp dir.
+		// Re-enter the existing ingest body with bind.source patched to the local
+		// temp dir. Mutating via a local copy keeps the outer call's bind read-only.
+		LoaderBindData local_bind(bind.func_schema);
+		local_bind.data_location = bind.data_location;
+		local_bind.target_schema = bind.target_schema;
+		local_bind.target_db = bind.target_db;
+		local_bind.source = state_dir; // <-- swap to local
+		local_bind.year = bind.year;
+		local_bind.states = bind.states;
+		local_bind.build_containment = bind.build_containment;
+		local_bind.parallel = false; // belt-and-suspenders
+		local_bind.temp_dir = bind.temp_dir;
+		local_bind.parallel_workers = bind.parallel_workers;
+		DoLoadStateImpl(context, local_bind, state, out);
+
+		// Successful ingest — let the RAII destructor clean up the temp dir.
+	} catch (std::exception &ex) {
+		fprintf(stderr, "[us_geocoder %s] parallel path failed: %s\n", state.abbrev.c_str(), ex.what());
+		fprintf(stderr, "[us_geocoder %s] falling back to legacy /vsicurl/ path\n", state.abbrev.c_str());
+		fflush(stderr);
+		DoLoadStateImpl(context, bind, state, out);
+	}
 }
 
 static void DoLoadStateImpl(ClientContext &context, const LoaderBindData &bind, const LoaderBindData::StatePlan &state,

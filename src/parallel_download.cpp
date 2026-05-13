@@ -318,11 +318,17 @@ ParallelDownloadResult ParallelDownload(ClientContext &context, const std::vecto
 	auto &fs = FileSystem::GetFileSystem(context);
 
 	// Ensure parent directory of every target exists. Cheap; doesn't hit network.
+	// Normalize the parent path through the FileSystem helpers so Windows
+	// LocalFileSystem doesn't choke on mixed forward/back-slashes.
 	for (const auto &t : targets) {
 		auto last_slash = t.dest_path.find_last_of("/\\");
 		if (last_slash != std::string::npos) {
 			auto parent = t.dest_path.substr(0, last_slash);
-			if (!parent.empty() && !fs.DirectoryExists(parent)) {
+			if (parent.empty()) {
+				continue;
+			}
+			parent = fs.ConvertSeparators(parent);
+			if (!fs.DirectoryExists(parent)) {
 				fs.CreateDirectoriesRecursive(parent);
 			}
 		}
@@ -409,16 +415,13 @@ std::string MakeStateTempDir(ClientContext &context, const std::string &base, co
                              int year) {
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto ts_ns = std::chrono::steady_clock::now().time_since_epoch().count();
-	// Forward-slashes only; BuildVsiPath in loader.cpp uses them unconditionally
-	// and GDAL accepts them on Windows.
-	std::string sep = "/";
+	// Use fs.JoinPath so Windows gets backslashes and Unix gets slashes —
+	// mixed separators on Windows have crashed CreateDirectoriesRecursive
+	// in MSVC builds (no stderr output before death; reproduced via a
+	// colleague's `CALL load_tiger_nation()`).
 	std::string sub = "us_geocoder_tiger_" + std::to_string(year) + "_" + state_label + "_" + PidString() + "_" +
 	                  std::to_string(static_cast<long long>(ts_ns));
-	std::string full = base;
-	if (!full.empty() && full.back() != '/' && full.back() != '\\') {
-		full += sep;
-	}
-	full += sub;
+	std::string full = fs.JoinPath(base, sub);
 	fs.CreateDirectoriesRecursive(full);
 	return full;
 }
