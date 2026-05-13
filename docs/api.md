@@ -14,6 +14,9 @@ Loads three nation-wide TIGER tables into the target schema: `state` (56 rows), 
 - `year` — TIGER vintage; default `2025`.
 - `target_db` — attached catalog name to write into. `NULL` (default) means the current database.
 - `target_schema` — schema name inside the target catalog; default `tiger`. Created idempotently.
+- `parallel BOOLEAN DEFAULT true` — when `true` and `source` is an HTTP URL, downloads the 3 nation zips concurrently to a temp dir via DuckDB's `httpfs` HTTP client, ingests from local files, then removes the temp dir. When `false`, uses the legacy `/vsicurl/` serial GDAL HTTP path. Auto-disabled (with a warning) when `source` is a local path.
+- `temp_dir VARCHAR` — base directory for the per-state scratch dir created when `parallel := true`. `NULL` (default) tries `$TMPDIR` / `$TEMP` / `$TMP` / `/tmp` in order.
+- `parallel_workers INTEGER DEFAULT 16` — concurrent download threads. Cap is 3 for `load_tiger_nation` (only 3 files).
 
 Emits one summary row per loaded file. Idempotent: re-running skips rows that already exist (checked by FIPS / GEOID).
 
@@ -31,6 +34,7 @@ Loads a single state's TIGER data: state-level `place` and `cousub`, county-leve
 - `source` / `year` — same as `load_tiger_nation`.
 - `target_db` / `target_schema` — same as `load_tiger_nation`. Must match the target used for `load_tiger_nation` (the state loader reads `<target>.county` to enumerate counties).
 - `build_containment BOOLEAN DEFAULT true` — when `false`, skip the eager `edge_containment` precompute at the end of the state load (saves ~1-2 min per state). Populate it later with [`build_edge_containment()`](#build_edge_containmentstates-varchar--varchar-target_db-varchar-default-null-target_schema-varchar-default-tiger--table).
+- `parallel BOOLEAN DEFAULT true` / `temp_dir VARCHAR` / `parallel_workers INTEGER DEFAULT 16` — same semantics as `load_tiger_nation`. With `parallel := true` (the default), each state's zips are downloaded into a per-state temp dir under `temp_dir` (auto-resolved from OS conventions if NULL), ingested locally, then `RemoveDirectory`-cleaned before the next state. Peak disk is bounded at `max(state_size)` — important for `load_tiger_all_states`, where the alternative is `sum(state_sizes)` ≈ 50 GB. `parallel := false` uses the legacy `/vsicurl/` path; on Windows MSVC that path requires `$env:GDAL_HTTP_UNSAFESSL="YES"` because GDAL's bundled curl can't validate the Census cert chain — the default parallel path uses DuckDB's `httpfs` HTTP client instead and works without that env var.
 
 Idempotent via **DELETE-first**: re-running wipes all rows for that state before reinserting (including `edge_containment`).
 

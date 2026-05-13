@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+# DEPRECATED (May 2026). The parallel download logic this script implements
+# is now built into the C++ loader. Just call:
+#
+#   CALL load_tiger_state('NJ');       -- parallel := true is the default
+#
+# That path is cross-platform (works on Windows MSVC, where this script's
+# curl/xargs/grep chain is awkward), uses DuckDB's own httpfs HTTP client
+# (no GDAL /vsicurl/ cert-chain issues on Windows), and bounds peak disk at
+# max(state_size) when chained via load_tiger_states / load_tiger_all_states.
+#
+# This script remains for users who want to pre-stage zips for other tools
+# or run cross-process. Scheduled for removal in the next minor release.
+#
 # Parallel-download a single state's TIGER/Line shapefiles from the Census CDN
 # into a Census-nested local mirror that `load_tiger_state('XX', './dir')` can
 # ingest directly.

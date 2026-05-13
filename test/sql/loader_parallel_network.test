@@ -1,0 +1,36 @@
+# name: test/sql/loader_parallel_network.test
+# description: Smoke-test the parallel HTTP path against the real Census CDN.
+# group: [sql]
+
+#              Gated on US_GEOCODER_NETWORK_TESTS so CI doesn't hit external
+#              services. DC is the smallest non-empty TIGER state: 1 county,
+#              6 zips total (~10 MB). Real-world wall is ~5-10s.
+
+require us_geocoder
+
+require-env TIGER_TEST_EXTENSIONS
+
+require-env US_GEOCODER_NETWORK_TESTS
+
+statement ok
+LOAD spatial;
+
+statement ok
+CALL load_tiger_nation();
+
+statement ok
+CALL load_tiger_state('DC');
+
+# DC's FIPS is 11. Sanity-check that the parallel path actually populated edges.
+query I
+SELECT COUNT(*) > 0 FROM tiger.edges WHERE statefp = '11';
+----
+true
+
+# And that the loader_progress checkpoints landed (idempotency relies on these).
+query I
+SELECT COUNT(*) > 0
+FROM tiger.loader_progress
+WHERE section LIKE 'state:11:county:%:edges';
+----
+true

@@ -1,0 +1,57 @@
+# name: test/sql/loader_parallel.test
+# description: Binder-level coverage of the new parallel/temp_dir/parallel_workers
+# group: [sql]
+
+#              named params on load_tiger_state* / load_tiger_nation. Doesn't
+#              actually fetch anything — just exercises bind paths to catch
+#              regressions in param plumbing.
+
+require us_geocoder
+
+# parallel := false with bogus local source — proves the named param is
+# accepted on the binder side. Errors out on first INSERT (no zip exists at
+# /nonexistent), which is the right shape.
+statement error
+CALL load_tiger_state('RI', '/nonexistent/tiger', parallel := false);
+----
+us_geocoder loader
+
+# parallel := true with a local source — should warn + force parallel = false
+# silently. Same downstream behavior as the line above.
+statement error
+CALL load_tiger_state('RI', '/nonexistent/tiger', parallel := true);
+----
+us_geocoder loader
+
+# temp_dir accepted as a named param. Same downstream error.
+statement error
+CALL load_tiger_state('RI', '/nonexistent/tiger', parallel := true, temp_dir := '/tmp/us_geocoder_test_irrelevant');
+----
+us_geocoder loader
+
+# parallel_workers validation: must be >= 1.
+statement error
+CALL load_tiger_state('RI', '/nonexistent/tiger', parallel_workers := 0);
+----
+parallel_workers must be >= 1
+
+statement error
+CALL load_tiger_state('RI', '/nonexistent/tiger', parallel_workers := -3);
+----
+parallel_workers must be >= 1
+
+# Same surface on load_tiger_states + load_tiger_all_states + load_tiger_nation.
+statement error
+CALL load_tiger_states(['RI'], '/nonexistent/tiger', parallel := false);
+----
+us_geocoder loader
+
+statement error
+CALL load_tiger_all_states('/nonexistent/tiger', parallel := false);
+----
+us_geocoder loader
+
+statement error
+CALL load_tiger_nation('/nonexistent/tiger', parallel := false);
+----
+us_geocoder loader

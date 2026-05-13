@@ -213,6 +213,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 set(EXTENSION_SOURCES
     src/us_geocoder_extension.cpp
     src/loader.cpp
+    src/parallel_download.cpp
     src/geocode_batch.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

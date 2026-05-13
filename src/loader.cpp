@@ -1,9 +1,11 @@
 #include "us_geocoder_loader.hpp"
 #include "us_geocoder_embed.hpp"
 #include "us_geocoder_embedded_sql.hpp"
+#include "us_geocoder_parallel_download.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database.hpp"
@@ -12,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <regex>
 #include <sstream>
 #include <thread>
 #include <utility>
@@ -130,6 +133,19 @@ struct LoaderBindData : public FunctionData {
 	// separately when you actually need the GEOIDs.
 	bool build_containment = true;
 
+	// Parallel download mode (default true). When true and `source` is an
+	// HTTP URL, the loader downloads each state's (or the nation's) zips in
+	// parallel into a temp dir, then ingests from local files, then deletes
+	// the temp dir before moving to the next state. Bounds peak disk at
+	// max(state_size) and bypasses GDAL's /vsicurl/ — fixes the Windows MSVC
+	// SSL-cert-chain failure mode entirely.
+	// `parallel := false` reverts to the legacy serial /vsicurl/ path.
+	// Setting `parallel := true` with a local source emits a warning and
+	// silently disables (parallel is meaningless when files are already local).
+	bool parallel = true;
+	std::string temp_dir; // base for state-suffixed scratch dirs; empty → OS temp
+	int32_t parallel_workers = 16;
+
 public:
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<LoaderBindData>(func_schema);
@@ -140,13 +156,16 @@ public:
 		copy->year = year;
 		copy->states = states;
 		copy->build_containment = build_containment;
+		copy->parallel = parallel;
+		copy->temp_dir = temp_dir;
+		copy->parallel_workers = parallel_workers;
 		return std::move(copy);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<LoaderBindData>();
 		return func_schema == other.func_schema && data_location == other.data_location && source == other.source &&
-		       year == other.year && states.size() == other.states.size();
+		       year == other.year && states.size() == other.states.size() && parallel == other.parallel;
 	}
 };
 
@@ -574,6 +593,32 @@ static void ApplyYearSourceTarget(LoaderBindData &bind, const TableFunctionBindI
 	if (bc_it != input.named_parameters.end() && !bc_it->second.IsNull()) {
 		bind.build_containment = bc_it->second.GetValue<bool>();
 	}
+	auto par_it = input.named_parameters.find("parallel");
+	if (par_it != input.named_parameters.end() && !par_it->second.IsNull()) {
+		bind.parallel = par_it->second.GetValue<bool>();
+	}
+	auto tmp_it = input.named_parameters.find("temp_dir");
+	if (tmp_it != input.named_parameters.end() && !tmp_it->second.IsNull()) {
+		bind.temp_dir = StringValue::Get(tmp_it->second);
+	}
+	auto pw_it = input.named_parameters.find("parallel_workers");
+	if (pw_it != input.named_parameters.end() && !pw_it->second.IsNull()) {
+		auto v = pw_it->second.GetValue<int32_t>();
+		if (v < 1) {
+			throw BinderException("us_geocoder: parallel_workers must be >= 1 (got %d)", v);
+		}
+		bind.parallel_workers = v;
+	}
+	// `parallel` is meaningless when files are already local; warn + silently disable.
+	const bool source_is_http = bind.source.rfind("http://", 0) == 0 || bind.source.rfind("https://", 0) == 0;
+	if (bind.parallel && !source_is_http) {
+		fprintf(stderr,
+		        "[us_geocoder] WARN: parallel := true has no effect with a local source (%s); "
+		        "ignored.\n",
+		        bind.source.c_str());
+		fflush(stderr);
+		bind.parallel = false;
+	}
 }
 
 // Resolve state abbrev → 2-digit FIPS via the lookup table.
@@ -648,7 +693,111 @@ static void EnsureHttpfsIfRemote(DatabaseInstance &db, const std::string &source
 	}
 }
 
+// RAII wrapper for a temp-dir lifetime. Destructor removes the directory
+// unless Disarm() was called (e.g. on failure — keep zips for retry).
+// Shared by both DoLoadState and DoLoadNation parallel preludes.
+class StateDirCleanup {
+public:
+	StateDirCleanup(FileSystem &fs, std::string path) : fs_(fs), path_(std::move(path)) {
+	}
+	~StateDirCleanup() {
+		if (!armed_ || path_.empty()) {
+			return;
+		}
+		try {
+			fs_.RemoveDirectory(path_);
+		} catch (...) {
+			fprintf(stderr, "[us_geocoder] WARN: failed to remove temp dir %s\n", path_.c_str());
+			fflush(stderr);
+		}
+	}
+	void Disarm() {
+		armed_ = false;
+	}
+
+private:
+	FileSystem &fs_;
+	std::string path_;
+	bool armed_ = true;
+};
+
+static void DoLoadNationImpl(ClientContext &context, const LoaderBindData &bind, std::vector<LoaderResult> &out);
+
+// Build the 3 nation-level download targets (STATE, COUNTY, ZCTA520).
+// Filenames are known; no scraping needed.
+static std::vector<DownloadTarget> BuildNationDownloadTargets(const LoaderBindData &bind,
+                                                              const std::string &dest_root) {
+	const std::string year = std::to_string(bind.year);
+	auto src_base = bind.source;
+	if (!src_base.empty() && src_base.back() == '/') {
+		src_base.pop_back();
+	}
+	struct NationFile {
+		const char *subdir;
+		std::string filename;
+	};
+	std::vector<NationFile> files = {
+	    {"STATE", "tl_" + year + "_us_state.zip"},
+	    {"COUNTY", "tl_" + year + "_us_county.zip"},
+	    {"ZCTA520", "tl_" + year + "_us_zcta520.zip"},
+	};
+	std::vector<DownloadTarget> targets;
+	targets.reserve(files.size());
+	for (const auto &f : files) {
+		targets.push_back(
+		    {src_base + "/" + f.subdir + "/" + f.filename, dest_root + "/" + f.subdir + "/" + f.filename});
+	}
+	return targets;
+}
+
 static void DoLoadNation(ClientContext &context, const LoaderBindData &bind, std::vector<LoaderResult> &out) {
+	const bool source_is_http = bind.source.rfind("http://", 0) == 0 || bind.source.rfind("https://", 0) == 0;
+
+	if (!bind.parallel || !source_is_http) {
+		DoLoadNationImpl(context, bind, out);
+		return;
+	}
+
+	EnsureHttpfsIfRemote(*context.db, bind.source);
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto temp_base = ResolveTempBase(context, bind.temp_dir);
+	auto state_dir = MakeStateTempDir(context, temp_base, "nation", bind.year);
+	StateDirCleanup raii(fs, state_dir);
+
+	auto t0 = std::chrono::steady_clock::now();
+	auto targets = BuildNationDownloadTargets(bind, state_dir);
+
+	ParallelDownloadOptions opts;
+	// Only 3 files; cap workers at 3 to avoid pointless thread overhead.
+	opts.workers = std::min(bind.parallel_workers, 3);
+	opts.max_attempts = 3;
+	opts.backoff_seconds = {2, 5};
+	opts.log_prefix = "nation";
+	auto result = ParallelDownload(context, targets, opts);
+	auto dl_secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+	fprintf(stderr,
+	        "[us_geocoder nation] parallel_download: %zu files (%zu downloaded, %zu skipped) "
+	        "%.1f MB in %.1fs\n",
+	        result.files_total, result.files_downloaded, result.files_skipped,
+	        static_cast<double>(result.bytes_downloaded) / (1024.0 * 1024.0), dl_secs);
+	fflush(stderr);
+	out.push_back({"parallel_download:nation", static_cast<int64_t>(result.files_total)});
+
+	LoaderBindData local_bind(bind.func_schema);
+	local_bind.data_location = bind.data_location;
+	local_bind.target_schema = bind.target_schema;
+	local_bind.target_db = bind.target_db;
+	local_bind.source = state_dir;
+	local_bind.year = bind.year;
+	local_bind.states = bind.states;
+	local_bind.build_containment = bind.build_containment;
+	local_bind.parallel = false;
+	local_bind.temp_dir = bind.temp_dir;
+	local_bind.parallel_workers = bind.parallel_workers;
+	DoLoadNationImpl(context, local_bind, out);
+}
+
+static void DoLoadNationImpl(ClientContext &context, const LoaderBindData &bind, std::vector<LoaderResult> &out) {
 	EnsureHttpfsIfRemote(*context.db, bind.source);
 	Connection conn(*context.db);
 	BootstrapTargetSchema(conn, bind);
@@ -899,8 +1048,124 @@ static void UnloadTigerStateExecute(ClientContext &context, TableFunctionInput &
 	EmitLoaderResults(gstate, output);
 }
 
+// Build the list of (URL, dest_path) pairs to download for one state.
+// `dest_root` is the local state-temp-dir; output paths land at
+// <dest_root>/<SUBDIR>/<zip>.zip. Counties are scraped from the Census HTML
+// directory index for each per-county SUBDIR (EDGES, FACES, FEATNAMES, ADDR).
+static std::vector<DownloadTarget> BuildStateDownloadTargets(ClientContext &context, const LoaderBindData &bind,
+                                                             const LoaderBindData::StatePlan &state,
+                                                             const std::string &dest_root) {
+	const std::string &fips = state.fips;
+	const std::string year = std::to_string(bind.year);
+	std::vector<DownloadTarget> targets;
+
+	// State-level (known filenames): PLACE, COUSUB.
+	struct StateFile {
+		const char *subdir;
+		std::string filename;
+	};
+	auto src_base = bind.source;
+	if (!src_base.empty() && src_base.back() == '/') {
+		src_base.pop_back();
+	}
+	std::vector<StateFile> state_files = {
+	    {"PLACE", "tl_" + year + "_" + fips + "_place.zip"},
+	    {"COUSUB", "tl_" + year + "_" + fips + "_cousub.zip"},
+	};
+	for (const auto &sf : state_files) {
+		targets.push_back(
+		    {src_base + "/" + sf.subdir + "/" + sf.filename, dest_root + "/" + sf.subdir + "/" + sf.filename});
+	}
+
+	// Per-county (scraped): EDGES, FACES, FEATNAMES, ADDR.
+	// Filename pattern: tl_<year>_<fips><cfp>_<type>.zip — cfp is 3 digits.
+	ParallelDownloadOptions scrape_opts;
+	scrape_opts.workers = 1; // scrape is a single GET per directory
+	scrape_opts.max_attempts = 3;
+	scrape_opts.log_prefix = state.abbrev;
+	for (const char *sub : {"EDGES", "FACES", "FEATNAMES", "ADDR"}) {
+		std::string lower_type(sub);
+		for (auto &c : lower_type) {
+			c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+		}
+		std::string pattern_str = "tl_" + year + "_" + fips + "[0-9]{3}_" + lower_type + "\\.zip";
+		std::regex pat(pattern_str);
+		std::string idx_url = src_base + "/" + sub + "/";
+		auto names = ScrapeCensusIndex(context, idx_url, pat, scrape_opts);
+		if (names.empty()) {
+			throw IOException("us_geocoder parallel_download (%s): index %s yielded no matching files (pattern %s)",
+			                  state.abbrev, idx_url, pattern_str);
+		}
+		for (const auto &n : names) {
+			targets.push_back({src_base + "/" + sub + "/" + n, dest_root + "/" + sub + "/" + n});
+		}
+	}
+	return targets;
+}
+
+// RAII wrapper for a temp-dir lifetime. Destructor removes the directory
+// unless Disarm() was called (e.g. on failure — keep zips for retry).
+// Forward decl — defined below.
+static void DoLoadStateImpl(ClientContext &context, const LoaderBindData &bind, const LoaderBindData::StatePlan &state,
+                            std::vector<LoaderResult> &out);
+
 static void DoLoadState(ClientContext &context, const LoaderBindData &bind, const LoaderBindData::StatePlan &state,
                         std::vector<LoaderResult> &out) {
+	const bool source_is_http = bind.source.rfind("http://", 0) == 0 || bind.source.rfind("https://", 0) == 0;
+
+	// Serial fallback: same as the legacy path.
+	if (!bind.parallel || !source_is_http) {
+		DoLoadStateImpl(context, bind, state, out);
+		return;
+	}
+
+	// Parallel prelude: download all this state's zips into a temp dir, then
+	// dispatch the existing local-source ingest against that dir.
+	EnsureHttpfsIfRemote(*context.db, bind.source);
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto temp_base = ResolveTempBase(context, bind.temp_dir);
+	auto state_dir = MakeStateTempDir(context, temp_base, state.abbrev, bind.year);
+	StateDirCleanup raii(fs, state_dir);
+
+	auto t0 = std::chrono::steady_clock::now();
+	auto targets = BuildStateDownloadTargets(context, bind, state, state_dir);
+
+	ParallelDownloadOptions opts;
+	opts.workers = bind.parallel_workers;
+	opts.max_attempts = 3;
+	opts.backoff_seconds = {2, 5};
+	opts.log_prefix = state.abbrev;
+	auto result = ParallelDownload(context, targets, opts);
+
+	auto dl_secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+	fprintf(stderr,
+	        "[us_geocoder %s] parallel_download: %zu files (%zu downloaded, %zu skipped) "
+	        "%.1f MB in %.1fs\n",
+	        state.abbrev.c_str(), result.files_total, result.files_downloaded, result.files_skipped,
+	        static_cast<double>(result.bytes_downloaded) / (1024.0 * 1024.0), dl_secs);
+	fflush(stderr);
+	out.push_back({"parallel_download:" + state.abbrev, static_cast<int64_t>(result.files_total)});
+
+	// Re-enter the existing ingest body with bind.source patched to the local
+	// temp dir. Mutating via a local copy keeps the outer call's bind read-only.
+	LoaderBindData local_bind(bind.func_schema);
+	local_bind.data_location = bind.data_location;
+	local_bind.target_schema = bind.target_schema;
+	local_bind.target_db = bind.target_db;
+	local_bind.source = state_dir; // <-- swap to local
+	local_bind.year = bind.year;
+	local_bind.states = bind.states;
+	local_bind.build_containment = bind.build_containment;
+	local_bind.parallel = false; // belt-and-suspenders
+	local_bind.temp_dir = bind.temp_dir;
+	local_bind.parallel_workers = bind.parallel_workers;
+	DoLoadStateImpl(context, local_bind, state, out);
+
+	// Successful ingest — let the RAII destructor clean up the temp dir.
+}
+
+static void DoLoadStateImpl(ClientContext &context, const LoaderBindData &bind, const LoaderBindData::StatePlan &state,
+                            std::vector<LoaderResult> &out) {
 	EnsureHttpfsIfRemote(*context.db, bind.source);
 	Connection conn(*context.db);
 	BootstrapTargetSchema(conn, bind);
@@ -1429,6 +1694,9 @@ static void AddLoaderNamedParams(TableFunction &fn) {
 	fn.named_parameters["target_db"] = LogicalType::VARCHAR;
 	fn.named_parameters["target_schema"] = LogicalType::VARCHAR;
 	fn.named_parameters["build_containment"] = LogicalType::BOOLEAN;
+	fn.named_parameters["parallel"] = LogicalType::BOOLEAN;
+	fn.named_parameters["temp_dir"] = LogicalType::VARCHAR;
+	fn.named_parameters["parallel_workers"] = LogicalType::INTEGER;
 }
 
 void RegisterLoaderFunctions(ExtensionLoader &loader, const std::string &) {

@@ -31,7 +31,11 @@ CALL load_tiger_states(['RI','MA','CT']);      -- several states in one call
 CALL load_tiger_all_states();                  -- 50 states + DC
 ```
 
-`load_tiger_state[s]` must run after `load_tiger_nation`. RI loads in ~45s from the Census CDN, ~30s from a local mirror.
+`load_tiger_state[s]` must run after `load_tiger_nation`. RI loads in ~25s from the Census CDN, ~20s from a local mirror.
+
+Census HTTP loads default to **parallel download** (`parallel := true`): each state's zips are downloaded concurrently into an OS temp dir, ingested locally, and the temp dir is removed before the next state. This bounds peak disk at `max(state_size)` (~10 GB for TX, the largest state) regardless of how many states you're loading, gives a ~2× speed-up over the per-county-serial `/vsicurl/` path on most states, and bypasses GDAL's `/vsicurl/` entirely (which mattered for Windows MSVC users whose curl couldn't verify the Census cert chain — see `parallel := false` note below).
+
+Override the temp dir base with `temp_dir := '/path/'`; tune concurrency with `parallel_workers := 16`; pass `parallel := false` to fall back to the legacy `/vsicurl/` serial path for benchmarking. On Windows MSVC, the legacy `/vsicurl/` path requires `$env:GDAL_HTTP_UNSAFESSL="YES"` before loading the extension — the default parallel path doesn't.
 
 Local sources need a **Census-nested** layout (`STATE/`, `COUNTY/`, `EDGES/`, `FACES/`, `FEATNAMES/`, … under a single root) — see [docs/api.md § Local source layout](docs/api.md#local-source-layout) for the full subdirectory map.
 
@@ -178,24 +182,11 @@ Benchmarked on a 2024 M4 Max with 32 GB RAM. TIGER 2025 reference data.
 | batch of 1,000 addresses (LATERAL, RI) | RI only | 17 ms/addr (~60/sec/thread) |
 | **`geocode_batch`, 100K mixed addresses** (nationwide) | full nation | **~205 s, 0 GB tmp spill** |
 | full state load (local source, RI) | shapefile mirror | ~25 s |
-| full state load (Census HTTP, RI) | from CDN | ~45 s |
-| full state load (Census HTTP, NJ) | from CDN | ~5–8 min |
+| full state load (Census HTTP, RI, **parallel default**) | from CDN | ~25 s |
+| full state load (Census HTTP, NJ, **parallel default**) | from CDN | **~58 s** |
+| full state load (Census HTTP, NJ, `parallel := false`) | from CDN, legacy `/vsicurl/` | ~116 s |
 
-The nationwide batch number is ~3× faster than what the same workload took before the May 2026 perf push (was ~630 s + 10 GB tmp). See [docs/api.md § geocode_batch](docs/api.md#geocode_batchinput-table--table) for the tunables (`us_geocoder_slice_cap`, `us_geocoder_disable_join_order`) and [CLAUDE.md § Geocoder performance](CLAUDE.md#geocoder-performance-findings) for the engineering history.
-
-### Faster HTTP loads
-
-The Census CDN path issues one HTTPS fetch per `(county, table-type)` via GDAL's `/vsicurl/`, which doesn't parallelize well for large states (NJ ≈ 8 min, CA ≈ 30 min). The fix is a parallel pre-download into a Census-nested local mirror + local ingest:
-
-```sh
-./scripts/parallel_download_state.sh NJ ./tiger_nj        # ~26 s for all 89 NJ zips
-./build/release/duckdb tiger_nj.duckdb <<'EOF'
-CALL load_tiger_nation('./tiger_nj');
-CALL load_tiger_state('NJ', './tiger_nj');                -- ~3-4 min local ingest
-EOF
-```
-
-The script uses `xargs -P 16 curl` and scrapes the Census directory index for county-level enumeration — no hardcoded per-state FIPS list. See [scripts/parallel_download_state.sh](scripts/parallel_download_state.sh) for knobs (parallelism, year, destination).
+The NJ ~2× wall-clock win comes from running 16 concurrent HTTPS fetches against the Census CDN instead of serializing them through GDAL's `/vsicurl/`. The nationwide batch number is ~3× faster than what the same workload took before the May 2026 perf push (was ~630 s + 10 GB tmp). See [docs/api.md § geocode_batch](docs/api.md#geocode_batchinput-table--table) for the tunables (`us_geocoder_slice_cap`, `us_geocoder_disable_join_order`) and [CLAUDE.md § Geocoder performance](CLAUDE.md#geocoder-performance-findings) for the engineering history.
 
 ## License
 
