@@ -1,0 +1,126 @@
+# name: test/sql/tiger1992_fixedwidth.test
+# description: 1992 TIGER fixed-width field extraction, CFCC map, node IDs
+# group: [sql]
+
+require us_geocoder
+
+# ---- RT1 field extraction -------------------------------------------------
+query IIIIII
+WITH src AS (
+  SELECT rtrim(line, chr(13)) AS line
+  FROM read_csv('test/data/tiger1992/34/34999/TGR34999.F51',
+       columns={'line':'VARCHAR'}, delim='\x1f', header=false, quote='', escape='')
+)
+SELECT substr(line,6,10)::BIGINT AS tlid,
+       nullif(trim(substr(line,20,30)),'') AS fename,
+       nullif(trim(substr(line,50,4)),'')  AS fetype,
+       trim(substr(line,56,3))             AS cfcc,
+       nullif(trim(substr(line,59,11)),'') AS fraddl,
+       nullif(trim(substr(line,107,5)),'') AS zipl
+FROM src WHERE length(line) >= 228 ORDER BY tlid;
+----
+9001	Fixture	Road	A41	1	07825
+9002	Second	Ave	A41	100	07825
+
+# ---- Review Focus 2: leading zeros in ZIP survive as text ----------------
+query I
+WITH src AS (
+  SELECT rtrim(line, chr(13)) AS line
+  FROM read_csv('test/data/tiger1992/34/34999/TGR34999.F51',
+       columns={'line':'VARCHAR'}, delim='\x1f', header=false, quote='', escape='')
+)
+SELECT DISTINCT nullif(trim(substr(line,107,5)),'') FROM src WHERE length(line) >= 228;
+----
+07825
+
+# ---- CFCC -> MTFCC map ---------------------------------------------------
+query II
+SELECT cfcc, CASE
+         WHEN cfcc LIKE 'A1%' THEN 'S1100'
+         WHEN cfcc LIKE 'A2%' THEN 'S1200'
+         WHEN cfcc LIKE 'A3%' OR cfcc LIKE 'A4%' THEN 'S1400'
+         WHEN cfcc LIKE 'A5%' OR cfcc LIKE 'A6%' OR cfcc LIKE 'A7%' THEN 'S1500'
+         WHEN cfcc LIKE 'A%' THEN 'S1400'
+         ELSE 'X' || cfcc END AS mtfcc
+FROM (VALUES ('A11'),('A21'),('A31'),('A41'),('A51'),('A63'),('A74'),('A00'),('H01'),('B11')) v(cfcc)
+ORDER BY cfcc;
+----
+A00	S1400
+A11	S1100
+A21	S1200
+A31	S1400
+A41	S1400
+A51	S1500
+A63	S1500
+A74	S1500
+B11	XB11
+H01	XH01
+
+# ---- Node ID arithmetic: deterministic, collision-free, fits BIGINT -----
+# Shared endpoint of chains 9001/9002 (-74.950000, +40.995000) must yield
+# the SAME id from 9001's to-node and 9002's from-node.
+query I
+WITH src AS (
+  SELECT rtrim(line, chr(13)) AS line
+  FROM read_csv('test/data/tiger1992/34/34999/TGR34999.F51',
+       columns={'line':'VARCHAR'}, delim='\x1f', header=false, quote='', escape='')
+), nodes AS (
+  SELECT (trim(substr(line,210,10))::BIGINT + 180000000) * 1000000000
+         + (trim(substr(line,220,9))::BIGINT + 90000000) AS nid
+  FROM src WHERE substr(line,6,10)::BIGINT = 9001
+  UNION ALL
+  SELECT (trim(substr(line,191,10))::BIGINT + 180000000) * 1000000000
+         + (trim(substr(line,201,9))::BIGINT + 90000000)
+  FROM src WHERE substr(line,6,10)::BIGINT = 9002
+)
+SELECT count(DISTINCT nid) FROM nodes;
+----
+1
+
+# Signed fields with leading '+' and leading spaces both cast.
+query III
+SELECT '+40996043'::BIGINT, ' -74960022'::BIGINT,
+       (105050000::BIGINT + 180000000) * 1000000000 + (40990000 + 90000000);
+----
+40996043	-74960022	285050000130990000
+
+# ---- Review Focus 3: short / blank lines are skipped ---------------------
+query I
+WITH src AS (SELECT * FROM (VALUES ('short'),(''),(NULL)) v(line))
+SELECT count(*) FROM src WHERE length(line) >= 228;
+----
+0
+
+# ---- L/R address unpivot -------------------------------------------------
+query IIII
+WITH src AS (
+  SELECT rtrim(line, chr(13)) AS line
+  FROM read_csv('test/data/tiger1992/34/34999/TGR34999.F51',
+       columns={'line':'VARCHAR'}, delim='\x1f', header=false, quote='', escape='')
+), rt1 AS (
+  SELECT substr(line,6,10)::BIGINT AS tlid,
+         nullif(trim(substr(line,59,11)),'') AS fraddl,
+         nullif(trim(substr(line,70,11)),'') AS toaddl,
+         nullif(trim(substr(line,81,11)),'') AS fraddr,
+         nullif(trim(substr(line,92,11)),'') AS toaddr
+  FROM src WHERE length(line) >= 228
+)
+SELECT tlid, fromhn, tohn, side FROM (
+  SELECT tlid, fraddl AS fromhn, toaddl AS tohn, 'L' AS side FROM rt1
+  UNION ALL SELECT tlid, fraddr, toaddr, 'R' FROM rt1
+) WHERE fromhn IS NOT NULL ORDER BY tlid, side;
+----
+9001	1	99	L
+9001	2	98	R
+9002	100	198	L
+9002	101	199	R
+
+# ---- Review Focus 1: a zero-byte optional file yields zero rows ----------
+statement ok
+COPY (SELECT '' AS line WHERE false) TO '__TEST_DIR__/empty.F56' (FORMAT CSV, HEADER false);
+
+query I
+SELECT count(*) FROM read_csv('__TEST_DIR__/empty.F56',
+    columns={'line':'VARCHAR'}, delim='\x1f', header=false, quote='', escape='');
+----
+0

@@ -1,0 +1,303 @@
+-- Per-table INSERT templates for the 1992 TIGER/Line loader. Sections are
+-- delimited by "-- @SECTION:name@" and parsed by ExtractSection().
+-- Placeholders substituted per-call:
+--   @TIGER@    → data location ("tiger", or "refdb.tiger" with target_db)
+--   @FUNC@     → local macro location (always "tiger")
+--   @STATEFP@  → 2-digit state FIPS
+--   @COUNTYFP@ → 3-digit county FIPS
+--   @STUSPS@   → 2-letter state abbrev (from state_lookup, not in the files)
+--   @F51@ … @F5I@, @NAM@ → fully-resolved paths to the extracted files
+--
+-- Record layouts are documented in
+-- docs/superpowers/specs/2026-10-02-tiger1992-loader-design.md § Record layouts.
+-- Offsets are exact: record widths were verified byte-for-byte against the
+-- 1992 Census documentation.
+--
+-- delim='\x1f' is a byte that cannot occur in printable-ASCII TIGER content,
+-- so read_csv never splits a record; it just hands back whole lines.
+
+-- @SECTION:county_edges@
+INSERT INTO @TIGER@.edges
+    (statefp, countyfp, tlid, tfidl, tfidr, tnidf, tnidt, mtfcc, fullname, the_geom, zipl, zipr)
+WITH rt1 AS (
+    SELECT substr(line,6,10)::BIGINT                   AS tlid,
+           nullif(trim(substr(line,18,2)),'')          AS fedirp,
+           nullif(trim(substr(line,20,30)),'')         AS fename,
+           nullif(trim(substr(line,50,4)),'')          AS fetype,
+           nullif(trim(substr(line,54,2)),'')          AS fedirs,
+           trim(substr(line,56,3))                     AS cfcc,
+           nullif(trim(substr(line,107,5)),'')         AS zipl,
+           nullif(trim(substr(line,112,5)),'')         AS zipr,
+           trim(substr(line,191,10))::BIGINT           AS frlong,
+           trim(substr(line,201,9))::BIGINT            AS frlat,
+           trim(substr(line,210,10))::BIGINT           AS tolong,
+           trim(substr(line,220,9))::BIGINT            AS tolat
+    FROM (SELECT rtrim(line, chr(13)) AS line
+          FROM read_csv('@F51@', columns={'line':'VARCHAR'}, delim='\x1f',
+                        header=false, quote='', escape=''))
+    WHERE length(line) >= 228
+),
+rt2 AS (
+    SELECT substr(line,6,10)::BIGINT AS tlid,
+           substr(line,16,3)::INT    AS rtsq,
+           g.i                       AS slot,
+           trim(substr(line, 19 + (g.i-1)*19, 10))::BIGINT AS lon,
+           trim(substr(line, 29 + (g.i-1)*19,  9))::BIGINT AS lat
+    FROM (SELECT rtrim(line, chr(13)) AS line
+          FROM read_csv('@F52@', columns={'line':'VARCHAR'}, delim='\x1f',
+                        header=false, quote='', escape='')) s,
+         generate_series(1,10) g(i)
+    WHERE length(s.line) >= 208
+      AND trim(substr(s.line, 19 + (g.i-1)*19, 10))::BIGINT <> 0
+),
+rti AS (
+    SELECT substr(line,6,10)::BIGINT AS tlid,
+           CASE WHEN trim(substr(line,22,5)) <> '' AND trim(substr(line,27,10)) <> ''
+                THEN trim(substr(line,22,5))::BIGINT * 10000000000
+                   + trim(substr(line,27,10))::BIGINT END AS tfidl,
+           CASE WHEN trim(substr(line,37,5)) <> '' AND trim(substr(line,42,10)) <> ''
+                THEN trim(substr(line,37,5))::BIGINT * 10000000000
+                   + trim(substr(line,42,10))::BIGINT END AS tfidr
+    FROM (SELECT rtrim(line, chr(13)) AS line
+          FROM read_csv('@F5I@', columns={'line':'VARCHAR'}, delim='\x1f',
+                        header=false, quote='', escape=''))
+    WHERE length(line) >= 51
+),
+pts AS (
+    SELECT tlid, 0       AS ord, 0    AS slot, frlong AS lon, frlat AS lat FROM rt1
+    UNION ALL
+    SELECT tlid, rtsq,          slot,        lon,          lat           FROM rt2
+    UNION ALL
+    SELECT tlid, 1000000 AS ord, 0    AS slot, tolong,      tolat         FROM rt1
+),
+geo AS (
+    SELECT tlid, ST_MakeLine(list(ST_Point(lon/1e6, lat/1e6) ORDER BY ord, slot)) AS the_geom
+    FROM pts GROUP BY tlid
+)
+SELECT '@STATEFP@', '@COUNTYFP@', r.tlid, i.tfidl, i.tfidr,
+       -- Node identity == coordinate identity. Derived from the raw
+       -- microdegree integers so it is exact, collision-free and stable
+       -- across county files (geocode_intersection joins across them).
+       (r.frlong + 180000000) * 1000000000 + (r.frlat + 90000000),
+       (r.tolong + 180000000) * 1000000000 + (r.tolat + 90000000),
+       CASE WHEN r.cfcc LIKE 'A1%' THEN 'S1100'
+            WHEN r.cfcc LIKE 'A2%' THEN 'S1200'
+            WHEN r.cfcc LIKE 'A3%' OR r.cfcc LIKE 'A4%' THEN 'S1400'
+            WHEN r.cfcc LIKE 'A5%' OR r.cfcc LIKE 'A6%' OR r.cfcc LIKE 'A7%' THEN 'S1500'
+            WHEN r.cfcc LIKE 'A%'  THEN 'S1400'
+            ELSE 'X' || r.cfcc END,
+       nullif(trim(concat_ws(' ', r.fedirp, r.fename, r.fetype, r.fedirs)), ''),
+       g.the_geom, r.zipl, r.zipr
+FROM rt1 r
+JOIN geo g USING (tlid)
+LEFT JOIN rti i USING (tlid);
+
+-- @SECTION:county_faces@
+-- the_geom stays NULL: 1992 ships no polygon geometry and forward
+-- geocoding joins faces only on tfid for placefp/cousubfp/tract/block.
+INSERT INTO @TIGER@.faces
+    (statefp, countyfp, tfid, placefp, cousubfp, tractce20, blockce20, blkgrpce20, the_geom)
+SELECT '@STATEFP@', '@COUNTYFP@',
+       trim(substr(line,11,5))::BIGINT * 10000000000 + trim(substr(line,16,10))::BIGINT,
+       nullif(trim(substr(line,36,5)),''),
+       nullif(trim(substr(line,31,5)),''),
+       nullif(trim(substr(line,41,6)),''),
+       nullif(trim(substr(line,47,4)),''),
+       nullif(substr(trim(substr(line,47,4)),1,1),''),
+       NULL
+FROM (SELECT rtrim(line, chr(13)) AS line
+      FROM read_csv('@F5A@', columns={'line':'VARCHAR'}, delim='\x1f',
+                    header=false, quote='', escape=''))
+WHERE length(line) >= 50;
+
+-- @SECTION:county_featnames@
+-- RT1 supplies the primary name per TLID; RT4 ⨝ RT5 supplies alternates,
+-- which inherit their chain's CFCC. pretypabrv/prequalabr are always NULL:
+-- 1992 has only FEDIRP/FENAME/FETYPE/FEDIRS.
+INSERT INTO @TIGER@.featnames
+    (statefp, countyfp, tlid, name, fullname, predirabrv, pretypabrv, prequalabr,
+     suftypabrv, sufdirabrv, mtfcc, name_lower, fullname_norm, name_soundex,
+     numeric_stem, name_first_5, fullname_first_5)
+WITH rt1 AS (
+    SELECT substr(line,6,10)::BIGINT           AS tlid,
+           nullif(trim(substr(line,18,2)),'')  AS fedirp,
+           nullif(trim(substr(line,20,30)),'') AS fename,
+           nullif(trim(substr(line,50,4)),'')  AS fetype,
+           nullif(trim(substr(line,54,2)),'')  AS fedirs,
+           trim(substr(line,56,3))             AS cfcc
+    FROM (SELECT rtrim(line, chr(13)) AS line
+          FROM read_csv('@F51@', columns={'line':'VARCHAR'}, delim='\x1f',
+                        header=false, quote='', escape=''))
+    WHERE length(line) >= 228
+),
+rt4 AS (
+    SELECT substr(line,6,10)::BIGINT AS tlid,
+           nullif(trim(substr(line, 19 + (g.i-1)*8, 8)),'')::BIGINT AS feat
+    FROM (SELECT rtrim(line, chr(13)) AS line
+          FROM read_csv('@F54@', columns={'line':'VARCHAR'}, delim='\x1f',
+                        header=false, quote='', escape='')) s,
+         generate_series(1,5) g(i)
+    WHERE length(s.line) >= 26
+      AND nullif(trim(substr(s.line, 19 + (g.i-1)*8, 8)),'') IS NOT NULL
+),
+rt5 AS (
+    SELECT substr(line,7,8)::BIGINT            AS feat,
+           nullif(trim(substr(line,15,2)),'')  AS fedirp,
+           nullif(trim(substr(line,17,30)),'') AS fename,
+           nullif(trim(substr(line,47,4)),'')  AS fetype,
+           nullif(trim(substr(line,51,2)),'')  AS fedirs
+    FROM (SELECT rtrim(line, chr(13)) AS line
+          FROM read_csv('@F55@', columns={'line':'VARCHAR'}, delim='\x1f',
+                        header=false, quote='', escape=''))
+    WHERE length(line) >= 46
+),
+named AS (
+    SELECT tlid, fename AS name, fedirp, fetype, fedirs, cfcc
+    FROM rt1 WHERE fename IS NOT NULL
+    UNION ALL
+    SELECT x.tlid, f.fename, f.fedirp, f.fetype, f.fedirs, r.cfcc
+    FROM rt4 x
+    JOIN rt5 f USING (feat)
+    JOIN rt1 r ON r.tlid = x.tlid
+    WHERE f.fename IS NOT NULL
+),
+built AS (
+    SELECT *, nullif(trim(concat_ws(' ', fedirp, name, fetype, fedirs)), '') AS fn FROM named
+)
+SELECT '@STATEFP@', '@COUNTYFP@', tlid, name, fn,
+       fedirp, NULL, NULL, fetype, fedirs,
+       CASE WHEN cfcc LIKE 'A1%' THEN 'S1100'
+            WHEN cfcc LIKE 'A2%' THEN 'S1200'
+            WHEN cfcc LIKE 'A3%' OR cfcc LIKE 'A4%' THEN 'S1400'
+            WHEN cfcc LIKE 'A5%' OR cfcc LIKE 'A6%' OR cfcc LIKE 'A7%' THEN 'S1500'
+            WHEN cfcc LIKE 'A%'  THEN 'S1400'
+            ELSE 'X' || cfcc END,
+       lower(name),
+       @FUNC@.normalize_street_name(fn),
+       soundex(name),
+       CASE WHEN name IS NOT NULL AND length(name) < 10
+                 AND regexp_matches(name, '^[0-9/\s]+')
+            THEN trim(regexp_extract(name, '^[0-9/\s]+')) END,
+       substr(lower(name), 1, 5),
+       substr(@FUNC@.normalize_street_name(fn), 1, 5)
+FROM built;
+
+-- @SECTION:county_addr@
+-- RT1's primary L/R ranges plus RT6's additional ranges, unpivoted into
+-- `side`. zip stays VARCHAR straight off substr so leading zeros survive.
+-- plus4 is NULL: 1992 carries no ZIP+4 on these records.
+INSERT INTO @TIGER@.addr (statefp, countyfp, tlid, fromhn, tohn, side, zip, plus4)
+WITH rt1 AS (
+    SELECT substr(line,6,10)::BIGINT           AS tlid,
+           nullif(trim(substr(line,59,11)),'') AS fraddl,
+           nullif(trim(substr(line,70,11)),'') AS toaddl,
+           nullif(trim(substr(line,81,11)),'') AS fraddr,
+           nullif(trim(substr(line,92,11)),'') AS toaddr,
+           nullif(trim(substr(line,107,5)),'') AS zipl,
+           nullif(trim(substr(line,112,5)),'') AS zipr
+    FROM (SELECT rtrim(line, chr(13)) AS line
+          FROM read_csv('@F51@', columns={'line':'VARCHAR'}, delim='\x1f',
+                        header=false, quote='', escape=''))
+    WHERE length(line) >= 228
+),
+rt6 AS (
+    SELECT substr(line,6,10)::BIGINT           AS tlid,
+           nullif(trim(substr(line,19,11)),'') AS fraddl,
+           nullif(trim(substr(line,30,11)),'') AS toaddl,
+           nullif(trim(substr(line,41,11)),'') AS fraddr,
+           nullif(trim(substr(line,52,11)),'') AS toaddr,
+           nullif(trim(substr(line,67,5)),'')  AS zipl,
+           nullif(trim(substr(line,72,5)),'')  AS zipr
+    FROM (SELECT rtrim(line, chr(13)) AS line
+          FROM read_csv('@F56@', columns={'line':'VARCHAR'}, delim='\x1f',
+                        header=false, quote='', escape=''))
+    WHERE length(line) >= 76
+)
+SELECT '@STATEFP@', '@COUNTYFP@', tlid, fromhn, tohn, side, zip, NULL FROM (
+    SELECT tlid, fraddl AS fromhn, toaddl AS tohn, 'L' AS side, zipl AS zip FROM rt1
+    UNION ALL SELECT tlid, fraddr, toaddr, 'R', zipr FROM rt1
+    UNION ALL SELECT tlid, fraddl, toaddl, 'L', zipl FROM rt6
+    UNION ALL SELECT tlid, fraddr, toaddr, 'R', zipr FROM rt6
+) WHERE fromhn IS NOT NULL;
+
+-- @SECTION:state_state@
+-- 1992 has no nation-level product, so each state load writes its own
+-- state row. stusps is not in the NAM file; it comes from state_lookup.
+-- Guarded like the modern nation_state section so re-runs cannot duplicate.
+INSERT INTO @TIGER@.state (statefp, stusps, name, the_geom)
+SELECT '@STATEFP@', '@STUSPS@', trim(substr(line,13,60)), NULL
+FROM (SELECT rtrim(line, chr(13)) AS line
+      FROM read_csv('@NAM@', columns={'line':'VARCHAR'}, delim='\x1f',
+                    header=false, quote='', escape=''))
+WHERE length(line) >= 72 AND substr(line,1,2) = '01'
+  AND '@STATEFP@' NOT IN (SELECT statefp FROM @TIGER@.state WHERE statefp IS NOT NULL);
+
+-- @SECTION:state_county@
+-- Strips the legal/statistical suffix so NAME matches modern TIGER's
+-- convention ("Autauga", not "Autauga County"). The alternation covers the
+-- forms that appear across states and territories.
+INSERT INTO @TIGER@.county (statefp, countyfp, cntyidfp, name, the_geom)
+SELECT '@STATEFP@', trim(substr(line,5,3)),
+       '@STATEFP@' || trim(substr(line,5,3)),
+       regexp_replace(trim(substr(line,13,60)),
+           ' (County|Parish|Borough|Census Area|City and Borough|Municipality|city|municipio)$', ''),
+       NULL
+FROM (SELECT rtrim(line, chr(13)) AS line
+      FROM read_csv('@NAM@', columns={'line':'VARCHAR'}, delim='\x1f',
+                    header=false, quote='', escape=''))
+WHERE length(line) >= 72 AND substr(line,1,2) = '02'
+  AND '@STATEFP@' || trim(substr(line,5,3))
+      NOT IN (SELECT cntyidfp FROM @TIGER@.county WHERE cntyidfp IS NOT NULL);
+
+-- @SECTION:state_place@
+INSERT INTO @TIGER@.place (statefp, placefp, plcidfp, name, the_geom)
+SELECT DISTINCT '@STATEFP@', trim(substr(line,8,5)),
+       '@STATEFP@' || trim(substr(line,8,5)),
+       regexp_replace(trim(substr(line,13,60)),
+           ' (city|town|township|borough|village|CDP|comunidad|zona urbana)$', ''),
+       NULL
+FROM (SELECT rtrim(line, chr(13)) AS line
+      FROM read_csv('@NAM@', columns={'line':'VARCHAR'}, delim='\x1f',
+                    header=false, quote='', escape=''))
+WHERE length(line) >= 72 AND substr(line,1,2) = '05' AND trim(substr(line,8,5)) <> '';
+
+-- @SECTION:state_cousub@
+INSERT INTO @TIGER@.cousub (statefp, countyfp, cousubfp, cosbidfp, name, the_geom)
+SELECT '@STATEFP@', trim(substr(line,5,3)), trim(substr(line,8,5)),
+       '@STATEFP@' || trim(substr(line,5,3)) || trim(substr(line,8,5)),
+       regexp_replace(trim(substr(line,13,60)),
+           ' (township|borough|town|city|village|plantation|gore|district)$', ''),
+       NULL
+FROM (SELECT rtrim(line, chr(13)) AS line
+      FROM read_csv('@NAM@', columns={'line':'VARCHAR'}, delim='\x1f',
+                    header=false, quote='', escape=''))
+WHERE length(line) >= 72 AND substr(line,1,2) = '03' AND trim(substr(line,8,5)) <> '';
+
+-- @SECTION:derived_edge_containment@
+-- GEOIDs only. guaranteed_* is hard false: the flag needs ST_Within against
+-- a face polygon, and 1992 ships none. See spec § Known limitations —
+-- require_containment must be 'none' for 1992 data.
+-- Block GEOIDs are 1990-vintage and may be 14 or 15 chars (1990 block codes
+-- are 3 digits + optional suffix); kept raw, since padding would conflate
+-- distinct blocks.
+INSERT INTO @TIGER@.edge_containment
+    (statefp, tlid, guaranteed_l, guaranteed_r,
+     block_geoid_l, tract_geoid_l, blkgrp_geoid_l,
+     block_geoid_r, tract_geoid_r, blkgrp_geoid_r)
+SELECT e.statefp, e.tlid, false, false,
+    CASE WHEN f_l.tractce20 IS NULL OR f_l.blockce20 IS NULL THEN NULL
+         ELSE e.statefp || f_l.countyfp || f_l.tractce20 || f_l.blockce20 END,
+    CASE WHEN f_l.tractce20 IS NULL THEN NULL
+         ELSE e.statefp || f_l.countyfp || f_l.tractce20 END,
+    CASE WHEN f_l.tractce20 IS NULL OR f_l.blkgrpce20 IS NULL THEN NULL
+         ELSE e.statefp || f_l.countyfp || f_l.tractce20 || f_l.blkgrpce20 END,
+    CASE WHEN f_r.tractce20 IS NULL OR f_r.blockce20 IS NULL THEN NULL
+         ELSE e.statefp || f_r.countyfp || f_r.tractce20 || f_r.blockce20 END,
+    CASE WHEN f_r.tractce20 IS NULL THEN NULL
+         ELSE e.statefp || f_r.countyfp || f_r.tractce20 END,
+    CASE WHEN f_r.tractce20 IS NULL OR f_r.blkgrpce20 IS NULL THEN NULL
+         ELSE e.statefp || f_r.countyfp || f_r.tractce20 || f_r.blkgrpce20 END
+FROM @TIGER@.edges e
+LEFT JOIN @TIGER@.faces f_l ON f_l.statefp = e.statefp AND f_l.tfid = e.tfidl
+LEFT JOIN @TIGER@.faces f_r ON f_r.statefp = e.statefp AND f_r.tfid = e.tfidr
+WHERE e.statefp = '@STATEFP@';

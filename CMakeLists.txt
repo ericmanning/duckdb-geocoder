@@ -80,6 +80,7 @@ file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode.sql.in GEOCODE_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_intersection.sql.in GEOCODE_INTERSECTION_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/reverse_geocode.sql.in REVERSE_GEOCODE_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/loader_templates.sql.in LOADER_TEMPLATES_SQL)
+file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/loader_1992_templates.sql.in LOADER_1992_TEMPLATES_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_input_type.sql.in GEOCODE_INPUT_TYPE_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/from_pagc.sql.in FROM_PAGC_SQL)
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/pagc_tables.sql.in PAGC_TABLES_SQL)
@@ -97,6 +98,7 @@ emit_chunked_literals(GEOCODE_SQL                    GEOCODE_LITS)
 emit_chunked_literals(GEOCODE_INTERSECTION_SQL       GEOCODE_INTERSECTION_LITS)
 emit_chunked_literals(REVERSE_GEOCODE_SQL            REVERSE_GEOCODE_LITS)
 emit_chunked_literals(LOADER_TEMPLATES_SQL           LOADER_TEMPLATES_LITS)
+emit_chunked_literals(LOADER_1992_TEMPLATES_SQL      LOADER_1992_TEMPLATES_LITS)
 emit_chunked_literals(GEOCODE_INPUT_TYPE_SQL         GEOCODE_INPUT_TYPE_LITS)
 emit_chunked_literals(FROM_PAGC_SQL                  FROM_PAGC_LITS)
 emit_chunked_literals(PAGC_TABLES_SQL                PAGC_TABLES_LITS)
@@ -166,6 +168,11 @@ inline const std::string &LoaderTemplatesSql() {
   ${LOADER_TEMPLATES_LITS});
   return data;
 }
+inline const std::string &Loader1992TemplatesSql() {
+  static const std::string data(
+  ${LOADER_1992_TEMPLATES_LITS});
+  return data;
+}
 inline const std::string &GeocodeInputTypeSql() {
   static const std::string data(
   ${GEOCODE_INPUT_TYPE_LITS});
@@ -204,6 +211,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_intersection.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/reverse_geocode.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/loader_templates.sql.in
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/loader_1992_templates.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/geocode_input_type.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/from_pagc.sql.in
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/pagc_tables.sql.in
