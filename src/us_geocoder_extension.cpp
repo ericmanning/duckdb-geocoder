@@ -4,6 +4,7 @@
 #include "us_geocoder_embed.hpp"
 #include "us_geocoder_embedded_sql.hpp"
 #include "us_geocoder_loader.hpp"
+#include "us_geocoder_loader_1992.hpp"
 #include "us_geocoder_zip.hpp"
 #include "vendored_soundex.hpp"
 #include "geocode_batch.hpp"
@@ -189,6 +190,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register the C++ loader table functions (load_tiger_nation, load_tiger_state).
 	// These don't need spatial at load time; ST_Read only fires at invocation.
 	us_geocoder::RegisterLoaderFunctions(loader, kDefaultTigerSchema);
+
+	// 1992-vintage TIGER/Line loader (load_tiger_1992_state and friends).
+	// Fixed-width ASCII parsing via read_csv; no GDAL/spatial dependency at
+	// load time.
+	us_geocoder::RegisterLoader1992Functions(loader, kDefaultTigerSchema);
 
 	// us_geocoder_unzip — extracts a zip archive's entries via DuckDB's
 	// bundled miniz (headers only; see CMakeLists.txt). Used by the 1992

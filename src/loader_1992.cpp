@@ -1,0 +1,692 @@
+#include "us_geocoder_loader_1992.hpp"
+#include "us_geocoder_loader_internal.hpp"
+#include "us_geocoder_zip.hpp"
+#include "us_geocoder_embed.hpp"
+#include "us_geocoder_embedded_sql.hpp"
+
+#include "duckdb.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/function/table_function.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cstdio>
+#include <regex>
+#include <utility>
+
+namespace duckdb {
+namespace us_geocoder {
+
+static const char *kDefaultSource1992 = "https://www2.census.gov/geo/tiger/TIGER1992";
+
+// =====================================================================
+// Bind data + global state
+// =====================================================================
+
+struct Loader1992BindData : public FunctionData {
+	struct StatePlan {
+		std::string abbrev;
+		std::string fips;
+	};
+	std::string source = kDefaultSource1992;
+	std::string target_db;                  // empty => current catalog
+	std::string target_schema = "tiger";
+	bool build_containment = true;
+	bool parallel = true;
+	int parallel_workers = 16;
+	std::string temp_dir;
+	std::vector<StatePlan> states;
+	bool unload = false;
+
+	// "tiger" locally, or "<db>.<schema>" when target_db is set.
+	std::string DataLoc() const {
+		if (target_db.empty()) {
+			return QuoteIdent(target_schema);
+		}
+		return QuoteIdent(target_db) + "." + QuoteIdent(target_schema);
+	}
+	// Macros always live locally.
+	std::string FuncLoc() const {
+		return "tiger";
+	}
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<Loader1992BindData>(*this);
+	}
+	bool Equals(const FunctionData &other) const override {
+		auto &o = other.Cast<Loader1992BindData>();
+		return source == o.source && target_db == o.target_db && target_schema == o.target_schema &&
+		       build_containment == o.build_containment && unload == o.unload;
+	}
+};
+
+struct Loader1992GlobalState : public GlobalTableFunctionState {
+	std::vector<LoaderResult> results;
+	idx_t row_idx = 0;
+	bool ran = false;
+
+	static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInput &) {
+		return make_uniq<Loader1992GlobalState>();
+	}
+};
+
+// =====================================================================
+// Source resolution
+// =====================================================================
+
+// Where a county's extracted files live for this load. Returns the directory
+// holding TGR<ssccc>.F5*, extracting from a zip first if needed.
+// `work_dir` is the loader's temp dir (used only for modes 1 and 2).
+static std::string ResolveCountyDir(ClientContext &context, FileSystem &fs, const Loader1992BindData &bind,
+                                    const std::string &fips, const std::string &cfp, const std::string &work_dir) {
+	const std::string ssccc = fips + cfp;
+	const std::vector<std::string> wanted = {"TGR" + ssccc + ".F51", "TGR" + ssccc + ".F52",
+	                                         "TGR" + ssccc + ".F54", "TGR" + ssccc + ".F55",
+	                                         "TGR" + ssccc + ".F56", "TGR" + ssccc + ".F5A",
+	                                         "TGR" + ssccc + ".F5I"};
+	const bool remote = bind.source.rfind("http://", 0) == 0 || bind.source.rfind("https://", 0) == 0;
+	if (remote) {
+		// Already downloaded into work_dir by the caller.
+		const std::string local_zip = fs.JoinPath(work_dir, ssccc + ".zip");
+		const std::string dest = fs.JoinPath(work_dir, ssccc);
+		ExtractZipEntries(fs, local_zip, dest, wanted);
+		return dest;
+	}
+	// Mode 2: local nested zip.
+	const std::string zip_path = fs.JoinPath(fs.JoinPath(bind.source, fips), ssccc + ".zip");
+	if (fs.FileExists(zip_path)) {
+		const std::string dest = fs.JoinPath(work_dir, ssccc);
+		ExtractZipEntries(fs, zip_path, dest, wanted);
+		return dest;
+	}
+	// Mode 3: local already-extracted tree.
+	const std::string dir = fs.JoinPath(fs.JoinPath(bind.source, fips), ssccc);
+	if (fs.DirectoryExists(dir)) {
+		return dir;
+	}
+	throw IOException("us_geocoder 1992: no county data for %s — looked for %s and %s", ssccc, zip_path, dir);
+}
+
+// RT4/RT5/RT6 are optional per county. read_csv errors on a missing file, so
+// substitute a known-empty file when the real one is absent.
+static std::string PathOrEmpty(FileSystem &fs, const std::string &dir, const std::string &name,
+                               const std::string &work_dir) {
+	const std::string p = fs.JoinPath(dir, name);
+	if (fs.FileExists(p)) {
+		return p;
+	}
+	const std::string stub = fs.JoinPath(work_dir, "__empty__");
+	if (!fs.FileExists(stub)) {
+		auto h = fs.OpenFile(stub, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+		h.reset();
+	}
+	return stub;
+}
+
+// County FIPS list for a state. Remote: scrape <source>/<ss>/ for
+// <ssccc>.zip. Local: list <source>/<ss>/ for either <ssccc>.zip files or
+// <ssccc>/ directories, so both local layouts work.
+static std::vector<std::string> ListCounties1992(ClientContext &context, FileSystem &fs,
+                                                 const Loader1992BindData &bind, const std::string &fips) {
+	std::vector<std::string> out;
+	const bool remote = bind.source.rfind("http://", 0) == 0 || bind.source.rfind("https://", 0) == 0;
+	if (remote) {
+		std::string base = bind.source;
+		if (!base.empty() && base.back() == '/') {
+			base.pop_back();
+		}
+		ParallelDownloadOptions opts;
+		opts.workers = 1; // one GET for the directory index
+		opts.max_attempts = 3;
+		opts.log_prefix = fips;
+		const std::string pattern_str = "^" + fips + "[0-9]{3}\\.zip$";
+		std::regex pat(pattern_str);
+		auto names = ScrapeCensusIndex(context, base + "/" + fips + "/", pat, opts);
+		if (names.empty()) {
+			throw IOException("us_geocoder 1992: index %s/%s/ yielded no county zips (pattern %s)", base, fips,
+			                  pattern_str);
+		}
+		for (size_t i = 0; i < names.size(); ++i) {
+			// "<ssccc>.zip" -> "ccc"
+			out.push_back(names[i].substr(2, 3));
+		}
+	} else {
+		const std::string state_dir = fs.JoinPath(bind.source, fips);
+		if (!fs.DirectoryExists(state_dir)) {
+			throw IOException("us_geocoder 1992: no such directory: %s", state_dir);
+		}
+		fs.ListFiles(state_dir, [&](const string &name, bool is_dir) {
+			if (is_dir) {
+				if (name.size() == 5 && name.compare(0, 2, fips) == 0) {
+					out.push_back(name.substr(2, 3));
+				}
+			} else if (name.size() == 9 && name.compare(0, 2, fips) == 0 &&
+			           name.compare(5, 4, ".zip") == 0) {
+				out.push_back(name.substr(2, 3));
+			}
+		});
+		if (out.empty()) {
+			throw IOException("us_geocoder 1992: no county zips or county directories under %s", state_dir);
+		}
+	}
+	std::sort(out.begin(), out.end());
+	out.erase(std::unique(out.begin(), out.end()), out.end());
+	return out;
+}
+
+// Directory holding TGR92S<ss>.NAM. Extracted from OtherFiles.zip for
+// remote and local-zip sources; for an already-extracted tree it is just
+// <source>/<ss>.
+static std::string ResolveStateOtherDir(ClientContext &context, FileSystem &fs, const Loader1992BindData &bind,
+                                        const std::string &fips, const std::string &work_dir) {
+	const std::vector<std::string> wanted = {"TGR92S" + fips + ".NAM"};
+	const bool remote = bind.source.rfind("http://", 0) == 0 || bind.source.rfind("https://", 0) == 0;
+	if (remote) {
+		// Downloaded by the prelude in DoLoadState1992.
+		const std::string zip = fs.JoinPath(work_dir, "OtherFiles.zip");
+		const std::string dest = fs.JoinPath(work_dir, "other");
+		ExtractZipEntries(fs, zip, dest, wanted);
+		return dest;
+	}
+	const std::string zip = fs.JoinPath(fs.JoinPath(bind.source, fips), "OtherFiles.zip");
+	if (fs.FileExists(zip)) {
+		const std::string dest = fs.JoinPath(work_dir, "other");
+		ExtractZipEntries(fs, zip, dest, wanted);
+		return dest;
+	}
+	const std::string dir = fs.JoinPath(bind.source, fips);
+	if (fs.FileExists(fs.JoinPath(dir, "TGR92S" + fips + ".NAM"))) {
+		return dir;
+	}
+	throw IOException("us_geocoder 1992: no TGR92S%s.NAM — looked in %s and %s", fips, zip, dir);
+}
+
+// =====================================================================
+// Bind-input helpers
+// =====================================================================
+
+// Extract varchar abbrevs from a LIST<VARCHAR> Value (or a single scalar
+// VARCHAR). Local copy of loader.cpp's AbbrevsFromValue (static there too —
+// internal linkage means no ODR conflict across translation units).
+static std::vector<std::string> AbbrevsFromValue(const Value &v, const char *context_fn) {
+	std::vector<std::string> out;
+	if (v.IsNull()) {
+		throw BinderException("%s: states argument is NULL", context_fn);
+	}
+	if (v.type().id() == LogicalTypeId::LIST) {
+		auto &children = ListValue::GetChildren(v);
+		for (const auto &child : children) {
+			if (child.IsNull())
+				continue;
+			auto s = StringValue::Get(child);
+			if (!s.empty())
+				out.push_back(s);
+		}
+	} else if (v.type().id() == LogicalTypeId::VARCHAR) {
+		auto s = StringValue::Get(v);
+		if (!s.empty())
+			out.push_back(s);
+	} else {
+		throw BinderException("%s: expected VARCHAR or VARCHAR[], got %s", context_fn, v.type().ToString());
+	}
+	return out;
+}
+
+// Resolve a list of state abbreviations into Loader1992BindData::states[]
+// (in order). Dedups case-insensitively while preserving first-occurrence
+// order; errors on any unknown abbrev. Macros/lookup tables for the 1992
+// loader always live in the local "tiger" schema (FuncLoc()), independent
+// of target_db/target_schema.
+static void ResolveStates1992(Connection &conn, Loader1992BindData &bind, const std::vector<std::string> &abbrevs) {
+	std::vector<std::string> seen;
+	for (const auto &raw : abbrevs) {
+		std::string up;
+		up.reserve(raw.size());
+		for (char c : raw) {
+			up += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+		}
+		bool dup = false;
+		for (const auto &s : seen) {
+			if (s == up) {
+				dup = true;
+				break;
+			}
+		}
+		if (dup)
+			continue;
+		seen.push_back(up);
+		auto fips = LookupStateFips(conn, "tiger", up);
+		bind.states.push_back({up, fips});
+	}
+	if (bind.states.empty()) {
+		throw BinderException("us_geocoder: no state abbreviations provided");
+	}
+}
+
+// target_db / target_schema named params, shared by every 1992 entry point.
+static void ApplyTargetParams1992(Loader1992BindData &bind, const TableFunctionBindInput &input) {
+	auto db_it = input.named_parameters.find("target_db");
+	if (db_it != input.named_parameters.end() && !db_it->second.IsNull()) {
+		bind.target_db = StringValue::Get(db_it->second);
+	}
+	auto schema_it = input.named_parameters.find("target_schema");
+	if (schema_it != input.named_parameters.end() && !schema_it->second.IsNull()) {
+		auto s = StringValue::Get(schema_it->second);
+		if (!s.empty()) {
+			bind.target_schema = s;
+		}
+	}
+}
+
+// Full named-parameter set for load_tiger_1992_*: target params plus
+// source/build_containment/parallel/temp_dir/parallel_workers.
+// `source_input_index` is the positional slot that accepts the source
+// string on this overload (-1 to disable positional).
+static void Apply1992Params(Loader1992BindData &bind, const TableFunctionBindInput &input, int source_input_index) {
+	ApplyTargetParams1992(bind, input);
+	bool found_source = false;
+	if (source_input_index >= 0 && static_cast<int>(input.inputs.size()) > source_input_index &&
+	    !input.inputs[source_input_index].IsNull() &&
+	    !StringValue::Get(input.inputs[source_input_index]).empty()) {
+		bind.source = StringValue::Get(input.inputs[source_input_index]);
+		found_source = true;
+	}
+	if (!found_source) {
+		auto src_it = input.named_parameters.find("source");
+		if (src_it != input.named_parameters.end() && !src_it->second.IsNull() &&
+		    !StringValue::Get(src_it->second).empty()) {
+			bind.source = StringValue::Get(src_it->second);
+			found_source = true;
+		}
+	}
+	// else: bind.source keeps its struct-default (kDefaultSource1992).
+	auto bc_it = input.named_parameters.find("build_containment");
+	if (bc_it != input.named_parameters.end() && !bc_it->second.IsNull()) {
+		bind.build_containment = bc_it->second.GetValue<bool>();
+	}
+	auto par_it = input.named_parameters.find("parallel");
+	if (par_it != input.named_parameters.end() && !par_it->second.IsNull()) {
+		bind.parallel = par_it->second.GetValue<bool>();
+	}
+	auto tmp_it = input.named_parameters.find("temp_dir");
+	if (tmp_it != input.named_parameters.end() && !tmp_it->second.IsNull()) {
+		bind.temp_dir = StringValue::Get(tmp_it->second);
+	}
+	auto pw_it = input.named_parameters.find("parallel_workers");
+	if (pw_it != input.named_parameters.end() && !pw_it->second.IsNull()) {
+		auto v = pw_it->second.GetValue<int32_t>();
+		if (v < 1) {
+			throw BinderException("us_geocoder: parallel_workers must be >= 1 (got %d)", v);
+		}
+		bind.parallel_workers = v;
+	}
+	// `parallel` only controls download worker count for the 1992 loader
+	// (unlike the modern loader, there's no separate /vsicurl/-direct path
+	// to fall back to); still meaningless with a local source.
+	const bool source_is_http = bind.source.rfind("http://", 0) == 0 || bind.source.rfind("https://", 0) == 0;
+	if (bind.parallel && !source_is_http) {
+		fprintf(stderr,
+		        "[us_geocoder 1992] WARN: parallel := true has no effect with a local source (%s); "
+		        "ignored.\n",
+		        bind.source.c_str());
+		fflush(stderr);
+		bind.parallel = false;
+	}
+}
+
+// =====================================================================
+// DoLoadState1992 — per-state ingest
+// =====================================================================
+
+static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bind,
+                            const Loader1992BindData::StatePlan &state, std::vector<LoaderResult> &out) {
+	Connection conn(*context.db);
+	auto &fs = FileSystem::GetFileSystem(context);
+	const std::string data_loc = bind.DataLoc();
+	const std::string func_loc = bind.FuncLoc();
+	const std::string &fips = state.fips;
+	const std::string tmpl = Loader1992TemplatesSql();
+	const std::string state_pfx = "tiger1992:state:" + fips + ":";
+	const bool remote = bind.source.rfind("http://", 0) == 0 || bind.source.rfind("https://", 0) == 0;
+
+	EnsureHttpfsIfRemote(*context.db, bind.source);
+
+	// Create the TIGER tables in the target catalog when target_db is set.
+	// The modern loader does this at the head of DoLoadStateImpl; without it,
+	// `target_db := 'hist92'` would try to INSERT into tables that do not exist.
+	BootstrapTargetSchema(conn, data_loc, func_loc);
+
+	// Vintage guard goes here — see Task 6, Step 4.
+
+	std::vector<std::string> countyfps = ListCounties1992(context, fs, bind, fips);
+
+	// work_dir: scratch for extraction (always) and downloads (remote only).
+	// Reuse the modern loader's helpers so temp_dir resolution and the
+	// per-state directory naming stay identical across both paths.
+	const std::string temp_base = ResolveTempBase(context, bind.temp_dir);
+	const std::string work_dir = MakeStateTempDir(context, temp_base, state.abbrev, 1992);
+	StateDirCleanup cleanup(fs, work_dir);
+
+	if (remote) {
+		std::string src = bind.source;
+		if (!src.empty() && src.back() == '/') {
+			src.pop_back();
+		}
+		std::vector<DownloadTarget> targets;
+		for (size_t i = 0; i < countyfps.size(); ++i) {
+			const std::string ssccc = fips + countyfps[i];
+			targets.push_back({src + "/" + fips + "/" + ssccc + ".zip", fs.JoinPath(work_dir, ssccc + ".zip")});
+		}
+		targets.push_back({src + "/" + fips + "/OtherFiles.zip", fs.JoinPath(work_dir, "OtherFiles.zip")});
+		ParallelDownloadOptions opts;
+		opts.workers = bind.parallel ? bind.parallel_workers : 1;
+		opts.log_prefix = state.abbrev;
+		auto dl = ParallelDownload(context, targets, opts);
+		(void)dl;
+	}
+
+	// Keep the temp dir on failure so a retry reuses the downloads instead of
+	// re-fetching a whole state. StateDirCleanup removes it on success only.
+	try {
+		// Per-state names first — the county sections do not depend on them.
+		const std::string stusps = state.abbrev;
+		const std::string nam_dir = ResolveStateOtherDir(context, fs, bind, fips, work_dir);
+		const std::string nam = fs.JoinPath(nam_dir, "TGR92S" + fips + ".NAM");
+		struct StateStep {
+			const char *section;
+			const char *progress;
+		};
+		const StateStep state_steps[] = {{"state_state", "state"},
+		                                 {"state_county", "county"},
+		                                 {"state_place", "place"},
+		                                 {"state_cousub", "cousub"}};
+		for (const auto &s : state_steps) {
+			const std::string key = state_pfx + s.progress;
+			if (IsProgressDone(conn, data_loc, key)) {
+				out.push_back({std::string(s.section) + ":skipped", 0});
+				continue;
+			}
+			auto sql = RenderTemplate(ExtractSection(tmpl, s.section), {{"@TIGER@", data_loc},
+			                                                            {"@FUNC@", func_loc},
+			                                                            {"@STATEFP@", fips},
+			                                                            {"@STUSPS@", stusps},
+			                                                            {"@NAM@", nam}});
+			int64_t rows = ExecuteInsert(conn, sql, s.section);
+			out.push_back({s.section, rows});
+			MarkProgressDone(conn, data_loc, key);
+		}
+
+		// Per-county.
+		struct CountyStep {
+			const char *section;
+			const char *progress_table;
+		};
+		const CountyStep county_steps[] = {{"county_edges", "edges"},
+		                                   {"county_faces", "faces"},
+		                                   {"county_featnames", "featnames"},
+		                                   {"county_addr", "addr"}};
+		for (size_t ci = 0; ci < countyfps.size(); ++ci) {
+			const auto &cfp = countyfps[ci];
+			const std::string ssccc = fips + cfp;
+			std::string dir; // resolved lazily, only if some step is pending
+			for (const auto &t : county_steps) {
+				const std::string key = state_pfx + "county:" + cfp + ":" + t.progress_table;
+				if (IsProgressDone(conn, data_loc, key)) {
+					out.push_back({std::string(t.section) + ":" + cfp + ":skipped", 0});
+					continue;
+				}
+				if (dir.empty()) {
+					dir = ResolveCountyDir(context, fs, bind, fips, cfp, work_dir);
+				}
+				auto sql = RenderTemplate(
+				    ExtractSection(tmpl, t.section),
+				    {{"@TIGER@", data_loc},
+				     {"@FUNC@", func_loc},
+				     {"@STATEFP@", fips},
+				     {"@COUNTYFP@", cfp},
+				     {"@F51@", fs.JoinPath(dir, "TGR" + ssccc + ".F51")},
+				     {"@F52@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F52", work_dir)},
+				     {"@F54@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F54", work_dir)},
+				     {"@F55@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F55", work_dir)},
+				     {"@F56@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F56", work_dir)},
+				     {"@F5A@", fs.JoinPath(dir, "TGR" + ssccc + ".F5A")},
+				     {"@F5I@", fs.JoinPath(dir, "TGR" + ssccc + ".F5I")}});
+				int64_t rows = ExecuteInsert(conn, sql, std::string(t.section) + ":" + cfp);
+				out.push_back({std::string(t.section) + ":" + cfp, rows});
+				MarkProgressDone(conn, data_loc, key);
+			}
+		}
+	} catch (...) {
+		cleanup.Disarm();
+		throw;
+	}
+}
+
+static void Load1992Execute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<Loader1992BindData>();
+	auto &gstate = data_p.global_state->Cast<Loader1992GlobalState>();
+
+	if (!gstate.ran) {
+		gstate.ran = true;
+		for (size_t i = 0; i < bind.states.size(); ++i) {
+			const auto &st = bind.states[i];
+			char counter[64];
+			snprintf(counter, sizeof(counter), "(%zu/%zu)", i + 1, bind.states.size());
+			fprintf(stderr, "[us_geocoder 1992 %s] begin %s\n", st.abbrev.c_str(), counter);
+			fflush(stderr);
+			auto t0 = std::chrono::steady_clock::now();
+			gstate.results.push_back({"begin:" + st.abbrev, 0});
+			DoLoadState1992(context, bind, st, gstate.results);
+			gstate.results.push_back({"done:" + st.abbrev, 0});
+			auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+			fprintf(stderr, "[us_geocoder 1992 %s] done %s in %.1fs\n", st.abbrev.c_str(), counter, secs);
+			fflush(stderr);
+		}
+		RunAnalyzeOnTigerTables(context, bind.DataLoc(), gstate.results);
+	}
+
+	EmitLoaderResults(gstate, output);
+}
+
+// =====================================================================
+// load_tiger_1992_state / _states / _all_states — bind
+// =====================================================================
+
+static unique_ptr<FunctionData> Load1992StateBind(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("step");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("rows_loaded");
+
+	if (input.inputs.empty() || input.inputs[0].IsNull()) {
+		throw BinderException("load_tiger_1992_state: state_abbrev is required");
+	}
+	auto bind_data = make_uniq<Loader1992BindData>();
+	auto abbrevs = AbbrevsFromValue(input.inputs[0], "load_tiger_1992_state");
+	Apply1992Params(*bind_data, input, /*source_input_index=*/1);
+	Connection conn(*context.db);
+	ResolveStates1992(conn, *bind_data, abbrevs);
+	return std::move(bind_data);
+}
+
+static unique_ptr<FunctionData> Load1992StatesBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("step");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("rows_loaded");
+
+	if (input.inputs.empty() || input.inputs[0].IsNull()) {
+		throw BinderException("load_tiger_1992_states: states (VARCHAR[]) is required");
+	}
+	auto bind_data = make_uniq<Loader1992BindData>();
+	auto abbrevs = AbbrevsFromValue(input.inputs[0], "load_tiger_1992_states");
+	Apply1992Params(*bind_data, input, /*source_input_index=*/1);
+	Connection conn(*context.db);
+	ResolveStates1992(conn, *bind_data, abbrevs);
+	return std::move(bind_data);
+}
+
+static unique_ptr<FunctionData> Load1992AllStatesBind(ClientContext &context, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types, vector<string> &names) {
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("step");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("rows_loaded");
+
+	auto bind_data = make_uniq<Loader1992BindData>();
+	Apply1992Params(*bind_data, input, /*source_input_index=*/0);
+
+	// Same enumeration the modern load_tiger_all_states uses: 50 states + DC
+	// (FIPS 01-56, with gaps) from the local state_lookup.
+	Connection conn(*context.db);
+	auto result = conn.Query("SELECT abbrev, statefp FROM tiger.state_lookup "
+	                         "WHERE statefp::INT BETWEEN 1 AND 56 ORDER BY statefp");
+	if (result->HasError()) {
+		throw IOException("us_geocoder load_tiger_1992_all_states: %s", result->GetError());
+	}
+	while (auto row = result->Fetch()) {
+		for (idx_t i = 0; i < row->size(); ++i) {
+			auto abbrev_v = row->GetValue(0, i);
+			auto fips_v = row->GetValue(1, i);
+			if (!abbrev_v.IsNull() && !fips_v.IsNull()) {
+				bind_data->states.push_back({abbrev_v.GetValue<std::string>(), fips_v.GetValue<std::string>()});
+			}
+		}
+	}
+	if (bind_data->states.empty()) {
+		throw BinderException("us_geocoder: no state abbreviations provided");
+	}
+	return std::move(bind_data);
+}
+
+// =====================================================================
+// unload_tiger_1992_state(state_abbrev VARCHAR | VARCHAR[],
+//                        target_db := NULL, target_schema := 'tiger')
+// =====================================================================
+
+static unique_ptr<FunctionData> Unload1992Bind(ClientContext &context, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names) {
+	return_types.emplace_back(LogicalType::VARCHAR);
+	names.emplace_back("step");
+	return_types.emplace_back(LogicalType::BIGINT);
+	names.emplace_back("rows_loaded");
+	if (input.inputs.empty() || input.inputs[0].IsNull()) {
+		throw BinderException("unload_tiger_1992_state: state abbrev is required");
+	}
+	auto bind_data = make_uniq<Loader1992BindData>();
+	auto abbrevs = AbbrevsFromValue(input.inputs[0], "unload_tiger_1992_state");
+	ApplyTargetParams1992(*bind_data, input);
+	Connection conn(*context.db);
+	ResolveStates1992(conn, *bind_data, abbrevs);
+	bind_data->unload = true;
+	return std::move(bind_data);
+}
+
+static void Unload1992Execute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<Loader1992BindData>();
+	auto &gstate = data_p.global_state->Cast<Loader1992GlobalState>();
+	if (!gstate.ran) {
+		gstate.ran = true;
+		Connection conn(*context.db);
+		const std::string data_loc = bind.DataLoc();
+		const std::string func_loc = bind.FuncLoc();
+		BootstrapTargetSchema(conn, data_loc, func_loc);
+		const auto &tmpl = LoaderTemplatesSql();
+		auto unload_template = ExtractSection(tmpl, "unload_state");
+		for (const auto &state : bind.states) {
+			StepTimer t(state.abbrev, "unload_1992_state");
+			auto rendered = RenderTemplate(unload_template,
+			                               {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", state.fips}});
+			auto result = conn.Query(rendered);
+			if (result->HasError()) {
+				throw IOException("us_geocoder unload_tiger_1992_state(%s): %s", state.abbrev, result->GetError());
+			}
+			// 1992 writes its own county + state rows per-state (unlike the
+			// modern nation-level load_tiger_nation path), so the shared
+			// unload_state template's coverage of the other 11 tables needs
+			// two extra per-state deletes here.
+			auto del_county = conn.Query("DELETE FROM " + data_loc + ".county WHERE statefp = '" + state.fips + "'");
+			if (del_county->HasError()) {
+				throw IOException("us_geocoder unload_tiger_1992_state(%s): %s", state.abbrev,
+				                  del_county->GetError());
+			}
+			auto del_state = conn.Query("DELETE FROM " + data_loc + ".state WHERE statefp = '" + state.fips + "'");
+			if (del_state->HasError()) {
+				throw IOException("us_geocoder unload_tiger_1992_state(%s): %s", state.abbrev, del_state->GetError());
+			}
+			DeleteProgressLike(conn, data_loc, "tiger1992:state:" + state.fips + ":");
+			gstate.results.push_back({"unload:" + state.abbrev, 0});
+			t.Done(0);
+		}
+	}
+	EmitLoaderResults(gstate, output);
+}
+
+// =====================================================================
+// Registration
+// =====================================================================
+
+static void Add1992NamedParams(TableFunction &fn) {
+	fn.named_parameters["source"] = LogicalType::VARCHAR;
+	fn.named_parameters["target_db"] = LogicalType::VARCHAR;
+	fn.named_parameters["target_schema"] = LogicalType::VARCHAR;
+	fn.named_parameters["build_containment"] = LogicalType::BOOLEAN;
+	fn.named_parameters["parallel"] = LogicalType::BOOLEAN;
+	fn.named_parameters["temp_dir"] = LogicalType::VARCHAR;
+	fn.named_parameters["parallel_workers"] = LogicalType::INTEGER;
+}
+
+void RegisterLoader1992Functions(ExtensionLoader &loader, const std::string &) {
+	const auto list_vc = LogicalType::LIST(LogicalType::VARCHAR);
+
+	TableFunction st1("load_tiger_1992_state", {LogicalType::VARCHAR}, Load1992Execute, Load1992StateBind,
+	                  Loader1992GlobalState::Init);
+	Add1992NamedParams(st1);
+	loader.RegisterFunction(st1);
+
+	TableFunction st2("load_tiger_1992_state", {LogicalType::VARCHAR, LogicalType::VARCHAR}, Load1992Execute,
+	                  Load1992StateBind, Loader1992GlobalState::Init);
+	Add1992NamedParams(st2);
+	loader.RegisterFunction(st2);
+
+	TableFunction sts1("load_tiger_1992_states", {list_vc}, Load1992Execute, Load1992StatesBind,
+	                   Loader1992GlobalState::Init);
+	Add1992NamedParams(sts1);
+	loader.RegisterFunction(sts1);
+
+	TableFunction sts2("load_tiger_1992_states", {list_vc, LogicalType::VARCHAR}, Load1992Execute,
+	                   Load1992StatesBind, Loader1992GlobalState::Init);
+	Add1992NamedParams(sts2);
+	loader.RegisterFunction(sts2);
+
+	TableFunction all0("load_tiger_1992_all_states", {}, Load1992Execute, Load1992AllStatesBind,
+	                   Loader1992GlobalState::Init);
+	Add1992NamedParams(all0);
+	loader.RegisterFunction(all0);
+
+	TableFunction all1("load_tiger_1992_all_states", {LogicalType::VARCHAR}, Load1992Execute,
+	                   Load1992AllStatesBind, Loader1992GlobalState::Init);
+	Add1992NamedParams(all1);
+	loader.RegisterFunction(all1);
+
+	TableFunction ul1("unload_tiger_1992_state", {LogicalType::VARCHAR}, Unload1992Execute, Unload1992Bind,
+	                  Loader1992GlobalState::Init);
+	ul1.named_parameters["target_db"] = LogicalType::VARCHAR;
+	ul1.named_parameters["target_schema"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(ul1);
+
+	TableFunction ul2("unload_tiger_1992_state", {list_vc}, Unload1992Execute, Unload1992Bind,
+	                  Loader1992GlobalState::Init);
+	ul2.named_parameters["target_db"] = LogicalType::VARCHAR;
+	ul2.named_parameters["target_schema"] = LogicalType::VARCHAR;
+	loader.RegisterFunction(ul2);
+}
+
+} // namespace us_geocoder
+} // namespace duckdb

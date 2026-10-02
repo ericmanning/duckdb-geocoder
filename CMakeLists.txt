@@ -227,6 +227,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/miniz)
 set(EXTENSION_SOURCES
     src/us_geocoder_extension.cpp
     src/loader.cpp
+    src/loader_1992.cpp
     src/parallel_download.cpp
     src/zip_extract.cpp
     src/geocode_batch.cpp)

@@ -1,0 +1,172 @@
+# name: test/sql/tiger1992_load.test
+# description: load_tiger_1992_state ingests a local extracted fixture tree
+# group: [sql]
+
+require us_geocoder
+
+require-env TIGER_TEST_EXTENSIONS
+
+statement ok
+LOAD spatial;
+
+# Use NJ (34) and point at a clean fixture tree whose only county is 999.
+#
+# Deviation from the task brief's literal `source := 'test/data/tiger1992'`:
+# that directory's state-34 folder also holds `34998.zip` (a committed
+# fixture from the zip-extraction task, tiger1992_zip.test) which is
+# shaped exactly like a real per-county 1992 zip ("<ss><ccc>.zip") and so
+# is legitimately picked up by ListCounties1992's directory scan as a
+# second county. It only contains TGR34998.F51 + .F5I (no .F5A), so
+# loading it throws on the county_faces step. `main92/` is a byte-exact
+# `cp` of the committed county-999 fixture (verified via `cmp`), nested
+# under test/data/tiger1992/ so it inherits that tree's .gitattributes
+# (`* -text`) automatically; no existing committed file was changed.
+statement ok
+CALL load_tiger_1992_state('NJ', source := 'test/data/tiger1992/main92',
+                           build_containment := false);
+
+query II
+SELECT statefp, countyfp FROM tiger.edges GROUP BY 1,2 ORDER BY 1,2;
+----
+34	999
+
+query IIII
+SELECT tlid, fullname, zipl, zipr FROM tiger.edges ORDER BY tlid;
+----
+9001	Fixture Road	07825	07825
+9002	Second Ave	07825	07825
+
+# Geometry: chain 9001 has from-node + 1 shape point + to-node = 3 points.
+query II
+SELECT tlid, ST_NPoints(the_geom) FROM tiger.edges ORDER BY tlid;
+----
+9001	3
+9002	2
+
+# mtfcc maps A41 -> S1400 so the macros' LIKE 'S%' filter passes.
+query I
+SELECT DISTINCT mtfcc FROM tiger.edges;
+----
+S1400
+
+# Node IDs: 9001's to-node and 9002's from-node are the same coordinate.
+query I
+SELECT count(*) FROM tiger.edges a JOIN tiger.edges b ON a.tnidt = b.tnidf
+WHERE a.tlid = 9001 AND b.tlid = 9002;
+----
+1
+
+# faces attributes, no geometry.
+query IIIII
+SELECT tfid, placefp, cousubfp, tractce20, blockce20 FROM tiger.faces ORDER BY tfid;
+----
+349990000000001	54321	12345	012345	1001
+349990000000002	54321	12345	012345	1002
+
+query I
+SELECT count(*) FROM tiger.faces WHERE the_geom IS NOT NULL;
+----
+0
+
+# featnames: 2 primary + 1 alternate, all six precomputed columns populated.
+query I
+SELECT count(*) FROM tiger.featnames;
+----
+3
+
+query IIIII
+SELECT name, fullname, name_lower, name_first_5, suftypabrv
+FROM tiger.featnames ORDER BY name;
+----
+Fixture	Fixture Road	fixture	fixtu	Road
+Old Fixture	Old Fixture Rd	old fixture	old f	Rd
+Second	Second Ave	second	secon	Ave
+
+query I
+SELECT count(*) FROM tiger.featnames
+WHERE name_soundex IS NULL OR fullname_norm IS NULL OR fullname_first_5 IS NULL;
+----
+0
+
+query I
+SELECT count(*) FROM tiger.featnames WHERE pretypabrv IS NOT NULL OR prequalabr IS NOT NULL;
+----
+0
+
+# addr: RT1 gives 4 ranges, RT6 adds 2 more on chain 9002.
+query IIII
+SELECT tlid, fromhn, tohn, side FROM tiger.addr ORDER BY tlid, side, fromhn;
+----
+9001	1	99	L
+9001	2	98	R
+9002	100	198	L
+9002	200	298	L
+9002	101	199	R
+9002	201	299	R
+
+query I
+SELECT DISTINCT zip FROM tiger.addr;
+----
+07825
+
+# Names from the NAM file, suffixes stripped.
+query II
+SELECT statefp, name FROM tiger.state;
+----
+34	New Jersey
+
+query II
+SELECT cntyidfp, name FROM tiger.county;
+----
+34999	Fixture
+
+query II
+SELECT plcidfp, name FROM tiger.place;
+----
+3454321	Fixture
+
+query II
+SELECT cosbidfp, name FROM tiger.cousub;
+----
+3499912345	Fixture
+
+# Review Focus 4: an unknown state abbreviation errors clearly.
+statement error
+CALL load_tiger_1992_state('ZZ', source := 'test/data/tiger1992/main92');
+----
+ZZ
+
+# Re-running is a no-op: per-county progress is already marked done.
+statement ok
+CALL load_tiger_1992_state('NJ', source := 'test/data/tiger1992/main92',
+                           build_containment := false);
+
+query I
+SELECT count(*) FROM tiger.edges;
+----
+2
+
+# Review Focus 1: a county with no RT4/RT5/RT6 (or RT2) files still loads.
+#
+# Deviation from the task brief's literal Step-12 construction: it builds
+# the fixture via `COPY (SELECT line FROM read_csv(...)) TO ... (FORMAT
+# CSV, QUOTE '')`. Verified empirically that this mangles the fixed-width
+# content exactly as this tree's own .gitattributes comment warns about —
+# TGR34999.F51 round-trips at 458 bytes instead of 460 (the writer drops
+# each record's trailing \r). The brief names this as an expected failure
+# mode and states the fallback: a second committed fixture county. `sparse92/`
+# is that fallback — county 34997 holds byte-exact `cp` copies (verified via
+# `cmp`) of the 34999 fixture's F51/F5A/F5I only (F52/F54/F55/F56 omitted),
+# nested under test/data/tiger1992/ so it inherits the tree's .gitattributes;
+# no existing committed file was changed.
+statement ok
+CALL unload_tiger_1992_state('NJ');
+
+statement ok
+CALL load_tiger_1992_state('NJ', source := 'test/data/tiger1992/sparse92', build_containment := false);
+
+# No RT6 -> only RT1's 4 ranges. No RT4/RT5 -> only the 2 primary names.
+query II
+SELECT (SELECT count(*) FROM tiger.addr), (SELECT count(*) FROM tiger.featnames);
+----
+4	2
