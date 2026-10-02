@@ -153,9 +153,11 @@ from the host process at `dlopen` — **headers only, no extra linkage, and we d
 compile `miniz.cpp` ourselves** (that would duplicate code and risk a different set of
 `MINIZ_*` defines than DuckDB built with). Note miniz is wrapped in
 **`namespace duckdb_miniz`**, so every call must be qualified, exactly as DuckDB's own
-`miniz_wrapper.hpp` does. That is sufficient and preferable — all I/O goes
-through DuckDB's `FileSystem`, which keeps Windows behaviour consistent with the rest of
-the loader.
+`miniz_wrapper.hpp` does.
+
+Losing the stdio variants costs nothing and is in fact preferable: all I/O goes through
+DuckDB's `FileSystem`, which keeps Windows behaviour consistent with the rest of the
+loader.
 
 ```
 read whole zip via FileSystem            ->  buffer
