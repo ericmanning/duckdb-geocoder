@@ -61,6 +61,47 @@ across TIGER vintages, so 1992 semantics are not self-evident from the schema.
 **Do not re-derive this.** If a future reader wonders whether GDAL can shortcut the parse:
 it can, and we are choosing not to.
 
+## API surface
+
+Four new table functions, registered by a new `RegisterLoader1992Functions(ExtensionLoader &,
+const std::string &tiger_schema)` called from `LoadInternal` alongside the existing
+`RegisterLoaderFunctions`:
+
+```
+load_tiger_1992_state(state_abbrev VARCHAR [, source VARCHAR], ...)
+load_tiger_1992_states(states VARCHAR[] [, source VARCHAR], ...)
+load_tiger_1992_all_states([source VARCHAR], ...)
+unload_tiger_1992_state(state_abbrev VARCHAR | VARCHAR[], ...)
+```
+
+Each load function is registered in both the with- and without-`source` arities, matching
+the modern loader's overload pattern.
+
+Named parameters, matching the modern `AddLoaderNamedParams` set **minus `year`** (which is
+pinned to 1992):
+
+`source`, `target_db`, `target_schema`, `build_containment`, `parallel`, `temp_dir`,
+`parallel_workers`.
+
+Note the parameter is `target_schema`, not `schema`.
+
+`source` defaults to `https://www2.census.gov/geo/tiger/TIGER1992`.
+
+`unload_tiger_1992_state` takes only `target_db` and `target_schema`, mirroring
+`unload_tiger_state`.
+
+There is **no** public per-county function. Per-county *restart* comes free from the
+progress ledger, exactly as in the modern path.
+
+One additional utility function, needed so the extraction layer is independently testable
+and useful to anyone pre-extracting a local mirror:
+
+```
+us_geocoder_unzip(zip_path VARCHAR, dest_dir VARCHAR) -> TABLE(entry VARCHAR, bytes BIGINT)
+```
+
+It extracts every entry of `zip_path` into `dest_dir` and returns one row per entry.
+
 ## Architecture
 
 ```
@@ -287,7 +328,7 @@ a database loaded before the progress ledger existed can hold rows with no keys;
 key-only check would wave it through.
 
 Error text names the offending state and points at the remedy: use a separate `target_db`
-or `schema`, or unload first.
+or `target_schema`, or unload first.
 
 `unload_tiger_1992_state(abbrev)` reuses the modern `unload_state` DELETE list unchanged
 (11 statements, covering every per-state table including `edge_containment`) and clears
@@ -297,7 +338,7 @@ per-state, so unload additionally deletes the state's `county` rows and its own 
 row.
 
 Side-by-side use of both vintages remains available through the existing `target_db` /
-`schema` parameters plus `set_tiger_reference`.
+`target_schema` parameters plus `set_tiger_reference`.
 
 This guard is the **only** change to the modern loader path.
 
@@ -397,6 +438,20 @@ written, loading 1992 data into the real `tiger` schema and geocoding against it
   returned 0 rows; `reverse_geocode` returned 0 rows.
 - `read_csv` cannot read inside a zip (`zip://` and `/vsizip/` both fail — `/vsizip/` is a
   GDAL VSI path usable only by `ST_Read`), which is why extraction is required.
+
+Additional facts established while planning, each of which removes a feared failure mode:
+
+- **No TLID duplication across county files.** Warren (`34041`) and adjacent Sussex
+  (`34037`) share **zero** TLIDs out of 14,460 and 19,236 records. Census splits complete
+  chains at county boundaries, so each chain belongs to exactly one county file. **No
+  dedupe step is needed**, and `(statefp, tlid)` stays unique across a state load.
+- **Signed coordinate fields cast directly.** `'+40996043'::BIGINT` → `40996043` and
+  `' -74960022'::BIGINT` → `-74960022`. DuckDB accepts both the leading `+` that TIGER
+  writes on latitudes and the leading spaces from right-justified fields, so no
+  sign-stripping is required.
+- **Empty fixed-width files are safe.** `read_csv` over a zero-byte file returns 0 rows
+  rather than erroring, which matters because some record types are absent or empty for
+  some counties.
 
 ## Risks
 
