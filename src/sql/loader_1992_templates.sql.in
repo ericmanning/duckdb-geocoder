@@ -80,12 +80,7 @@ SELECT '@STATEFP@', '@COUNTYFP@', r.tlid, i.tfidl, i.tfidr,
        -- across county files (geocode_intersection joins across them).
        (r.frlong + 180000000) * 1000000000 + (r.frlat + 90000000),
        (r.tolong + 180000000) * 1000000000 + (r.tolat + 90000000),
-       CASE WHEN r.cfcc LIKE 'A1%' THEN 'S1100'
-            WHEN r.cfcc LIKE 'A2%' THEN 'S1200'
-            WHEN r.cfcc LIKE 'A3%' OR r.cfcc LIKE 'A4%' THEN 'S1400'
-            WHEN r.cfcc LIKE 'A5%' OR r.cfcc LIKE 'A6%' OR r.cfcc LIKE 'A7%' THEN 'S1500'
-            WHEN r.cfcc LIKE 'A%'  THEN 'S1400'
-            ELSE 'X' || r.cfcc END,
+       @FUNC@.cfcc_to_mtfcc(r.cfcc),
        nullif(trim(concat_ws(' ', r.fedirp, r.fename, r.fetype, r.fedirs)), ''),
        g.the_geom, r.zipl, r.zipr
 FROM rt1 r
@@ -137,7 +132,7 @@ rt4 AS (
           FROM read_csv('@F54@', columns={'line':'VARCHAR'}, delim='\x1f',
                         header=false, quote='', escape='')) s,
          generate_series(1,5) g(i)
-    WHERE length(s.line) >= 26
+    WHERE length(s.line) >= 58
       AND nullif(trim(substr(s.line, 19 + (g.i-1)*8, 8)),'') IS NOT NULL
 ),
 rt5 AS (
@@ -149,7 +144,7 @@ rt5 AS (
     FROM (SELECT rtrim(line, chr(13)) AS line
           FROM read_csv('@F55@', columns={'line':'VARCHAR'}, delim='\x1f',
                         header=false, quote='', escape=''))
-    WHERE length(line) >= 46
+    WHERE length(line) >= 52
 ),
 named AS (
     SELECT tlid, fename AS name, fedirp, fetype, fedirs, cfcc
@@ -166,12 +161,7 @@ built AS (
 )
 SELECT '@STATEFP@', '@COUNTYFP@', tlid, name, fn,
        fedirp, NULL, NULL, fetype, fedirs,
-       CASE WHEN cfcc LIKE 'A1%' THEN 'S1100'
-            WHEN cfcc LIKE 'A2%' THEN 'S1200'
-            WHEN cfcc LIKE 'A3%' OR cfcc LIKE 'A4%' THEN 'S1400'
-            WHEN cfcc LIKE 'A5%' OR cfcc LIKE 'A6%' OR cfcc LIKE 'A7%' THEN 'S1500'
-            WHEN cfcc LIKE 'A%'  THEN 'S1400'
-            ELSE 'X' || cfcc END,
+       @FUNC@.cfcc_to_mtfcc(cfcc),
        lower(name),
        @FUNC@.normalize_street_name(fn),
        soundex(name),

@@ -35,13 +35,7 @@ SELECT DISTINCT nullif(trim(substr(line,107,5)),'') FROM src WHERE length(line) 
 
 # ---- CFCC -> MTFCC map ---------------------------------------------------
 query II
-SELECT cfcc, CASE
-         WHEN cfcc LIKE 'A1%' THEN 'S1100'
-         WHEN cfcc LIKE 'A2%' THEN 'S1200'
-         WHEN cfcc LIKE 'A3%' OR cfcc LIKE 'A4%' THEN 'S1400'
-         WHEN cfcc LIKE 'A5%' OR cfcc LIKE 'A6%' OR cfcc LIKE 'A7%' THEN 'S1500'
-         WHEN cfcc LIKE 'A%' THEN 'S1400'
-         ELSE 'X' || cfcc END AS mtfcc
+SELECT cfcc, tiger.cfcc_to_mtfcc(cfcc) AS mtfcc
 FROM (VALUES ('A11'),('A21'),('A31'),('A41'),('A51'),('A63'),('A74'),('A00'),('H01'),('B11')) v(cfcc)
 ORDER BY cfcc;
 ----
