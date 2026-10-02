@@ -35,3 +35,27 @@ ORDER BY entry;
 ----
 TGR34998.F51	460
 TGR34998.F5I	108
+
+# Resource-leak-on-write-failure regression: an entry's output path that
+# collides with an existing directory must make fs.OpenFile throw (not
+# crash, not hang) partway through the loop, after
+# mz_zip_reader_extract_to_heap has already handed back a heap buffer for
+# that entry. sqllogictest has no leak detector, but a missed
+# mz_free/mz_zip_reader_end on this path would show up as a crash or a
+# double-free, which the test harness itself would surface.
+#
+# Step A: make __TEST_DIR__/TGR34998.F51 itself a *directory*, by
+# extracting the fixture zip with that path as the destination.
+# __TEST_DIR__ already exists (the harness creates it), so this is a
+# single-level mkdir -- no bootstrapping needed. Its contents (the same
+# two entries, one level deeper) are irrelevant scaffolding.
+statement ok
+SELECT * FROM us_geocoder_unzip('test/data/tiger1992/34/34998.zip', '__TEST_DIR__/TGR34998.F51');
+
+# Step B: re-extracting straight into __TEST_DIR__ now tries to open
+# __TEST_DIR__/TGR34998.F51 -- a directory, from step A -- for writing,
+# and must throw cleanly rather than leak or crash.
+statement error
+SELECT * FROM us_geocoder_unzip('test/data/tiger1992/34/34998.zip', '__TEST_DIR__');
+----
+Cannot open file
