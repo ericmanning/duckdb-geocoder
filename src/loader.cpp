@@ -157,35 +157,11 @@ struct LoaderGlobalState : public GlobalTableFunctionState {
 	}
 };
 
-// Drain `gstate.results` into `output` a vector-size chunk at a time.
-// Shared by every loader execute function; DuckDB re-invokes the execute
-// callback until SetCardinality(0).
-//
-// Historical note: this used to be `EmitLoaderResults(gstate, output);`
-// (recursive self-call). On macOS/Linux clang at -O2 silently optimized
-// that to a `ret` since the body had no side effects, so every CALL
-// load_tiger_* returned `0 rows` with no one noticing. On Windows MSVC
-// the optimizer kept the loop and the function hung after analyze
-// completed — fix applied May 2026.
-template <typename State>
-static void EmitLoaderResults(State &gstate, DataChunk &output) {
-	const idx_t total = gstate.results.size();
-	if (gstate.row_idx >= total) {
-		output.SetCardinality(0);
-		return;
-	}
-	const idx_t avail = total - gstate.row_idx;
-	const idx_t n = std::min<idx_t>(STANDARD_VECTOR_SIZE, avail);
-	auto step_data = FlatVector::GetData<string_t>(output.data[0]);
-	auto rows_data = FlatVector::GetData<int64_t>(output.data[1]);
-	for (idx_t i = 0; i < n; ++i) {
-		auto &r = gstate.results[gstate.row_idx + i];
-		step_data[i] = StringVector::AddString(output.data[0], r.step);
-		rows_data[i] = r.rows;
-	}
-	gstate.row_idx += n;
-	output.SetCardinality(n);
-}
+// EmitLoaderResults moved to us_geocoder_loader_internal.hpp (shared with
+// loader_1992.cpp) — it's a template, so it must be defined in a header to
+// be instantiable from another translation unit. Pure move, not a
+// reimplementation: see that header for the May-2026 infinite-recursion
+// fix this carries.
 
 // =====================================================================
 // Helpers
@@ -350,14 +326,18 @@ static void ApplyTargetParams(LoaderBindData &bind, const TableFunctionBindInput
 // Renders tiger_schema.sql.in with @TIGER@ → data_location. Idempotent: all
 // statements are CREATE TABLE/SCHEMA IF NOT EXISTS. This makes the loader
 // self-sufficient even when writing to a freshly-attached empty DB.
-static void BootstrapTargetSchema(Connection &conn, const LoaderBindData &bind) {
-	if (bind.data_location == bind.func_schema) {
+//
+// De-static'd + narrowed to plain strings: declared in
+// us_geocoder_loader_internal.hpp so loader_1992.cpp can call it without
+// depending on LoaderBindData (private to this file).
+void BootstrapTargetSchema(Connection &conn, const std::string &data_location, const std::string &func_schema) {
+	if (data_location == func_schema) {
 		return; // default "tiger" location; already created by LoadInternal.
 	}
-	auto rendered = ApplySubstitutions(TigerSchemaSql(), {{"@TIGER@", bind.data_location}});
+	auto rendered = ApplySubstitutions(TigerSchemaSql(), {{"@TIGER@", data_location}});
 	auto result = conn.Query(rendered);
 	if (result->HasError()) {
-		throw IOException("us_geocoder loader (bootstrap %s): %s", bind.data_location, result->GetError());
+		throw IOException("us_geocoder loader (bootstrap %s): %s", data_location, result->GetError());
 	}
 }
 
@@ -619,14 +599,18 @@ std::string LookupStateFips(Connection &conn, const std::string &schema, const s
 // shaves another ~37% off geocode wall-clock once stats are populated.
 // Called once at the end of every loader entry point — running per-state
 // would just re-do the same work N times.
-static void RunAnalyzeOnTigerTables(ClientContext &context, const LoaderBindData &bind,
-                                    std::vector<LoaderResult> &out) {
+//
+// De-static'd + narrowed to a plain string: declared in
+// us_geocoder_loader_internal.hpp so loader_1992.cpp can call it without
+// depending on LoaderBindData (private to this file).
+void RunAnalyzeOnTigerTables(ClientContext &context, const std::string &data_location,
+                             std::vector<LoaderResult> &out) {
 	static const char *const kAnalyzeTables[] = {
 	    "state",           "county", "place", "cousub",    "zcta5", "zip_state",        "zip_state_loc",
 	    "zip_lookup_base", "edges",  "faces", "featnames", "addr",  "edge_containment",
 	};
 	Connection conn(*context.db);
-	const auto &data_loc = bind.data_location;
+	const auto &data_loc = data_location;
 	auto t0 = std::chrono::steady_clock::now();
 	fprintf(stderr, "[us_geocoder] analyze: refreshing planner stats on %s.*\n", data_loc.c_str());
 	fflush(stderr);
@@ -772,7 +756,7 @@ static void DoLoadNation(ClientContext &context, const LoaderBindData &bind, std
 static void DoLoadNationImpl(ClientContext &context, const LoaderBindData &bind, std::vector<LoaderResult> &out) {
 	EnsureHttpfsIfRemote(*context.db, bind.source);
 	Connection conn(*context.db);
-	BootstrapTargetSchema(conn, bind);
+	BootstrapTargetSchema(conn, bind.data_location, bind.func_schema);
 	const auto &data_loc = bind.data_location;
 	const auto &func_loc = bind.func_schema;
 	const std::string year = std::to_string(bind.year);
@@ -826,7 +810,7 @@ static void LoadTigerNationExecute(ClientContext &context, TableFunctionInput &d
 	if (!gstate.executed) {
 		gstate.executed = true;
 		DoLoadNation(context, bind, gstate.results);
-		RunAnalyzeOnTigerTables(context, bind, gstate.results);
+		RunAnalyzeOnTigerTables(context, bind.data_location, gstate.results);
 	}
 
 	EmitLoaderResults(gstate, output);
@@ -999,7 +983,7 @@ static void UnloadTigerStateExecute(ClientContext &context, TableFunctionInput &
 	if (!gstate.executed) {
 		gstate.executed = true;
 		Connection conn(*context.db);
-		BootstrapTargetSchema(conn, bind);
+		BootstrapTargetSchema(conn, bind.data_location, bind.func_schema);
 		const auto &data_loc = bind.data_location;
 		const auto &func_loc = bind.func_schema;
 		const auto &tmpl = LoaderTemplatesSql();
@@ -1160,7 +1144,7 @@ static void DoLoadStateImpl(ClientContext &context, const LoaderBindData &bind, 
                             std::vector<LoaderResult> &out) {
 	EnsureHttpfsIfRemote(*context.db, bind.source);
 	Connection conn(*context.db);
-	BootstrapTargetSchema(conn, bind);
+	BootstrapTargetSchema(conn, bind.data_location, bind.func_schema);
 	const auto &data_loc = bind.data_location;
 	const auto &func_loc = bind.func_schema;
 	const std::string &fips = state.fips;
@@ -1397,7 +1381,7 @@ static void LoadTigerStateExecute(ClientContext &context, TableFunctionInput &da
 			fprintf(stderr, "[us_geocoder %s] done %s in %.1fs\n", st.abbrev.c_str(), counter, secs);
 			fflush(stderr);
 		}
-		RunAnalyzeOnTigerTables(context, bind, gstate.results);
+		RunAnalyzeOnTigerTables(context, bind.data_location, gstate.results);
 	}
 
 	EmitLoaderResults(gstate, output);

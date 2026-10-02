@@ -20,6 +20,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "us_geocoder_parallel_download.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -73,6 +74,45 @@ struct StepTimer {
 		// path (where exceptions are an expected outcome).
 	}
 };
+
+// =====================================================================
+// Result emission
+// =====================================================================
+
+// Drain `gstate.results` into `output` a vector-size chunk at a time.
+// Shared by every loader execute function (modern and 1992); DuckDB
+// re-invokes the execute callback until SetCardinality(0).
+//
+// Historical note: this used to be `EmitLoaderResults(gstate, output);`
+// (recursive self-call). On macOS/Linux clang at -O2 silently optimized
+// that to a `ret` since the body had no side effects, so every CALL
+// load_tiger_* returned `0 rows` with no one noticing. On Windows MSVC
+// the optimizer kept the loop and the function hung after analyze
+// completed — fix applied May 2026.
+//
+// Defined (not just declared) here, not `static`: `State` makes this a
+// template, so it must live in a header — with external linkage — to be
+// instantiable from another translation unit (loader_1992.cpp). Moved
+// (not reimplemented) from loader.cpp so this fix can't regress.
+template <typename State>
+void EmitLoaderResults(State &gstate, DataChunk &output) {
+	const idx_t total = gstate.results.size();
+	if (gstate.row_idx >= total) {
+		output.SetCardinality(0);
+		return;
+	}
+	const idx_t avail = total - gstate.row_idx;
+	const idx_t n = std::min<idx_t>(STANDARD_VECTOR_SIZE, avail);
+	auto step_data = FlatVector::GetData<string_t>(output.data[0]);
+	auto rows_data = FlatVector::GetData<int64_t>(output.data[1]);
+	for (idx_t i = 0; i < n; ++i) {
+		auto &r = gstate.results[gstate.row_idx + i];
+		step_data[i] = StringVector::AddString(output.data[0], r.step);
+		rows_data[i] = r.rows;
+	}
+	gstate.row_idx += n;
+	output.SetCardinality(n);
+}
 
 // =====================================================================
 // Template extraction
@@ -147,6 +187,27 @@ int64_t RetryableExecuteInsert(Connection &conn, RenderFn render, const std::str
 bool IsProgressDone(Connection &conn, const std::string &data_loc, const std::string &section);
 void MarkProgressDone(Connection &conn, const std::string &data_loc, const std::string &section);
 void DeleteProgressLike(Connection &conn, const std::string &data_loc, const std::string &prefix);
+
+// =====================================================================
+// Bind-data-free bootstrap/analyze helpers
+// =====================================================================
+
+// Ensure the target catalog.schema has the 13 TIGER data tables (+ schema).
+// Renders tiger_schema.sql.in with @TIGER@ → data_location. Idempotent: all
+// statements are CREATE TABLE/SCHEMA IF NOT EXISTS. No-op when data_location
+// equals func_schema (the default "tiger" location, already created by
+// LoadInternal). De-static'd + signature narrowed to plain strings (was
+// `const LoaderBindData &`) so loader_1992.cpp can call it without
+// depending on LoaderBindData, which stays private to loader.cpp.
+void BootstrapTargetSchema(Connection &conn, const std::string &data_location, const std::string &func_schema);
+
+// Refresh DuckDB's per-table sample stats so the planner stops misestimating
+// joins through the wide tiger.* fan-outs. One ANALYZE pass over the 13 data
+// tables is cheap and shaves wall-clock off geocode queries once stats are
+// populated. De-static'd + signature narrowed to a plain string (was
+// `const LoaderBindData &`) so loader_1992.cpp can call it too.
+void RunAnalyzeOnTigerTables(ClientContext &context, const std::string &data_location,
+                             std::vector<LoaderResult> &out);
 
 // =====================================================================
 // Misc helpers
