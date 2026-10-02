@@ -2,6 +2,7 @@
 #include "us_geocoder_embed.hpp"
 #include "us_geocoder_embedded_sql.hpp"
 #include "us_geocoder_parallel_download.hpp"
+#include "us_geocoder_loader_internal.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -26,38 +27,17 @@ namespace us_geocoder {
 // Live progress logging. Writes to stderr (and flushes) so a long-running
 // CALL load_tiger_all_states() shows per-file progress as it runs, instead
 // of the whole result vector flooding out at the end.
-static void LogProgress(const std::string &prefix, const std::string &step, int64_t rows, double secs) {
+//
+// De-static'd: declared in us_geocoder_loader_internal.hpp because
+// StepTimer::Done() (moved to that header) calls it.
+void LogProgress(const std::string &prefix, const std::string &step, int64_t rows, double secs) {
 	fprintf(stderr, "[us_geocoder %s] %s: %lld rows (%.1fs)\n", prefix.c_str(), step.c_str(),
 	        static_cast<long long>(rows), secs);
 	fflush(stderr);
 }
 
-// RAII helper: time an ExecuteInsert call and log it on completion. Use as:
-//   { auto _t = StepTimer(prefix, step_label);
-//     int64_t rows = ExecuteInsert(...);
-//     out.push_back(...);
-//     _t.Done(rows); }
-struct StepTimer {
-	std::string prefix;
-	std::string step;
-	std::chrono::steady_clock::time_point t0;
-	bool done = false;
-	StepTimer(std::string p, std::string s)
-	    : prefix(std::move(p)), step(std::move(s)), t0(std::chrono::steady_clock::now()) {
-	}
-	void Done(int64_t rows) {
-		auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-		LogProgress(prefix, step, rows, secs);
-		done = true;
-	}
-	~StepTimer() {
-		// Intentionally silent on the failure path. The IOException thrown
-		// by ExecuteInsert already includes the step label (e.g. "us_geocoder
-		// loader (county_faces:019): IO Error..."), so a separate FAILED log
-		// here was redundant and noisy under sqllogictest's `statement error`
-		// path (where exceptions are an expected outcome).
-	}
-};
+// StepTimer moved to us_geocoder_loader_internal.hpp (shared with
+// loader_1992.cpp).
 
 // =====================================================================
 // Template extraction
@@ -66,7 +46,7 @@ struct StepTimer {
 // Extracts one section from loader_templates.sql.in. Sections are delimited
 // by "-- @SECTION:name@" lines. Returns the text between the marker and the
 // next "-- @SECTION:" marker (or EOF). Throws if the section is missing.
-static std::string ExtractSection(const std::string &all, const std::string &name) {
+std::string ExtractSection(const std::string &all, const std::string &name) {
 	const std::string marker = "-- @SECTION:" + name + "@";
 	auto start = all.find(marker);
 	if (start == std::string::npos) {
@@ -85,8 +65,8 @@ static std::string ExtractSection(const std::string &all, const std::string &nam
 	return all.substr(body_start, next - body_start);
 }
 
-static std::string RenderTemplate(const std::string &section,
-                                  const std::vector<std::pair<std::string, std::string>> &subs) {
+std::string RenderTemplate(const std::string &section,
+                           const std::vector<std::pair<std::string, std::string>> &subs) {
 	return ApplySubstitutions(section, subs);
 }
 
@@ -94,10 +74,8 @@ static std::string RenderTemplate(const std::string &section,
 // Bind data + global state
 // =====================================================================
 
-struct LoaderResult {
-	std::string step;
-	int64_t rows;
-};
+// LoaderResult moved to us_geocoder_loader_internal.hpp (shared with
+// loader_1992.cpp).
 
 struct LoaderBindData : public FunctionData {
 	explicit LoaderBindData(std::string func_schema) : func_schema(std::move(func_schema)) {
@@ -213,7 +191,7 @@ static void EmitLoaderResults(State &gstate, DataChunk &output) {
 // Helpers
 // =====================================================================
 
-static std::string ZeroPad(const std::string &s, size_t width) {
+std::string ZeroPad(const std::string &s, size_t width) {
 	if (s.size() >= width) {
 		return s;
 	}
@@ -225,7 +203,9 @@ static std::string ZeroPad(const std::string &s, size_t width) {
 // origin. Caught a real failure mode: tl_2025_02016_faces.zip had a 247-byte
 // "Request Rejected" HTML cached at the edge, served instead of the zip.
 // Cache-bust per-call sidesteps that without depending on edge eviction.
-static uint64_t MakeCacheBust() {
+// De-static'd: declared in us_geocoder_loader_internal.hpp because
+// RetryableExecuteInsert's template body (moved to that header) calls it.
+uint64_t MakeCacheBust() {
 	static std::atomic<uint64_t> counter {0};
 	auto now_ns = std::chrono::steady_clock::now().time_since_epoch().count();
 	auto bump = counter.fetch_add(1, std::memory_order_relaxed);
@@ -265,7 +245,7 @@ static std::string BuildVsiPath(const std::string &source, const std::string &su
 
 // Run one INSERT statement against a Connection, return the number of rows
 // inserted (or 0 if the statement didn't produce a row count). Throws on SQL error.
-static int64_t ExecuteInsert(Connection &conn, const std::string &sql, const std::string &step_label) {
+int64_t ExecuteInsert(Connection &conn, const std::string &sql, const std::string &step_label) {
 	auto result = conn.Query(sql);
 	if (result->HasError()) {
 		throw IOException("us_geocoder loader (%s): %s", step_label, result->GetError());
@@ -291,7 +271,7 @@ static int64_t ExecuteInsert(Connection &conn, const std::string &sql, const std
 // case-insensitively — error strings come from a mix of GDAL (paths use
 // lowercase "gdal/"), DuckDB ("HTTP"), and curl, and we don't want a
 // missed case to silently fail the whole load.
-static bool IsRetriableLoaderError(const std::string &msg) {
+bool IsRetriableLoaderError(const std::string &msg) {
 	static const char *const kHints[] = {
 	    "gdal",
 	    "/vsicurl/",
@@ -324,39 +304,14 @@ static bool IsRetriableLoaderError(const std::string &msg) {
 	return false;
 }
 
-// Wrap ExecuteInsert with retry. The Render callable is invoked once per
-// attempt with a cache-bust token: 0 on the first attempt (CDN cache OK),
-// fresh on every retry. The happy path keeps Cloudflare's edge cache; only
-// failures pay the cache-miss + retry cost. Without this gating, every
-// request hits origin and Census rate-limits us. Backoff: 2s, 5s, 15s;
-// non-network errors fail fast.
-template <typename RenderFn>
-static int64_t RetryableExecuteInsert(Connection &conn, RenderFn render, const std::string &step_label) {
-	constexpr int kAttempts = 3;
-	const int kBackoffSec[] = {2, 5, 15};
-	for (int attempt = 0; attempt < kAttempts; ++attempt) {
-		uint64_t cb = (attempt == 0) ? 0 : MakeCacheBust();
-		try {
-			return ExecuteInsert(conn, render(cb), step_label);
-		} catch (const IOException &e) {
-			std::string msg = e.what();
-			bool last = (attempt + 1 == kAttempts);
-			if (last || !IsRetriableLoaderError(msg)) {
-				throw;
-			}
-			fprintf(stderr, "[us_geocoder] %s: HTTP/GDAL error, retry %d/%d in %ds\n", step_label.c_str(), attempt + 1,
-			        kAttempts - 1, kBackoffSec[attempt]);
-			fflush(stderr);
-			std::this_thread::sleep_for(std::chrono::seconds(kBackoffSec[attempt]));
-		}
-	}
-	throw IOException("us_geocoder loader (%s): unreachable retry loop", step_label);
-}
+// RetryableExecuteInsert moved to us_geocoder_loader_internal.hpp (shared
+// with loader_1992.cpp) — it's a template, so it must be defined in a
+// header to be instantiable from another translation unit.
 
 // DuckDB identifier quoting: wrap in double quotes and escape any embedded ".
 // Used for target_db / target_schema, which may contain mixed case or awkward
 // names the user chose for their ATTACH alias.
-static std::string QuoteIdent(const std::string &s) {
+std::string QuoteIdent(const std::string &s) {
 	std::string out = "\"";
 	for (char c : s) {
 		if (c == '"') {
@@ -422,7 +377,7 @@ static void BootstrapTargetSchema(Connection &conn, const LoaderBindData &bind) 
 //   state:<fp>:edge_containment
 // =====================================================================
 
-static bool IsProgressDone(Connection &conn, const std::string &data_loc, const std::string &section) {
+bool IsProgressDone(Connection &conn, const std::string &data_loc, const std::string &section) {
 	auto sql = "SELECT 1 FROM " + data_loc + ".loader_progress WHERE section = '" + section + "' LIMIT 1";
 	auto result = conn.Query(sql);
 	if (result->HasError()) {
@@ -431,7 +386,7 @@ static bool IsProgressDone(Connection &conn, const std::string &data_loc, const 
 	return result->RowCount() > 0;
 }
 
-static void MarkProgressDone(Connection &conn, const std::string &data_loc, const std::string &section) {
+void MarkProgressDone(Connection &conn, const std::string &data_loc, const std::string &section) {
 	auto sql = "INSERT INTO " + data_loc + ".loader_progress (section, completed_at) VALUES ('" + section +
 	           "', now()) ON CONFLICT (section) DO UPDATE SET completed_at = now()";
 	auto result = conn.Query(sql);
@@ -442,7 +397,7 @@ static void MarkProgressDone(Connection &conn, const std::string &data_loc, cons
 	}
 }
 
-static void DeleteProgressLike(Connection &conn, const std::string &data_loc, const std::string &prefix) {
+void DeleteProgressLike(Connection &conn, const std::string &data_loc, const std::string &prefix) {
 	auto sql = "DELETE FROM " + data_loc + ".loader_progress WHERE section LIKE '" + prefix + "%'";
 	auto result = conn.Query(sql);
 	if (result->HasError()) {
@@ -644,7 +599,7 @@ static void ApplyYearSourceTarget(LoaderBindData &bind, const TableFunctionBindI
 }
 
 // Resolve state abbrev → 2-digit FIPS via the lookup table.
-static std::string LookupStateFips(Connection &conn, const std::string &schema, const std::string &abbrev) {
+std::string LookupStateFips(Connection &conn, const std::string &schema, const std::string &abbrev) {
 	auto sql = "SELECT statefp FROM " + schema + ".state_lookup WHERE upper(abbrev) = upper('" + abbrev + "') LIMIT 1";
 	auto result = conn.Query(sql);
 	if (result->HasError() || result->RowCount() == 0) {
@@ -709,39 +664,14 @@ static unique_ptr<FunctionData> LoadTigerNationBind(ClientContext &context, Tabl
 
 // If source is an HTTP URL, make sure httpfs is loaded so GDAL's vsicurl
 // can reach it. Auto-load is a no-op if httpfs is already resident.
-static void EnsureHttpfsIfRemote(DatabaseInstance &db, const std::string &source) {
+void EnsureHttpfsIfRemote(DatabaseInstance &db, const std::string &source) {
 	if (source.rfind("http://", 0) == 0 || source.rfind("https://", 0) == 0) {
 		ExtensionHelper::TryAutoLoadExtension(db, "httpfs");
 	}
 }
 
-// RAII wrapper for a temp-dir lifetime. Destructor removes the directory
-// unless Disarm() was called (e.g. on failure — keep zips for retry).
-// Shared by both DoLoadState and DoLoadNation parallel preludes.
-class StateDirCleanup {
-public:
-	StateDirCleanup(FileSystem &fs, std::string path) : fs_(fs), path_(std::move(path)) {
-	}
-	~StateDirCleanup() {
-		if (!armed_ || path_.empty()) {
-			return;
-		}
-		try {
-			fs_.RemoveDirectory(path_);
-		} catch (...) {
-			fprintf(stderr, "[us_geocoder] WARN: failed to remove temp dir %s\n", path_.c_str());
-			fflush(stderr);
-		}
-	}
-	void Disarm() {
-		armed_ = false;
-	}
-
-private:
-	FileSystem &fs_;
-	std::string path_;
-	bool armed_ = true;
-};
+// StateDirCleanup moved to us_geocoder_loader_internal.hpp (shared with
+// loader_1992.cpp).
 
 static void DoLoadNationImpl(ClientContext &context, const LoaderBindData &bind, std::vector<LoaderResult> &out);
 
