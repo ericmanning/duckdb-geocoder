@@ -145,7 +145,15 @@ directory form (3).
 
 DuckDB bundles miniz as the `duckdb_miniz` static target. `MINIZ_NO_ARCHIVE_APIS` is
 **not** defined, so the ZIP reader APIs are compiled in; `MINIZ_NO_STDIO` **is** defined,
-so only the memory-based variants exist. That is sufficient and preferable — all I/O goes
+so only the memory-based variants exist.
+
+Linkage is settled empirically: every symbol we need is globally exported from the duckdb
+binary, so the static build resolves it from `libduckdb_miniz.a` and the loadable build
+from the host process at `dlopen` — **headers only, no extra linkage, and we do not
+compile `miniz.cpp` ourselves** (that would duplicate code and risk a different set of
+`MINIZ_*` defines than DuckDB built with). Note miniz is wrapped in
+**`namespace duckdb_miniz`**, so every call must be qualified, exactly as DuckDB's own
+`miniz_wrapper.hpp` does. That is sufficient and preferable — all I/O goes
 through DuckDB's `FileSystem`, which keeps Windows behaviour consistent with the rest of
 the loader.
 
@@ -457,7 +465,7 @@ Additional facts established while planning, each of which removes a feared fail
 
 | Risk | Mitigation |
 |---|---|
-| `duckdb_miniz` symbols not reachable from the extension at link time | Verify early with a minimal call; fall back to compiling `third_party/miniz/miniz.cpp` into our target |
+| A DuckDB bump renames or un-exports the `duckdb_miniz` symbols | Verified exported today (`T`) from both the static binary and the host process, so the loadable and static builds both resolve them with headers only. A bump that breaks this is a link error on first build, not a runtime bug |
 | Shared-helper extraction regresses the modern loader | Pure-move commit, full suite green before any 1992 code |
 | Windows path and CRLF handling in the new ingest path | All I/O via DuckDB `FileSystem`; `rtrim(line, chr(13))` in the scan; committed zip fixture exercises extraction on every platform in the gated suite |
 | Polygon-dependent code paths fail confusingly rather than cleanly | Documented in `docs/tiger1992.md`; negative-control assertions in the test suite |
