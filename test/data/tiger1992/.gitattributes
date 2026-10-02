@@ -1,0 +1,9 @@
+# 1992 TIGER/Line fixtures are fixed-width ASCII with CRLF record
+# terminators (matching real Census files) and a binary zip. The repo's
+# top-level `* text=auto` strips the \r from CRLF line endings on commit,
+# which silently shrinks every fixture below its documented byte count
+# (verified: TGR34999.F51 460 -> 458 bytes once normalized). Every byte
+# count in test/sql/tiger1992_zip.test and the task brief depends on these
+# staying byte-exact, so this whole tree is marked binary: no line-ending
+# or encoding conversion, ever, on any platform.
+* -text

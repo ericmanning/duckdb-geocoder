@@ -210,10 +210,17 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sql/pprint_adr.sql.in)
 # -------------------------------------------------------------------------
 
+# DuckDB bundles miniz and exports its symbols (namespace duckdb_miniz) from
+# both the static binary and the host process, so we need headers only — do
+# not compile miniz.cpp here, or we would duplicate the code and risk a
+# different set of MINIZ_* defines than DuckDB built with.
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/miniz)
+
 set(EXTENSION_SOURCES
     src/us_geocoder_extension.cpp
     src/loader.cpp
     src/parallel_download.cpp
+    src/zip_extract.cpp
     src/geocode_batch.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

@@ -4,6 +4,7 @@
 #include "us_geocoder_embed.hpp"
 #include "us_geocoder_embedded_sql.hpp"
 #include "us_geocoder_loader.hpp"
+#include "us_geocoder_zip.hpp"
 #include "vendored_soundex.hpp"
 #include "geocode_batch.hpp"
 
@@ -188,6 +189,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register the C++ loader table functions (load_tiger_nation, load_tiger_state).
 	// These don't need spatial at load time; ST_Read only fires at invocation.
 	us_geocoder::RegisterLoaderFunctions(loader, kDefaultTigerSchema);
+
+	// us_geocoder_unzip — extracts a zip archive's entries via DuckDB's
+	// bundled miniz (headers only; see CMakeLists.txt). Used by the 1992
+	// TIGER/Line loader to unpack per-county zips before read_csv.
+	us_geocoder::RegisterZipFunctions(loader);
 
 	// tiger.geocode_batch — C++ table-in-out function for batched geocoding
 	// (works around the per-row LATERAL decorrelation that hangs the SQL
