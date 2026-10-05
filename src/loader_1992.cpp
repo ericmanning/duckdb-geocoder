@@ -587,6 +587,44 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 			MarkProgressDone(conn, data_loc, key);
 		}
 	}
+
+	// Derived per-state tables. The zip_* sections are reused verbatim from
+	// the modern templates — they are pure SQL over edges/faces/place/state
+	// and carry no vintage assumptions.
+	const std::string modern_tmpl = LoaderTemplatesSql();
+	struct DerivedStep {
+		const char *section;
+		const char *table;
+		const char *progress;
+		bool from_1992_templates;
+	};
+	std::vector<DerivedStep> derived = {
+	    {"derived_zip_state", "zip_state", "zip_state", false},
+	    {"derived_zip_state_loc", "zip_state_loc", "zip_state_loc", false},
+	    {"derived_zip_lookup_base", "zip_lookup_base", "zip_lookup_base", false},
+	};
+	// build_containment is accepted and stored by Task 4 but never read there —
+	// wiring it here is what makes the parameter mean anything. A user passing the
+	// `true` default must get containment; `false` must skip the section entirely.
+	if (bind.build_containment) {
+		derived.push_back({"derived_edge_containment", "edge_containment", "edge_containment", true});
+	}
+	for (const auto &d : derived) {
+		const std::string key = state_pfx + "derived:" + d.progress;
+		if (IsProgressDone(conn, data_loc, key)) {
+			out.push_back({std::string(d.section) + ":skipped", 0});
+			continue;
+		}
+		// Absent progress entry means either a fresh load or a partial
+		// restart that just filled in counties; DELETE first so a rebuild
+		// cannot duplicate.
+		conn.Query("DELETE FROM " + data_loc + "." + d.table + " WHERE statefp = '" + fips + "'");
+		auto section = ExtractSection(d.from_1992_templates ? tmpl : modern_tmpl, d.section);
+		auto sql = RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", fips}});
+		int64_t rows = ExecuteInsert(conn, sql, d.section);
+		out.push_back({d.section, rows});
+		MarkProgressDone(conn, data_loc, key);
+	}
 }
 
 static void Load1992Execute(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {

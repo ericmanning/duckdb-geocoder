@@ -1,0 +1,118 @@
+# name: test/sql/tiger1992_geocode.test
+# description: forward geocoding against 1992-vintage data
+# group: [sql]
+
+require us_geocoder
+
+require-env TIGER_TEST_EXTENSIONS
+
+statement ok
+LOAD spatial;
+
+statement ok
+CALL load_tiger_1992_state('NJ', source := 'test/data/tiger1992');
+
+# Derived zip tables built from the reused modern sections.
+query III
+SELECT (SELECT count(*) FROM tiger.zip_state),
+       (SELECT count(*) FROM tiger.zip_state_loc),
+       (SELECT count(*) FROM tiger.zip_lookup_base);
+----
+1	1	1
+
+query III
+SELECT zip, state, city FROM tiger.zip_lookup_base;
+----
+07825	NJ	Fixture
+
+# edge_containment: GEOIDs present, guaranteed_* hard false.
+query III
+SELECT tlid, tract_geoid_l, guaranteed_l FROM tiger.edge_containment ORDER BY tlid;
+----
+9001	34999012345	false
+9002	34999012345	false
+
+# Forward geocode: house 50 on Fixture Road. Two addr ranges cover tlid 9001
+# (1-99 L, 2-98 R); 50 parity-matches the R range and wins the rating (see
+# the block_geoid query below for why).
+query IIII
+SELECT g.rating, (g.adr).street_name, (g.adr).street_type, (g.adr).zip
+FROM tiger.geocode({'address':50,'street_name':'Fixture','street_type':'Rd',
+                    'internal':NULL,'pre_dir':NULL,'post_dir':NULL,
+                    'location':NULL,'state_abbrev':'NJ','zip':'07825'}::tiger.geocode_input,
+                   1, NULL, 'none') g;
+----
+15	Fixture	Road	07825
+
+# The interpolated point lies on the chain's bounding box.
+query I
+SELECT ST_X(g.geom) BETWEEN -74.9601 AND -74.9499
+   AND ST_Y(g.geom) BETWEEN 40.9899 AND 40.9951
+FROM tiger.geocode({'address':50,'street_name':'Fixture','street_type':'Rd',
+                    'internal':NULL,'pre_dir':NULL,'post_dir':NULL,
+                    'location':NULL,'state_abbrev':'NJ','zip':'07825'}::tiger.geocode_input,
+                   1, NULL, 'none') g;
+----
+true
+
+# Block GEOID is populated and 1990-vintage (15 chars here: 4-digit block).
+#
+# House 50 is even, so it parity-matches the R-side range (2-98, hn_max=98,
+# even) rather than the L-side range (1-99, hn_max=99, odd) — see
+# geocode_address.sql.in's address-rating CASE: an in-range candidate whose
+# parity doesn't match hn_max's parity pays a +2 penalty vs. +0 for a parity
+# match, so the R-side addr row outranks L and wins the LIMIT-1 ORDER BY
+# rating. block_geoid is selected per the winning a_side (CASE a_side WHEN
+# 'L' THEN block_geoid_l ELSE block_geoid_r END), so the correct value here
+# is block_geoid_r for tlid 9001 (349990123451002), not block_geoid_l.
+# Verified directly: tiger.edges has tfidl=...0001/tfidr=...0002 for tlid
+# 9001, and tiger.edge_containment computed block_geoid_l=...1001,
+# block_geoid_r=...1002 for that row — both as designed.
+query II
+SELECT g.block_geoid, length(g.block_geoid)
+FROM tiger.geocode({'address':50,'street_name':'Fixture','street_type':'Rd',
+                    'internal':NULL,'pre_dir':NULL,'post_dir':NULL,
+                    'location':NULL,'state_abbrev':'NJ','zip':'07825'}::tiger.geocode_input,
+                   1, NULL, 'none') g;
+----
+349990123451002	15
+
+# The alternate name from RT4/RT5 also matches.
+query I
+SELECT count(*) FROM tiger.geocode(
+  {'address':50,'street_name':'Old Fixture','street_type':'Rd','internal':NULL,
+   'pre_dir':NULL,'post_dir':NULL,'location':NULL,'state_abbrev':'NJ','zip':'07825'}::tiger.geocode_input,
+  1, NULL, 'none');
+----
+1
+
+# Review Focus 5: require_containment != 'none' returns zero rows, no error.
+query I
+SELECT count(*) FROM tiger.geocode(
+  {'address':50,'street_name':'Fixture','street_type':'Rd','internal':NULL,
+   'pre_dir':NULL,'post_dir':NULL,'location':NULL,'state_abbrev':'NJ','zip':'07825'}::tiger.geocode_input,
+  1, NULL, 'block');
+----
+0
+
+# Documented limitation: reverse geocoding returns nothing (no face polygons).
+query I
+SELECT count(*) FROM tiger.reverse_geocode(ST_Point(-74.955, 40.9925), 5);
+----
+0
+
+# Unload clears every per-state table and the progress keys.
+statement ok
+CALL unload_tiger_1992_state('NJ');
+
+query IIIII
+SELECT (SELECT count(*) FROM tiger.edges), (SELECT count(*) FROM tiger.faces),
+       (SELECT count(*) FROM tiger.featnames), (SELECT count(*) FROM tiger.addr),
+       (SELECT count(*) FROM tiger.edge_containment);
+----
+0	0	0	0	0
+
+query II
+SELECT (SELECT count(*) FROM tiger.state), (SELECT count(*) FROM tiger.county);
+----
+0	0
