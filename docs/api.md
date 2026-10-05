@@ -128,7 +128,15 @@ verbatim.
   skipping it costs nothing but the GEOID columns on `geocode()` results.
 - `parallel` / `temp_dir` / `parallel_workers` — same semantics as the modern loaders.
 
-Idempotent via DELETE-first, same as `load_tiger_state`.
+Re-runnable, but by two different mechanisms. The four **per-county** steps
+(`county_edges`/`county_faces`/`county_featnames`/`county_addr`) are idempotent via the
+**progress ledger** only — a county whose key is already marked done is skipped without
+reading its files, and there is no DELETE and no SQL-level uniqueness guard behind that. The
+**state-level** steps (`state`/`county`/`place`/`cousub`) and the **derived** steps
+(`zip_state`/`zip_state_loc`/`zip_lookup_base`/`edge_containment`) are DELETE-first, so they
+can be forced to rebuild safely — which is what happens automatically when a call ingests a
+county it hasn't seen before. Deleting a county's `tiger1992:state:<fips>:county:<ccc>:*`
+keys by hand, without first deleting that county's rows, therefore duplicates them.
 
 ```sql
 CALL load_tiger_1992_state('NJ');
@@ -156,9 +164,10 @@ CALL load_tiger_1992_all_states();
 ### `unload_tiger_1992_state(state_abbrev VARCHAR | VARCHAR[], target_db VARCHAR DEFAULT NULL, target_schema VARCHAR DEFAULT 'tiger') → TABLE(step VARCHAR, rows_loaded BIGINT)`
 
 Clears one or more states' 1992 data and progress keys. Reuses the modern `unload_state`
-DELETE list (all 13 per-state tables, including `edge_containment`) and additionally deletes
-the state's own `county` and `state` rows — the modern unload template doesn't touch those
-two because the modern loader treats them as nation-level, but 1992 writes them per-state.
+DELETE list — **11** tables, including `edge_containment` — and additionally deletes the
+state's own `county` and `state` rows, which brings the total to 13. The modern unload
+template doesn't touch those two because the modern loader treats them as nation-level, but
+1992 writes them per-state.
 
 Only `target_db` and `target_schema` are accepted — no `source`/`build_containment`/`parallel`
 knobs, matching `unload_tiger_state`.
@@ -182,18 +191,29 @@ location holds *one* vintage. Both the 1992 loaders and the modern loaders refus
 into a location that already holds rows of the other vintage for a given state, and both
 `unload_tiger_1992_state` and `unload_tiger_state` refuse to delete the other vintage's rows.
 Every refusal names the offending state and the remedy (`target_db`/`target_schema`, or
-unload first). Side-by-side use of both vintages is still available — just not in the same
-location — via `target_db`/`target_schema` plus
+unload first).
+
+`load_tiger_nation` is guarded too, with a wider predicate: it writes nation-level
+`state`/`county`/`zcta5` rows that aren't keyed per state, so it refuses a location holding
+1992 data for *any* state. (Without that, a modern 2020-vintage `zcta5` row lands beside 1992
+streets and ZIP-only input silently returns a 2020 ZCTA centroid.)
+
+Every refusal happens before the loader touches the network — including on the default remote
+`parallel := true` path, where it would otherwise have cost a full state download first.
+
+Side-by-side use of both vintages is still available — just not in the same location — via
+`target_db`/`target_schema` plus
 [`set_tiger_reference`](#set_tiger_referencedatabase-varchar-schema-varchar-default-tiger--table).
 
 ### `us_geocoder_unzip(zip_path VARCHAR, dest_dir VARCHAR) → TABLE(entry VARCHAR, bytes BIGINT)`
 
-Extracts every entry of `zip_path` into `dest_dir`, creating `dest_dir` if needed, and returns
-one row per extracted entry (`entry` = basename as stored in the archive, `bytes` = uncompressed
-size written). Not specific to 1992 — a general-purpose utility, useful for pre-extracting a
-local mirror into the "local extracted tree" source form. Directory entries in the archive are
+Extracts every entry of `zip_path` into `dest_dir`, creating `dest_dir` (recursively, so a
+two-level missing path like `<mirror>/44/44007` works) if needed, and returns one row per
+extracted entry (`entry` = basename as stored in the archive, `bytes` = uncompressed size
+written). Not specific to 1992 — a general-purpose utility, useful for pre-extracting a local
+mirror into the "local extracted tree" source form. Directory entries in the archive are
 skipped. Matching against entries uses case-insensitive comparison (1992 archives store names
-in uppercase).
+in uppercase). A NULL `zip_path` or `dest_dir` is a bind-time error.
 
 ```sql
 SELECT * FROM us_geocoder_unzip('/data/tiger1992/34/34041.zip', '/data/tiger1992/34/34041');
@@ -441,6 +461,7 @@ For coercing arbitrary parser output into the `geocode_input` contract:
 | `canon_dir(d)` | uppercase 2-letter: `'Northwest'` / `'nw'` → `'NW'` |
 | `canon_state(s)` | 2-letter uppercase abbrev: `'Massachusetts'` → `'MA'`; unknown → `NULL` |
 | `canon_zip(z)` | 5-char, leading-zero preserved: `'2109'` → `'02109'`; `'02109-1234'` → `'02109'` |
+| `cfcc_to_mtfcc(cfcc)` | 1992 CFCC → nearest modern MTFCC: `'A41'` → `'S1400'`, `'A11'` → `'S1100'`; non-`A` codes pass through prefixed, `'H01'` → `'XH01'` |
 
 ### `from_pagc(raw_text VARCHAR) → geocode_input`
 
