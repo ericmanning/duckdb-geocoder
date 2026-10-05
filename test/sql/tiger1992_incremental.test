@@ -1,0 +1,163 @@
+# name: test/sql/tiger1992_incremental.test
+# description: Restart semantics for the 1992 loader's state-level and
+#              derived steps: a county added since the last call must
+#              refresh them even though their own progress key says "done",
+#              and clearing a single derived progress key must rebuild only
+#              that one table without duplicating it.
+# group: [sql]
+#
+# Regression coverage for a review finding on the Task 5 derived-table work:
+# `IsProgressDone` alone gated the state-level (state/county/place/cousub)
+# and derived (zip_state/zip_state_loc/zip_lookup_base/edge_containment)
+# steps, so a second CALL that picked up a previously-unseen county's files
+# ingested that county's edges/faces/featnames/addr cleanly but left every
+# state-level and derived step reporting ":skipped" — silently stale
+# edge_containment/zip_* data for the new county, with no error. The fix
+# tracks `any_county_inserted` across the per-county loop (now run first)
+# and forces both the state-level loop and the derived loop to run whenever
+# it's true, DELETE-then-INSERT so a forced re-run can't duplicate rows.
+#
+# test/data/tiger1992/incr92/34/34996 is a second, non-colliding synthetic
+# county fixture (new for this test, respecting the existing tree's rule
+# against modifying committed fixtures). It is NOT a byte-exact copy of
+# sparse92's county 997: reusing sparse92 unpatched here triggers a
+# DIFFERENT, unrelated pre-existing artifact — derived_edge_containment's
+# LEFT JOIN keys faces on (statefp, tfid) only, not countyfp, and
+# sparse92/34999's raw fixture bytes embed the identical literal tfid
+# values (349990000000001/...002) in both counties' F5A content, which
+# fans out that LEFT JOIN 1:2 per side (empirically verified: 16
+# edge_containment rows instead of the expected 4). TGR34996.F5A is a
+# byte-exact copy of sparse92's TGR34997.F5A with only the 5-digit tfid
+# prefix at the documented offset (position 11-15, 1-indexed, per
+# loader_1992_templates.sql.in's county_faces section) changed from
+# "34999" to "34996" so its tfid values (349960000000001/...002) don't
+# collide with county 999's; TGR34996.F51/.F5I are untouched byte-exact
+# copies of sparse92's TGR34997.F51/.F5I (TLID reuse across counties is
+# harmless here: tlid isn't a join key in any derived section).
+
+require us_geocoder
+
+require-env TIGER_TEST_EXTENSIONS
+
+statement ok
+LOAD spatial;
+
+# --- Step 1: fresh load, county 999 only ------------------------------
+
+query II
+SELECT step, rows_loaded FROM load_tiger_1992_state('NJ', source := 'test/data/tiger1992')
+WHERE step NOT LIKE 'begin:%' AND step NOT LIKE 'done:%' AND step <> 'analyze'
+ORDER BY step;
+----
+county_addr:999	6
+county_edges:999	2
+county_faces:999	2
+county_featnames:999	3
+derived_edge_containment	2
+derived_zip_lookup_base	1
+derived_zip_state	1
+derived_zip_state_loc	1
+state_county	1
+state_cousub	1
+state_place	1
+state_state	1
+
+query II
+SELECT (SELECT count(*) FROM tiger.edges), (SELECT count(*) FROM tiger.edge_containment);
+----
+2	2
+
+# --- Step 2: a second call against a source that resolves a different,
+# previously-unseen county (simulating a partial local mirror completed
+# between runs). county 999's steps are skipped (progress already done);
+# county 996's steps run; crucially, every state-level and derived step
+# also runs (not ":skipped") even though their own progress keys already
+# said "done" from Step 1. -----------------------------------------------
+
+query II
+SELECT step, rows_loaded FROM load_tiger_1992_state('NJ', source := 'test/data/tiger1992/incr92')
+WHERE step NOT LIKE 'begin:%' AND step NOT LIKE 'done:%' AND step <> 'analyze'
+ORDER BY step;
+----
+county_addr:996	4
+county_edges:996	2
+county_faces:996	2
+county_featnames:996	2
+derived_edge_containment	4
+derived_zip_lookup_base	1
+derived_zip_state	1
+derived_zip_state_loc	1
+state_county	1
+state_cousub	1
+state_place	1
+state_state	1
+
+# The concrete data consequence: edge_containment now covers both
+# counties' edges (4, not stuck at 2), and edges/faces/featnames/addr
+# reflect both counties' totals.
+query IIIII
+SELECT (SELECT count(*) FROM tiger.edges), (SELECT count(*) FROM tiger.faces),
+       (SELECT count(*) FROM tiger.featnames), (SELECT count(*) FROM tiger.addr),
+       (SELECT count(*) FROM tiger.edge_containment);
+----
+4	4	5	10	4
+
+# tiger.county/place/cousub/state are unchanged in value (the NAM file is
+# identical between the two source roots and only ever lists county 999),
+# but still exactly 1 row each — the forced re-run's DELETE-then-INSERT
+# didn't duplicate them.
+query IIII
+SELECT (SELECT count(*) FROM tiger.state), (SELECT count(*) FROM tiger.county),
+       (SELECT count(*) FROM tiger.place), (SELECT count(*) FROM tiger.cousub);
+----
+1	1	1	1
+
+# --- Step 3: clearing one derived progress key rebuilds exactly that
+# table without duplicating it, leaving every other step (state-level,
+# county-level, and the other three derived tables) ":skipped". ---------
+
+statement ok
+DELETE FROM tiger.loader_progress WHERE section = 'tiger1992:state:34:derived:zip_state';
+
+query II
+SELECT step, rows_loaded FROM load_tiger_1992_state('NJ', source := 'test/data/tiger1992')
+WHERE step NOT LIKE 'begin:%' AND step NOT LIKE 'done:%' AND step <> 'analyze'
+ORDER BY step;
+----
+county_addr:999:skipped	0
+county_edges:999:skipped	0
+county_faces:999:skipped	0
+county_featnames:999:skipped	0
+derived_edge_containment:skipped	0
+derived_zip_lookup_base:skipped	0
+derived_zip_state	1
+derived_zip_state_loc:skipped	0
+state_county:skipped	0
+state_cousub:skipped	0
+state_place:skipped	0
+state_state:skipped	0
+
+# zip_state rebuilt (not duplicated: still 1 row); edge_containment
+# untouched by this call (still 4, from Step 2 — not rebuilt, and not
+# dropped either).
+query II
+SELECT (SELECT count(*) FROM tiger.zip_state), (SELECT count(*) FROM tiger.edge_containment);
+----
+1	4
+
+# --- Cleanup -------------------------------------------------------------
+
+statement ok
+CALL unload_tiger_1992_state('NJ');
+
+query IIIII
+SELECT (SELECT count(*) FROM tiger.edges), (SELECT count(*) FROM tiger.faces),
+       (SELECT count(*) FROM tiger.featnames), (SELECT count(*) FROM tiger.addr),
+       (SELECT count(*) FROM tiger.edge_containment);
+----
+0	0	0	0	0
+
+query II
+SELECT (SELECT count(*) FROM tiger.state), (SELECT count(*) FROM tiger.county);
+----
+0	0

@@ -455,9 +455,13 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 	struct StateStep {
 		const char *section;
 		const char *progress;
+		const char *table;
 	};
 	const StateStep state_steps[] = {
-	    {"state_state", "state"}, {"state_county", "county"}, {"state_place", "place"}, {"state_cousub", "cousub"}};
+	    {"state_state", "state", "state"},
+	    {"state_county", "county", "county"},
+	    {"state_place", "place", "place"},
+	    {"state_cousub", "cousub", "cousub"}};
 	struct CountyStep {
 		const char *section;
 		const char *progress_table;
@@ -522,9 +526,13 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 			const std::string ssccc = fips + pending_counties[i];
 			targets.push_back({src + "/" + fips + "/" + ssccc + ".zip", fs.JoinPath(work_dir, ssccc + ".zip")});
 		}
-		if (state_steps_pending) {
-			targets.push_back({src + "/" + fips + "/OtherFiles.zip", fs.JoinPath(work_dir, "OtherFiles.zip")});
-		}
+		// Unconditional (not gated on `state_steps_pending`): we're already
+		// inside `if (remote && have_work)`, and the state-level loop below
+		// force-rebuilds whenever any county inserted this call (see its
+		// comment), even if the state-level progress keys were already
+		// marked done — so a pending-counties-only restart still needs the
+		// NAM file fetched.
+		targets.push_back({src + "/" + fips + "/OtherFiles.zip", fs.JoinPath(work_dir, "OtherFiles.zip")});
 		ParallelDownloadOptions opts;
 		opts.workers = bind.parallel ? bind.parallel_workers : 1;
 		opts.log_prefix = state.abbrev;
@@ -532,30 +540,14 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 		(void)dl;
 	}
 
-	// Per-state names first — the county sections do not depend on them.
-	const std::string stusps = state.abbrev;
-	std::string nam; // resolved lazily, only if some state step is pending
-	for (const auto &s : state_steps) {
-		const std::string key = state_pfx + s.progress;
-		if (IsProgressDone(conn, data_loc, key)) {
-			out.push_back({std::string(s.section) + ":skipped", 0});
-			continue;
-		}
-		if (nam.empty()) {
-			const std::string nam_dir = ResolveStateOtherDir(context, fs, bind, fips, work_dir);
-			nam = fs.JoinPath(nam_dir, "TGR92S" + fips + ".NAM");
-		}
-		auto sql = RenderTemplate(ExtractSection(tmpl, s.section), {{"@TIGER@", data_loc},
-		                                                            {"@FUNC@", func_loc},
-		                                                            {"@STATEFP@", fips},
-		                                                            {"@STUSPS@", stusps},
-		                                                            {"@NAM@", nam}});
-		int64_t rows = ExecuteInsert(conn, sql, s.section);
-		out.push_back({s.section, rows});
-		MarkProgressDone(conn, data_loc, key);
-	}
-
-	// Per-county.
+	// Per-county first, so `any_county_inserted` is known before the
+	// state-level and derived steps run. Those steps gate on their own
+	// progress key, but a progress key marked "done" on a prior call must
+	// not suppress a rebuild when this call just ingested a county that
+	// call hadn't seen yet (e.g. a partial local mirror completed between
+	// runs) — county data has nothing the state-level steps or NAM parse
+	// depend on, so running counties first is safe.
+	bool any_county_inserted = false;
 	for (size_t ci = 0; ci < countyfps.size(); ++ci) {
 		const auto &cfp = countyfps[ci];
 		const std::string ssccc = fips + cfp;
@@ -585,7 +577,44 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 			int64_t rows = ExecuteInsert(conn, sql, std::string(t.section) + ":" + cfp);
 			out.push_back({std::string(t.section) + ":" + cfp, rows});
 			MarkProgressDone(conn, data_loc, key);
+			any_county_inserted = true;
 		}
+	}
+
+	// Per-state names. The county sections above do not depend on them, but
+	// derived_zip_lookup_base/derived_zip_state_loc below join place/county,
+	// so this has to run before the derived loop even though it now runs
+	// after the county loop.
+	//
+	// Gated like the derived steps: `!any_county_inserted` is required (not
+	// just the section's own progress key) so a newly-ingested county's
+	// place/county/cousub rows get parsed out of the (already-fully-listing)
+	// NAM file even when this section previously completed. state_state and
+	// state_county re-insert idempotently via their own `NOT IN` guards, but
+	// state_place/state_cousub have no such guard — they re-parse the whole
+	// NAM file unconditionally — so every re-run DELETEs this state's rows
+	// first, the same idempotency rule the derived loop below uses.
+	const std::string stusps = state.abbrev;
+	std::string nam; // resolved lazily, only if some state step is pending
+	for (const auto &s : state_steps) {
+		const std::string key = state_pfx + s.progress;
+		if (!any_county_inserted && IsProgressDone(conn, data_loc, key)) {
+			out.push_back({std::string(s.section) + ":skipped", 0});
+			continue;
+		}
+		if (nam.empty()) {
+			const std::string nam_dir = ResolveStateOtherDir(context, fs, bind, fips, work_dir);
+			nam = fs.JoinPath(nam_dir, "TGR92S" + fips + ".NAM");
+		}
+		conn.Query("DELETE FROM " + data_loc + "." + s.table + " WHERE statefp = '" + fips + "'");
+		auto sql = RenderTemplate(ExtractSection(tmpl, s.section), {{"@TIGER@", data_loc},
+		                                                            {"@FUNC@", func_loc},
+		                                                            {"@STATEFP@", fips},
+		                                                            {"@STUSPS@", stusps},
+		                                                            {"@NAM@", nam}});
+		int64_t rows = ExecuteInsert(conn, sql, s.section);
+		out.push_back({s.section, rows});
+		MarkProgressDone(conn, data_loc, key);
 	}
 
 	// Derived per-state tables. The zip_* sections are reused verbatim from
@@ -603,15 +632,19 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 	    {"derived_zip_state_loc", "zip_state_loc", "zip_state_loc", false},
 	    {"derived_zip_lookup_base", "zip_lookup_base", "zip_lookup_base", false},
 	};
-	// build_containment is accepted and stored by Task 4 but never read there —
-	// wiring it here is what makes the parameter mean anything. A user passing the
-	// `true` default must get containment; `false` must skip the section entirely.
+	// build_containment is accepted and stored by Task 4; this loop is what
+	// reads it: `true` (the default) appends the containment section below,
+	// `false` leaves it out, so edge_containment is never touched this call.
 	if (bind.build_containment) {
 		derived.push_back({"derived_edge_containment", "edge_containment", "edge_containment", true});
 	}
 	for (const auto &d : derived) {
 		const std::string key = state_pfx + "derived:" + d.progress;
-		if (IsProgressDone(conn, data_loc, key)) {
+		// `!any_county_inserted` forces a rebuild even when this section's
+		// own progress key says "done" — otherwise a county added since the
+		// last call would ingest cleanly but leave the derived tables (and
+		// edge_containment) silently stale for that county's rows.
+		if (!any_county_inserted && IsProgressDone(conn, data_loc, key)) {
 			out.push_back({std::string(d.section) + ":skipped", 0});
 			continue;
 		}

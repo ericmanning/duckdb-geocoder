@@ -129,6 +129,19 @@ SELECT cosbidfp, name FROM tiger.cousub;
 ----
 3499912345	Fixture
 
+# build_containment := false (passed above) must skip the containment
+# section entirely rather than just producing zero rows some other way —
+# the three zip_* derived tables still build normally (they aren't gated on
+# build_containment). See test/sql/tiger1992_geocode.test for the
+# build_containment default-true case, where edge_containment is non-empty.
+query IIII
+SELECT (SELECT count(*) FROM tiger.edge_containment),
+       (SELECT count(*) FROM tiger.zip_state),
+       (SELECT count(*) FROM tiger.zip_state_loc),
+       (SELECT count(*) FROM tiger.zip_lookup_base);
+----
+0	1	1	1
+
 # Review Focus 4: an unknown state abbreviation errors clearly.
 statement error
 CALL load_tiger_1992_state('ZZ', source := 'test/data/tiger1992');
