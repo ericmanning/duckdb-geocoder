@@ -1,9 +1,11 @@
 # name: test/sql/tiger1992_incremental.test
 # description: Restart semantics for the 1992 loader's state-level and
 #              derived steps: a county added since the last call must
-#              refresh them even though their own progress key says "done",
-#              and clearing a single derived progress key must rebuild only
-#              that one table without duplicating it.
+#              refresh them with correct *content* (not just re-run and
+#              produce the same row counts), even though their own
+#              progress key says "done". Also: clearing a single derived
+#              progress key must rebuild only that one table without
+#              duplicating it.
 # group: [sql]
 #
 # Regression coverage for a review finding on the Task 5 derived-table work:
@@ -23,17 +25,48 @@
 # sparse92's county 997: reusing sparse92 unpatched here triggers a
 # DIFFERENT, unrelated pre-existing artifact — derived_edge_containment's
 # LEFT JOIN keys faces on (statefp, tfid) only, not countyfp, and
-# sparse92/34999's raw fixture bytes embed the identical literal tfid
+# sparse92/34997's raw fixture bytes embed the identical literal tfid
 # values (349990000000001/...002) in both counties' F5A content, which
 # fans out that LEFT JOIN 1:2 per side (empirically verified: 16
-# edge_containment rows instead of the expected 4). TGR34996.F5A is a
-# byte-exact copy of sparse92's TGR34997.F5A with only the 5-digit tfid
-# prefix at the documented offset (position 11-15, 1-indexed, per
-# loader_1992_templates.sql.in's county_faces section) changed from
-# "34999" to "34996" so its tfid values (349960000000001/...002) don't
-# collide with county 999's; TGR34996.F51/.F5I are untouched byte-exact
-# copies of sparse92's TGR34997.F51/.F5I (TLID reuse across counties is
-# harmless here: tlid isn't a join key in any derived section).
+# edge_containment rows instead of the expected 4).
+#
+# This fixture's topology (and getting it WRONG is exactly what the first
+# version of this test got wrong, caught by review — a stale edge/faces
+# join produces NULL GEOIDs and an empty zip_lookup_base either way, which
+# made row-count-only assertions pass without proving the refresh actually
+# worked):
+#   - TGR34996.F5A (faces/RTA): byte-exact copy of sparse92's
+#     TGR34997.F5A with the 5-digit CENID at the documented offset
+#     (position 11-15, 1-indexed, per loader_1992_templates.sql.in's
+#     county_faces section: `substr(line,11,5)`) changed from "34999" to
+#     "34996" in both records, so this county's own faces.tfid values
+#     (349960000000001/...002) don't collide with county 999's.
+#   - TGR34996.F5I (edges-to-faces link/RTI): byte-exact copy of
+#     sparse92's TGR34997.F5I with BOTH CENIDL (columns 22-26) and CENIDR
+#     (columns 37-41) also changed from "34999" to "34996" in both
+#     records, so edges.tfidl/tfidr (built from RTI) match the SAME
+#     faces.tfid values (built from RTA, above) rather than pointing at
+#     county 999's faces. Getting only RTA patched and leaving RTI at
+#     "34999" (this test's first draft) makes edges.tfidl/tfidr reference
+#     tfids that exist only in county 999's faces rows, so this county's
+#     own edges↔faces join finds nothing: edge_containment GEOIDs come
+#     back NULL and zip_lookup_base drops this county's rows entirely —
+#     both of which still happen to leave the *row counts* this test
+#     checks unchanged, which is why a stronger, content-level assertion
+#     (not just counts) is required below.
+#   - TGR34996.F51 is an untouched byte-exact copy of sparse92's
+#     TGR34997.F51 (TLID reuse across counties is harmless: tlid isn't a
+#     join key in any derived section, only faces.tfid is).
+#   - TGR92S34.NAM: sparse92's NAM (itself identical to the main fixture's,
+#     listing only county 999) plus one appended RT02 (county) record for
+#     "996", named "FixtureAdd County" (distinct from county 999's
+#     "Fixture County") so zip_lookup_base's required INNER JOIN to
+#     tiger.county actually finds a match for the new county AND produces
+#     a row visibly distinguishable from county 999's — proving
+#     zip_lookup_base reflects the added county's data, not just the same
+#     1-row result it would show even if the join silently dropped it
+#     (both counties share the same zip, 07825, so a name-only check is
+#     the only way to tell the rows apart).
 
 require us_geocoder
 
@@ -72,7 +105,10 @@ SELECT (SELECT count(*) FROM tiger.edges), (SELECT count(*) FROM tiger.edge_cont
 # between runs). county 999's steps are skipped (progress already done);
 # county 996's steps run; crucially, every state-level and derived step
 # also runs (not ":skipped") even though their own progress keys already
-# said "done" from Step 1. -----------------------------------------------
+# said "done" from Step 1. state_county and derived_zip_lookup_base report
+# > 1 row this time because the NAM file this source resolves to also
+# lists county 996 (with a distinct name) and the new county's zip now
+# clears zip_lookup_base's join. ------------------------------------------
 
 query II
 SELECT step, rows_loaded FROM load_tiger_1992_state('NJ', source := 'test/data/tiger1992/incr92')
@@ -84,10 +120,10 @@ county_edges:996	2
 county_faces:996	2
 county_featnames:996	2
 derived_edge_containment	4
-derived_zip_lookup_base	1
+derived_zip_lookup_base	2
 derived_zip_state	1
 derived_zip_state_loc	1
-state_county	1
+state_county	2
 state_cousub	1
 state_place	1
 state_state	1
@@ -102,15 +138,40 @@ SELECT (SELECT count(*) FROM tiger.edges), (SELECT count(*) FROM tiger.faces),
 ----
 4	4	5	10	4
 
-# tiger.county/place/cousub/state are unchanged in value (the NAM file is
-# identical between the two source roots and only ever lists county 999),
-# but still exactly 1 row each — the forced re-run's DELETE-then-INSERT
-# didn't duplicate them.
-query IIII
-SELECT (SELECT count(*) FROM tiger.state), (SELECT count(*) FROM tiger.county),
-       (SELECT count(*) FROM tiger.place), (SELECT count(*) FROM tiger.cousub);
+# Content, not just counts: every edge_containment row has a real,
+# non-NULL GEOID (proving the edges<->faces join actually matched, not a
+# join-miss that happened to still produce a row), and the new county's
+# rows carry its own distinct tract/block GEOID prefix (34996...), not
+# county 999's (34999...) or NULL.
+query I
+SELECT count(*) FROM tiger.edge_containment
+WHERE tract_geoid_l IS NULL OR block_geoid_l IS NULL
+   OR tract_geoid_r IS NULL OR block_geoid_r IS NULL;
 ----
-1	1	1	1
+0
+
+query II
+SELECT tlid, tract_geoid_l FROM tiger.edge_containment
+WHERE tract_geoid_l LIKE '34996%' ORDER BY tlid;
+----
+9001	34996012345
+9002	34996012345
+
+# zip_lookup_base reflects the added county: two distinct rows for the
+# same zip (both counties share 07825), one per county's own name.
+query II
+SELECT zip, county FROM tiger.zip_lookup_base ORDER BY county;
+----
+07825	Fixture
+07825	FixtureAdd
+
+# tiger.county itself also picked up the new county's row (not duplicated:
+# exactly 2, one per county).
+query II
+SELECT cntyidfp, name FROM tiger.county ORDER BY cntyidfp;
+----
+34996	FixtureAdd
+34999	Fixture
 
 # --- Step 3: clearing one derived progress key rebuilds exactly that
 # table without duplicating it, leaving every other step (state-level,
@@ -137,13 +198,14 @@ state_cousub:skipped	0
 state_place:skipped	0
 state_state:skipped	0
 
-# zip_state rebuilt (not duplicated: still 1 row); edge_containment
-# untouched by this call (still 4, from Step 2 — not rebuilt, and not
-# dropped either).
-query II
-SELECT (SELECT count(*) FROM tiger.zip_state), (SELECT count(*) FROM tiger.edge_containment);
+# zip_state rebuilt (not duplicated: still 1 row); edge_containment and
+# zip_lookup_base untouched by this call (still 4 and 2 respectively, from
+# Step 2 — not rebuilt, and not dropped either).
+query III
+SELECT (SELECT count(*) FROM tiger.zip_state), (SELECT count(*) FROM tiger.edge_containment),
+       (SELECT count(*) FROM tiger.zip_lookup_base);
 ----
-1	4
+1	4	2
 
 # --- Cleanup -------------------------------------------------------------
 
