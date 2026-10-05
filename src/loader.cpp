@@ -387,6 +387,28 @@ void DeleteProgressLike(Connection &conn, const std::string &data_loc, const std
 	}
 }
 
+// See the "Vintage-mixing guard" block comment in
+// us_geocoder_loader_internal.hpp for why both predicates fail open on a
+// query error, and why HasStateRows exists alongside HasVintage1992
+// (BackfillProgressIfNeeded above is exactly the pre-ledger scenario that
+// makes a key-only check insufficient).
+bool HasVintage1992(Connection &conn, const std::string &data_loc, const std::string &fips) {
+	auto r = conn.Query("SELECT count(*) FROM " + data_loc + ".loader_progress WHERE section LIKE 'tiger1992:state:" +
+	                    fips + ":%'");
+	if (r->HasError() || r->RowCount() == 0) {
+		return false;
+	}
+	return r->GetValue(0, 0).GetValue<int64_t>() > 0;
+}
+
+bool HasStateRows(Connection &conn, const std::string &data_loc, const std::string &fips) {
+	auto r = conn.Query("SELECT count(*) FROM " + data_loc + ".edges WHERE statefp = '" + fips + "' LIMIT 1");
+	if (r->HasError() || r->RowCount() == 0) {
+		return false;
+	}
+	return r->GetValue(0, 0).GetValue<int64_t>() > 0;
+}
+
 // One-shot backfill. If loader_progress is empty but the data tables already
 // have rows (existing DBs from before this migration), infer the completed
 // sections from the data so re-runs skip already-loaded states/counties
@@ -1145,6 +1167,19 @@ static void DoLoadStateImpl(ClientContext &context, const LoaderBindData &bind, 
 	EnsureHttpfsIfRemote(*context.db, bind.source);
 	Connection conn(*context.db);
 	BootstrapTargetSchema(conn, bind.data_location, bind.func_schema);
+
+	// Vintage guard: refuse to write modern data into a location that
+	// already holds 1992 TIGER data for this state. Must sit after
+	// BootstrapTargetSchema (loader_progress doesn't exist in a fresh
+	// target_db until that call creates it) and before anything else
+	// below writes rows or touches the network.
+	if (HasVintage1992(conn, bind.data_location, state.fips)) {
+		throw InvalidInputException(
+		    "us_geocoder: %s already holds 1992 TIGER data for %s. 1992 and modern vintages cannot share a "
+		    "location — use a separate catalog or schema, or run unload_tiger_1992_state('%s') first.",
+		    bind.data_location, state.abbrev, state.abbrev);
+	}
+
 	const auto &data_loc = bind.data_location;
 	const auto &func_loc = bind.func_schema;
 	const std::string &fips = state.fips;

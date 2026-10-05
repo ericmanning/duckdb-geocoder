@@ -1,0 +1,39 @@
+# name: test/sql/tiger1992_guard.test
+# description: 1992 and modern TIGER data cannot be mixed in one location
+# group: [sql]
+
+require us_geocoder
+
+require-env TIGER_TEST_EXTENSIONS
+
+statement ok
+LOAD spatial;
+
+statement ok
+CALL load_tiger_1992_state('NJ', source := 'test/data/tiger1992',
+                           build_containment := false);
+
+# The modern loader must refuse this location for NJ.
+statement error
+CALL load_tiger_state('NJ', source := 'test/data/tiger1992');
+----
+1992
+
+# After unload, the modern loader is free again (it will fail later on the
+# missing modern files, but not on the vintage guard).
+statement ok
+CALL unload_tiger_1992_state('NJ');
+
+query I
+SELECT count(*) FROM tiger.loader_progress WHERE section LIKE 'tiger1992:%';
+----
+0
+
+# Reciprocal direction: modern rows present, no tiger1992 key -> 1992 refuses.
+statement ok
+INSERT INTO tiger.edges (statefp, countyfp, tlid, mtfcc) VALUES ('34','001',1,'S1400');
+
+statement error
+CALL load_tiger_1992_state('NJ', source := 'test/data/tiger1992');
+----
+target_schema

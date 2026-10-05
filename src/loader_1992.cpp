@@ -448,7 +448,22 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 	// `target_db := 'hist92'` would try to INSERT into tables that do not exist.
 	BootstrapTargetSchema(conn, data_loc, func_loc);
 
-	// Vintage guard goes here — see Task 6, Step 4.
+	// Vintage guard: refuse to write 1992 data into a location that already
+	// holds modern TIGER rows for this state. The data-presence check
+	// (HasStateRows) matters alongside the key check (HasVintage1992)
+	// because a database loaded before the progress ledger existed can hold
+	// rows with no keys at all — a key-only check would wave that case
+	// straight through. Must sit after BootstrapTargetSchema (loader_progress
+	// doesn't exist in a fresh target_db until that call creates it) and
+	// before ListCounties1992 below, which is the first filesystem/network
+	// touch in this function.
+	if (!HasVintage1992(conn, data_loc, fips) && HasStateRows(conn, data_loc, fips)) {
+		throw InvalidInputException(
+		    "us_geocoder: %s already holds modern TIGER data for %s. 1992 and modern vintages cannot share a "
+		    "location — load 1992 into a separate catalog or schema (target_db := / target_schema :=), or run "
+		    "unload_tiger_state('%s') first.",
+		    data_loc, state.abbrev, state.abbrev);
+	}
 
 	std::vector<std::string> countyfps = ListCounties1992(context, fs, bind, fips);
 

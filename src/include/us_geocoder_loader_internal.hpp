@@ -189,6 +189,26 @@ void MarkProgressDone(Connection &conn, const std::string &data_loc, const std::
 void DeleteProgressLike(Connection &conn, const std::string &data_loc, const std::string &prefix);
 
 // =====================================================================
+// Vintage-mixing guard
+//
+// The 13 tiger.* tables carry no vintage column, so loading 1992 data and
+// modern data into the same location would silently interleave them (a
+// 1992 edge joining a 2025 face produces plausible-looking wrong
+// coordinates). These two predicates let each loader refuse the other
+// vintage's data before writing anything. Both fail OPEN on a query error
+// (loader_progress missing/unreadable => "no 1992 data"): a fresh
+// target_db has no loader_progress table until BootstrapTargetSchema
+// creates it, and failing closed there would break ordinary first loads.
+// =====================================================================
+
+// True iff this location holds 1992-vintage data for `fips`, i.e. at least
+// one progress key under "tiger1992:state:<fips>:".
+bool HasVintage1992(Connection &conn, const std::string &data_loc, const std::string &fips);
+
+// True iff this location holds any edges rows for `fips`.
+bool HasStateRows(Connection &conn, const std::string &data_loc, const std::string &fips);
+
+// =====================================================================
 // Bind-data-free bootstrap/analyze helpers
 // =====================================================================
 
