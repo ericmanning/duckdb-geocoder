@@ -4,6 +4,16 @@
 
 require us_geocoder
 
+# NOTE ON SCOPE: the queries below re-express the loader's substr() offsets
+# inline rather than running the shipped template. That is partly forced --
+# the real county_edges section is one INSERT with ST_MakeLine over a
+# generate_series unpivot, not a SELECT this harness can slice up -- but it
+# means offset drift between this file and
+# src/sql/loader_1992_templates.sql.in is invisible here. The end-to-end
+# coverage that catches drift is tiger1992_load.test / tiger1992_geocode.test
+# / tiger1992_incremental.test, which call the real loader against the same
+# fixture; treat this file as covering the arithmetic and the CFCC map only.
+
 # ---- RT1 field extraction -------------------------------------------------
 query IIIIII
 WITH src AS (
@@ -79,11 +89,15 @@ SELECT '+40996043'::BIGINT, ' -74960022'::BIGINT,
 40996043	-74960022	285050000130990000
 
 # ---- Review Focus 3: short / blank lines are skipped ---------------------
-query I
-WITH src AS (SELECT * FROM (VALUES ('short'),(''),(NULL)) v(line))
-SELECT count(*) FROM src WHERE length(line) >= 228;
-----
-0
+#
+# Deleted, not rewritten here: this was `SELECT count(*) FROM (VALUES
+# ('short'),(''),(NULL)) WHERE length(line) >= 228`, which asserted
+# DuckDB's length() against its own literals and never touched the loader's
+# filter. Real coverage now lives in tiger1992_load.test's sparse92
+# section, where the committed fixture TGR34997.F51 carries a truncated
+# 28-char record plus an empty line and the load must still produce exactly
+# 2 edges -- a load that stopped filtering would raise a cast error on the
+# truncated record instead.
 
 # ---- L/R address unpivot -------------------------------------------------
 query IIII
@@ -109,12 +123,12 @@ SELECT tlid, fromhn, tohn, side FROM (
 9002	100	198	L
 9002	101	199	R
 
-# ---- Review Focus 1: a zero-byte optional file yields zero rows ----------
-statement ok
-COPY (SELECT '' AS line WHERE false) TO '__TEST_DIR__/empty.F56' (FORMAT CSV, HEADER false);
-
-query I
-SELECT count(*) FROM read_csv('__TEST_DIR__/empty.F56',
-    columns={'line':'VARCHAR'}, delim='\x1f', header=false, quote='', escape='');
-----
-0
+# ---- Review Focus 1: a zero-byte / absent optional file yields zero rows -
+#
+# Deleted, not rewritten here: this COPY'd an empty file and counted
+# read_csv's rows over it, which tested DuckDB's CSV reader rather than
+# PathOrEmpty or any loader code. The behaviour it meant to cover -- a
+# county with no RT2/RT4/RT5/RT6 files loading cleanly -- is exercised
+# end-to-end by tiger1992_load.test's sparse92 section (county 34997 ships
+# F51/F5A/F5I only, and the assertion is that addr/featnames come back 4/2
+# rather than erroring).
