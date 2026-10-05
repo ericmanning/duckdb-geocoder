@@ -2,8 +2,8 @@
 
 DuckDB community extension `us_geocoder`: a pure-DuckDB port of PostGIS's `postgis_tiger_geocoder`. Geocodes US addresses against Census TIGER/Line data.
 
-- **PG comparison + design decisions D1–D14:** [docs/pg_parity.md](docs/pg_parity.md). The locked design ledger + per-test divergence audit + condensed PG cascade reference all live here.
-- **Public docs:** [README.md](README.md) (overview + quickstart pointer), [docs/quickstart.md](docs/quickstart.md), [docs/api.md](docs/api.md) (function reference), [docs/pg_parity.md](docs/pg_parity.md).
+- **PG comparison + design decisions D1–D15:** [docs/pg_parity.md](docs/pg_parity.md). The locked design ledger + per-test divergence audit + condensed PG cascade reference all live here.
+- **Public docs:** [README.md](README.md) (overview + quickstart pointer), [docs/quickstart.md](docs/quickstart.md), [docs/api.md](docs/api.md) (function reference), [docs/pg_parity.md](docs/pg_parity.md), [docs/tiger1992.md](docs/tiger1992.md) (1992 TIGER vintage loader).
 - **License:** GPLv2 (matches upstream).
 - **DuckDB pin:** 1.5.3 (submodule `duckdb/`).
 
@@ -12,10 +12,19 @@ DuckDB community extension `us_geocoder`: a pure-DuckDB port of PostGIS's `postg
 ```
 src/
   us_geocoder_extension.cpp    # ExtensionLoader entrypoint; registers macros + C++ table fns
-  loader.cpp                    # TIGER loader + set_tiger_reference + install_tiger_schema
+  loader.cpp                    # modern TIGER loader + set_tiger_reference + install_tiger_schema
+  loader_1992.cpp                # 1992 TIGER loader (load_tiger_1992_*, unload_tiger_1992_state)
+  zip_extract.cpp                # miniz-based zip extraction (us_geocoder_unzip); used by loader_1992
+  include/
+    us_geocoder_loader_internal.hpp  # shared loader helpers de-statics'd out of loader.cpp for reuse
+    us_geocoder_loader_1992.hpp      # RegisterLoader1992Functions
+    us_geocoder_zip.hpp              # ExtractZipEntries / RegisterZipFunctions
   sql/*.sql.in                  # embedded SQL (macros, lookup seeds, schema DDL, loader templates)
-test/sql/*.test                 # sqllogictest — 331 assertions, all deterministic (hand-built fixtures)
-docs/                           # quickstart.md, api.md, pg_parity.md, UPDATING.md
+    loader_1992_templates.sql.in # 1992 fixed-width parse + derived-table SQL (GetLoaderTemplate sections)
+test/sql/*.test                 # sqllogictest — 653 assertions, all deterministic (hand-built fixtures)
+  tiger1992_*.test               # 1992 loader: fixed-width parse, zip extraction, load, geocode, vintage guard
+test/data/tiger1992/             # hand-built 1992 fixtures (fixed-width text + one small committed zip)
+docs/                           # quickstart.md, api.md, pg_parity.md, tiger1992.md, UPDATING.md
 ```
 
 Embedded SQL is inlined at build time via the CMake pipeline in [CMakeLists.txt](CMakeLists.txt) — each `.sql.in` becomes `us_geocoder::<Name>Sql()`. Token `@TIGER@` (data location) and `@FUNC@` (local-macro location) are substituted at runtime.
@@ -24,8 +33,8 @@ Embedded SQL is inlined at build time via the CMake pipeline in [CMakeLists.txt]
 
 ```sh
 make release                    # ~10 min cold (builds DuckDB); ~30s hot
-TIGER_TEST_EXTENSIONS=1 ./build/release/test/unittest "test/sql/*"  # full suite (331 assertions, 21 cases)
-./build/release/test/unittest "test/sql/*"                          # CI-equivalent subset (93 assertions, 6 cases)
+TIGER_TEST_EXTENSIONS=1 ./build/release/test/unittest "test/sql/*"  # full suite (653 assertions, 29 cases, 1 skipped — network test)
+./build/release/test/unittest "test/sql/*"                          # CI-equivalent subset (156 assertions, 9 cases)
 ./build/release/test/unittest "test/sql/X.test"                     # single file
 ```
 
@@ -43,6 +52,28 @@ The built CLI `build/release/duckdb` statically links the extension, so no `INST
 - **Local source layout is Census-nested only.** `BuildVsiPath` uses `<source>/<SUBDIR>/<zip>.zip/<inner>` for both HTTP and local — no flat-layout fallback. Users point the loader at a mirror of `TIGER<year>/`.
 - **Loader state-list API.** `load_tiger_state(VARCHAR)` and `load_tiger_states(VARCHAR[])` share one bind-data structure (`std::vector<StatePlan>`); `load_tiger_all_states()` resolves the 50+DC list at bind time from `state_lookup WHERE statefp::INT BETWEEN 1 AND 56`.
 - **C++11** is the extension ABI baseline — no `inline constexpr std::string_view`, no structured bindings in public headers.
+
+## 1992 TIGER vintage
+
+A second loader family (`load_tiger_1992_state`/`_states`/`_all_states`, `unload_tiger_1992_state`,
+in `src/loader_1992.cpp`) populates the same 13 `tiger` tables from 1992-vintage TIGER/Line
+files, so forward geocoding works unchanged against 1990s-era data. It's a sibling module, not
+a `year`/`vintage` parameter on the modern loader — the capability set genuinely differs (no
+face polygons at all, so `reverse_geocode` and containment guarantees don't apply) and this
+keeps the modern loader's signature untouched. Full user-facing writeup, capability matrix, and
+vintage caveats: [docs/tiger1992.md](docs/tiger1992.md). Design decision D15 in
+[docs/pg_parity.md](docs/pg_parity.md#d15-1992-tiger-vintage-path).
+
+The 13 data tables have no vintage column, so a given location holds one vintage at a time —
+both loader families refuse to write into (or unload from) a location already holding the
+other vintage's rows for a given state, naming the state and the remedy. Side-by-side use of
+both vintages stays available via `target_db`/`target_schema` plus `set_tiger_reference`.
+
+Shared orchestration helpers (`LoaderResult`, `StepTimer`, `ExtractSection`, `RenderTemplate`,
+`ScrapeCensusIndex`, progress-ledger helpers, etc.) were de-statics'd out of `loader.cpp` into
+`src/include/us_geocoder_loader_internal.hpp` for reuse — that extraction landed as its own
+pure-move commit, verified green against the full suite before any 1992 code touched it,
+because `loader.cpp` is a large, critical file.
 
 ## Loader performance: what worked and what didn't
 
@@ -142,7 +173,7 @@ Wins shipped during the May 2026 perf push (`perf/geocode-batch-planning` + foll
 - Prefer editing `.sql.in` over regenerating macros from scratch.
 - Run the full sqllogic suite after any SQL change; individual file runs miss regression interactions.
 - Don't change rating weights or the "location ratings ≥ 100" invariant without an explicit spec amendment — downstream consumers depend on the total order.
-- Small focused commits per phase/feature. Commit messages reference design decisions D1–D14 from [docs/pg_parity.md](docs/pg_parity.md) where applicable.
+- Small focused commits per phase/feature. Commit messages reference design decisions D1–D15 from [docs/pg_parity.md](docs/pg_parity.md) where applicable.
 
 ## Roadmap / deferred
 
@@ -158,3 +189,4 @@ Falsified hypotheses (don't re-attempt without new information):
 - **Per-state TIGER tables (storage sharding).** Tested May 2026 on `perf/per-state-tables` (deleted): 12% wall-clock gain over unified+ART-pushdown but **2× peak RSS** because inter-state pipeline parallelism multiplies hash builds. ART pushdown gives equivalent scan shape without the schema refactor. See project memory `project_perstate_sharding_falsified.md`.
 - **Removing per-state dispatch entirely.** With the join_order workaround on, runtime-statefp queries spilled 21.8 GB at 73 s on 100K mixed before being killed by watchdog. Per-state dispatch + literal statefp + ART pushdown is the architectural floor.
 - **Smaller slice cap = safer on smaller-RAM machines.** Inverse turned out to be true: at `memory_limit='8GB'`, cap=5000 OOM'd on Texas dispatch while cap=10000 ran fine. Fewer-larger dispatches stream more cleanly than many-smaller through a constrained buffer pool. Default ships at 10000.
+- **GDAL's native TIGER driver, for the 1992 loader.** It exists and works today: `ST_Read` over `/vsizip/<county>.zip/TGR<ssccc>.F51` exposes `CompleteChain`, `Polygon`, `PolyChainLink`, and more as named layers with pre-assembled geometry, which would have removed the need for both the fixed-width parse and the zip-extraction dependency. **Rejected because the driver is deprecated upstream** — building on it would be a dead end. Two secondary problems also argued against it even setting that aside: it types `ZIPL`/`ZIPR`/`FPL`/`FMCD`/`CTBNA` as `integer`, silently destroying leading zeros (ZIP `07825` → `7825`), and it presents a field set unified across TIGER vintages, so 1992 semantics aren't self-evident from the schema. We use a fixed-width `read_csv` + `substr` parse instead (D15 in docs/pg_parity.md). Don't re-derive this.

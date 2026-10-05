@@ -2,11 +2,11 @@
 
 A DuckDB community extension that geocodes US addresses against [Census TIGER/Line](https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html) data. A pure-DuckDB rewrite of PostGIS's [`tiger_geocoder`](https://gitea.osgeo.org/postgis/postgis_tiger_geocoder).
 
-Given a street address, it returns (a) a point in NAD83 coordinates interpolated along the street centerline with a 10m perpendicular side-of-street offset, (b) the 2025 census block / tract / block-group GEOIDs covering that point, and (c) a `rating` that lower-bounds match quality (0 = perfect).
+Given a street address, it returns (a) a point in NAD83 coordinates interpolated along the street centerline with a 10m perpendicular side-of-street offset, (b) the 2025 census block / tract / block-group GEOIDs covering that point, and (c) a `rating` that lower-bounds match quality (0 = perfect). It can also load historical 1992-vintage TIGER/Line data for forward geocoding against 1990s-era streets — see [docs/tiger1992.md](docs/tiger1992.md).
 
 **Status:** alpha. Core geocoder is functional end-to-end against full TIGER data; see [docs/pg_parity.md](docs/pg_parity.md) for where v0.1 diverges from PostGIS. Future versions are likely to further diverge from PostGIS as improvements are made against ground-truth parcel data.
 
-**Docs:** [quickstart](docs/quickstart.md) · [API reference](docs/api.md) · [PG parity + design decisions](docs/pg_parity.md).
+**Docs:** [quickstart](docs/quickstart.md) · [API reference](docs/api.md) · [PG parity + design decisions](docs/pg_parity.md) · [1992 TIGER vintage](docs/tiger1992.md).
 
 ## Install
 
@@ -166,8 +166,8 @@ For an end-to-end walkthrough including TIGER data load and batch geocoding, see
 ```sh
 git submodule update --init --recursive
 make release                   # ~10 min first time (builds duckdb from source)
-TIGER_TEST_EXTENSIONS=1 make test   # 331 assertions across 21 sqllogictest files
-make test                           # CI subset: 93 assertions, 6 cases (skips spatial/standardizer tests)
+TIGER_TEST_EXTENSIONS=1 make test   # 653 assertions across 29 sqllogictest files (1 skipped — network test)
+make test                           # CI subset: 156 assertions, 9 cases (skips spatial/standardizer tests)
 ```
 
 The build produces a loadable extension at `build/release/extension/us_geocoder/us_geocoder.duckdb_extension` and a DuckDB CLI at `build/release/duckdb` with the extension statically linked.

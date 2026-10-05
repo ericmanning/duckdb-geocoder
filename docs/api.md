@@ -97,6 +97,110 @@ Either rewrap (zip the files back up, or create symlinks with the expected neste
 
 ---
 
+## 1992 TIGER vintage loaders
+
+A separate set of loaders populates the same 13 `tiger` tables from 1992-vintage TIGER/Line
+files instead of the modern shapefile distribution. Full writeup, capability matrix, and
+vintage caveats: [docs/tiger1992.md](tiger1992.md). Summary here is the function signatures.
+
+Named parameters match the modern loaders' set **minus `year`**, which is pinned to 1992:
+`source`, `target_db`, `target_schema`, `build_containment`, `parallel`, `temp_dir`,
+`parallel_workers`. Note the schema parameter is `target_schema`, matching the modern loaders —
+not `schema`.
+
+### `load_tiger_1992_state(state_abbrev VARCHAR, [source VARCHAR], target_db VARCHAR DEFAULT NULL, target_schema VARCHAR DEFAULT 'tiger', build_containment BOOLEAN DEFAULT true, parallel BOOLEAN DEFAULT true, temp_dir VARCHAR DEFAULT NULL, parallel_workers INTEGER DEFAULT 16) → TABLE(step VARCHAR, rows_loaded BIGINT)`
+
+Loads a single state's 1992 data: per-county `edges` (geometry assembled from RT1 + RT2,
+node IDs synthesized from endpoint coordinates), `faces` (attributes only — `the_geom` stays
+NULL, 1992 ships no polygons), `featnames`, `addr`, plus state-level `place`/`cousub` and —
+unlike the modern loader — this state's own `state`/`county` rows (1992 has no nation-level
+product, so each state load writes its own). Derived `zip_state`, `zip_state_loc`,
+`zip_lookup_base`, `edge_containment` follow, reusing the modern loader's derivation SQL
+verbatim.
+
+- `state_abbrev` — 2-letter postal code, case-insensitive.
+- `source` — optional URL or local path. Omitted/empty defaults to
+  `https://www2.census.gov/geo/tiger/TIGER1992`. See [docs/tiger1992.md § Source layouts](tiger1992.md#source-layouts)
+  for the three accepted forms (remote HTTP, local nested zips, local extracted tree).
+- `target_db` / `target_schema` — same semantics as the modern loaders.
+- `build_containment` — when `false`, skip the `edge_containment` precompute.
+  `containment_guaranteed` is a hard `false` either way for 1992 data (no face polygons), so
+  skipping it costs nothing but the GEOID columns on `geocode()` results.
+- `parallel` / `temp_dir` / `parallel_workers` — same semantics as the modern loaders.
+
+Idempotent via DELETE-first, same as `load_tiger_state`.
+
+```sql
+CALL load_tiger_1992_state('NJ');
+CALL load_tiger_1992_state('NJ', '/data/tiger_1992');
+CALL load_tiger_1992_state('NJ', target_db := 'hist92');
+```
+
+### `load_tiger_1992_states(states VARCHAR[], [source VARCHAR], ...) → TABLE(step VARCHAR, rows_loaded BIGINT)`
+
+Same as `load_tiger_1992_state` but accepts a list of abbreviations, loaded sequentially.
+Same named-parameter set.
+
+```sql
+CALL load_tiger_1992_states(['NJ','NY']);
+```
+
+### `load_tiger_1992_all_states([source VARCHAR], ...) → TABLE(step VARCHAR, rows_loaded BIGINT)`
+
+Convenience wrapper enumerating the 50 states + DC, same as `load_tiger_all_states`.
+
+```sql
+CALL load_tiger_1992_all_states();
+```
+
+### `unload_tiger_1992_state(state_abbrev VARCHAR | VARCHAR[], target_db VARCHAR DEFAULT NULL, target_schema VARCHAR DEFAULT 'tiger') → TABLE(step VARCHAR, rows_loaded BIGINT)`
+
+Clears one or more states' 1992 data and progress keys. Reuses the modern `unload_state`
+DELETE list (all 13 per-state tables, including `edge_containment`) and additionally deletes
+the state's own `county` and `state` rows — the modern unload template doesn't touch those
+two because the modern loader treats them as nation-level, but 1992 writes them per-state.
+
+Only `target_db` and `target_schema` are accepted — no `source`/`build_containment`/`parallel`
+knobs, matching `unload_tiger_state`.
+
+```sql
+CALL unload_tiger_1992_state('NJ');
+CALL unload_tiger_1992_state(['NJ','NY']);
+```
+
+**Multi-state calls are not atomic.** Both `unload_tiger_1992_state` and `unload_tiger_state`
+process their state list in a loop with per-statement autocommit — if a later state in the
+list fails or is refused (e.g. a mixed-vintage guard trip, below), earlier states in the same
+call have already had their rows deleted. Pre-existing behavior for any mid-loop failure; the
+vintage guard just makes it reachable via an ordinary configuration mistake instead of a rare
+I/O error.
+
+### Vintage mixing is refused, not merged
+
+The 13 TIGER data tables carry no vintage column — a given `(target_db, target_schema)`
+location holds *one* vintage. Both the 1992 loaders and the modern loaders refuse to write
+into a location that already holds rows of the other vintage for a given state, and both
+`unload_tiger_1992_state` and `unload_tiger_state` refuse to delete the other vintage's rows.
+Every refusal names the offending state and the remedy (`target_db`/`target_schema`, or
+unload first). Side-by-side use of both vintages is still available — just not in the same
+location — via `target_db`/`target_schema` plus
+[`set_tiger_reference`](#set_tiger_referencedatabase-varchar-schema-varchar-default-tiger--table).
+
+### `us_geocoder_unzip(zip_path VARCHAR, dest_dir VARCHAR) → TABLE(entry VARCHAR, bytes BIGINT)`
+
+Extracts every entry of `zip_path` into `dest_dir`, creating `dest_dir` if needed, and returns
+one row per extracted entry (`entry` = basename as stored in the archive, `bytes` = uncompressed
+size written). Not specific to 1992 — a general-purpose utility, useful for pre-extracting a
+local mirror into the "local extracted tree" source form. Directory entries in the archive are
+skipped. Matching against entries uses case-insensitive comparison (1992 archives store names
+in uppercase).
+
+```sql
+SELECT * FROM us_geocoder_unzip('/data/tiger1992/34/34041.zip', '/data/tiger1992/34/34041');
+```
+
+---
+
 ## Reference databases
 
 The geocoder macros (`tiger.geocode`, `tiger.reverse_geocode`, `tiger.geocode_intersection`, and their helpers) always live in the local `tiger` schema. The 13 **data tables** (`state`, `county`, `place`, `cousub`, `zcta5`, `zip_state`, `zip_state_loc`, `zip_lookup_base`, `edges`, `faces`, `featnames`, `addr`, `edge_containment`) can be either base tables in the current catalog or views pointing at an attached catalog.

@@ -1,6 +1,6 @@
 # Parity with `postgis_tiger_geocoder`
 
-`us_geocoder` is a pure-DuckDB port of PostGIS's [`postgis_tiger_geocoder`](https://gitea.osgeo.org/postgis/postgis_tiger_geocoder). This doc records what matches, where the port deliberately diverges, and the per-test divergence audit. It also captures the design decisions (D1–D14) that drove the port and a condensed reference to the PG cascade for maintainers reading our SQL alongside PG's.
+`us_geocoder` is a pure-DuckDB port of PostGIS's [`postgis_tiger_geocoder`](https://gitea.osgeo.org/postgis/postgis_tiger_geocoder). This doc records what matches, where the port deliberately diverges, and the per-test divergence audit. It also captures the design decisions (D1–D15) that drove the port and a condensed reference to the PG cascade for maintainers reading our SQL alongside PG's.
 
 ## Quick status
 
@@ -67,6 +67,34 @@ PG's loader generates bash/batch scripts that the user runs outside Postgres. `u
 - **L3** The single-midpoint offset check can pass or fail differently than a full buffer-within-face test near intersections (endpoint caps). v0.2 can upgrade to an `ST_OffsetCurve`-based sampled strip once DuckDB spatial exposes it (as of pinned v1.5.3 it doesn't).
 
 All three limitations are **false-negatives only** — `containment_guaranteed = true` is provably correct.
+
+### D15: 1992 TIGER vintage path
+
+`load_tiger_1992_state` / `_states` / `_all_states` populate the same 13 `tiger` tables from
+1992-vintage TIGER/Line files instead of the modern shapefile distribution, so
+`tiger.geocode()` and the whole forward path run unchanged against 1990s-era data. Full
+writeup: [docs/tiger1992.md](tiger1992.md).
+
+This is **forward geocoding only** — 1992 TIGER ships no face polygons, so everything that
+needs an area polygon is out of scope: `tiger.reverse_geocode()` returns zero rows,
+`geocode_location`'s ZCTA-centroid and place-centroid tiers (city/ZIP-only input) don't fire,
+and `containment_guaranteed` is a hard `false` on every row (`require_containment` values
+other than `'none'` consequently return zero rows, not an error). `pretypabrv` and
+`prequalabr` are always NULL — 1992 has only four name fields (FEDIRP/FENAME/FETYPE/FEDIRS),
+so prefix types and qualifiers stay inside `FENAME`. Block GEOIDs are 1990-vintage and 14 *or*
+15 characters (three-digit 1990 block codes plus an optional suffix), kept unpadded rather
+than coerced to the modern four-digit `blockce20` width, because padding would conflate
+distinct blocks.
+
+GDAL's native `TIGER` driver was evaluated and rejected as the parse layer. It works today —
+`ST_Read` over `/vsizip/<county>.zip/TGR<ssccc>.F51` exposes `CompleteChain`, `Polygon`,
+`PolyChainLink`, and more as named layers with pre-assembled geometry — but it is deprecated
+upstream, and it has two secondary problems that would have mattered even if it weren't:
+it types `ZIPL`/`ZIPR`/`FPL`/`FMCD`/`CTBNA` as `integer`, silently destroying leading zeros
+(ZIP `07825` → `7825`), and it presents a field set unified across TIGER vintages, so 1992
+semantics aren't self-evident from the schema. We use a fixed-width `read_csv` + `substr`
+parse instead. See [CLAUDE.md § 1992 TIGER vintage](../CLAUDE.md#1992-tiger-vintage) for the
+full rejection rationale — don't re-derive this.
 
 ## Improvements over PG (deliberate divergences)
 
@@ -333,7 +361,7 @@ The Docker image at [benchmark/pg/](../benchmark/pg/) builds the PG side (PG 16 
 
 ---
 
-# Locked design decisions (D1–D14)
+# Locked design decisions (D1–D15)
 
 The committed choices that drove the v0.1 port. Inline `.sql.in` and C++ comments reference these by number — don't change the meaning of a decision without updating both sides.
 
@@ -353,6 +381,7 @@ The committed choices that drove the v0.1 port. Inline `.sql.in` and C++ comment
 | D12 | **Year handling.** `2025` default; `year` is a runtime parameter override. Per-year URL patterns and per-year schema tweaks live in a small internal config structure so year-to-year TIGER drift can be handled without a new extension release. |
 | D13 | **Parity testing.** v0.1 ships with (a) a hand-curated ~50-address corpus covering stress classes (numbered highways, `prequalabr` like `Old`, short street names, ZIP typos, cross-state ZIPs, unit suffixes, `I-635`/`I- 635` highway spacing), plus (b) ports of PG's regression tests (`geocode_regress`, `reverse_geocode_regress`, `test-geocode_intersection_spacing`). We skip `normalize_address_regress` — that parser isn't ported. |
 | D14 | **Census block/tract containment guarantees.** Precompute per-edge-per-side whether the interpolated offset point is guaranteed to land inside the adjacent face (implying block, tract, block group, county, state). Exposed at geocode time via `block_geoid`/`tract_geoid`/`blkgrp_geoid` output columns (always populated) plus a `containment_guaranteed` boolean, and a `require_containment` filter parameter. Guarantee holds at the default offset only. |
+| D15 | **1992 TIGER vintage path.** Explicit `load_tiger_1992_*` loaders (not a `year`/`vintage` parameter on the modern loader) populate the same 13 tables from 1990s TIGER/Line files — forward geocoding only, since 1992 ships no face polygons. `guaranteed_*` is a hard `false` on every row; `pretypabrv`/`prequalabr` are always NULL (only four 1992 name fields); block GEOIDs are 1990-vintage and 14-or-15 characters, kept unpadded. GDAL's native TIGER driver was evaluated and rejected: deprecated upstream, plus it types ZIP/FIPS fields as `integer` (destroying leading zeros) and unifies fields across vintages. See [§ D15](#d15-1992-tiger-vintage-path) and [docs/tiger1992.md](tiger1992.md). |
 
 ---
 
