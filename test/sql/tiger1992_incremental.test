@@ -84,7 +84,7 @@ ORDER BY step;
 ----
 county_addr:999	6
 county_edges:999	2
-county_faces:999	2
+county_faces:999	3
 county_featnames:999	3
 derived_edge_containment	2
 derived_zip_lookup_base	1
@@ -136,7 +136,7 @@ SELECT (SELECT count(*) FROM tiger.edges), (SELECT count(*) FROM tiger.faces),
        (SELECT count(*) FROM tiger.featnames), (SELECT count(*) FROM tiger.addr),
        (SELECT count(*) FROM tiger.edge_containment);
 ----
-4	4	5	10	4
+4	5	5	10	4
 
 # Content, not just counts: every edge_containment row has a real,
 # non-NULL GEOID (proving the edges<->faces join actually matched, not a

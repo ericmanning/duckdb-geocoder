@@ -56,11 +56,22 @@ WHERE a.tlid = 9001 AND b.tlid = 9002;
 1
 
 # faces attributes, no geometry.
+#
+# Polygon 3 is the blank-CTBNA-suffix / 3-digit-BLK case. Real 1992 RTA
+# records store CTBNA (cols 41-46) as a 4-digit basic tract plus a
+# BLANK-filled 2-char suffix ('0301  '), while the canonical 1990 tract
+# code zero-fills that suffix ('030100'). Polygons 1 and 2 carry a full
+# 6-char CTBNA, so on their own they exercise only the path where trimming
+# and zero-filling agree -- which is why the template's original
+# `nullif(trim(substr(line,41,6)),'')` emitted 4-char tracts on ~60% of
+# real rows and no test noticed. See the GEOID-length assertions in
+# tiger1992_geocode.test.
 query IIIII
 SELECT tfid, placefp, cousubfp, tractce20, blockce20 FROM tiger.faces ORDER BY tfid;
 ----
 349990000000001	54321	12345	012345	1001
 349990000000002	54321	12345	012345	1002
+349990000000003	54321	12345	030100	201
 
 query I
 SELECT count(*) FROM tiger.faces WHERE the_geom IS NOT NULL;
@@ -193,3 +204,16 @@ query II
 SELECT (SELECT count(*) FROM tiger.addr), (SELECT count(*) FROM tiger.featnames);
 ----
 4	2
+
+# Short / blank records are skipped. sparse92's TGR34997.F51 carries, after
+# its two well-formed 228-char records, a 28-char truncated record and an
+# empty line. Every 1992 county section filters with `length(line) >= 228`;
+# with that filter removed the substr()::BIGINT casts on the truncated
+# record raise a conversion error, so "2 edges, load succeeded" is the
+# assertion that proves the filter does its job. This replaces a
+# `VALUES ('short'),(''),(NULL)` block in tiger1992_fixedwidth.test that
+# asserted length() against its own literals and touched no project code.
+query I
+SELECT count(*) FROM tiger.edges;
+----
+2

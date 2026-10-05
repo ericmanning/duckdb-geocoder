@@ -96,7 +96,20 @@ SELECT '@STATEFP@', '@COUNTYFP@',
        trim(substr(line,11,5))::BIGINT * 10000000000 + trim(substr(line,16,10))::BIGINT,
        nullif(trim(substr(line,36,5)),''),
        nullif(trim(substr(line,31,5)),''),
-       nullif(trim(substr(line,41,6)),''),
+       -- CTBNA (cols 41-46) is a 4-digit basic tract (41-44) plus a 2-char
+       -- suffix (45-46) that is BLANK-filled when the tract has no suffix
+       -- ('0301  '), not zero-filled. The canonical 1990 tract code is
+       -- always 6 chars with a ZERO-filled suffix ('030100'), so trim()ing
+       -- the whole field would emit a 4-char tract and a 12/13-char block
+       -- GEOID that no 1990 census tract/block table can be joined on.
+       -- Zero-fill the suffix instead: tract 11 chars, blkgrp 12,
+       -- block 14-or-15 (see derived_edge_containment below).
+       CASE WHEN trim(substr(line,41,6)) = '' THEN NULL
+            ELSE substr(line,41,4)
+                 || CASE WHEN trim(substr(line,45,2)) = '' THEN '00'
+                         ELSE substr(line,45,2) END END,
+       -- BLK (cols 47-50) is genuinely variable-width in 1990 (3 digits
+       -- plus an optional suffix char), so trim() is correct here.
        nullif(trim(substr(line,47,4)),''),
        nullif(substr(trim(substr(line,47,4)),1,1),''),
        NULL

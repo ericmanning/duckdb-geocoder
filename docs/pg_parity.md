@@ -79,12 +79,25 @@ This is **forward geocoding only** — 1992 TIGER ships no face polygons, so eve
 needs an area polygon is out of scope: `tiger.reverse_geocode()` returns zero rows,
 `geocode_location`'s ZCTA-centroid and place-centroid tiers (city/ZIP-only input) don't fire,
 and `containment_guaranteed` is a hard `false` on every row (`require_containment` values
-other than `'none'` consequently return zero rows, not an error). `pretypabrv` and
-`prequalabr` are always NULL — 1992 has only four name fields (FEDIRP/FENAME/FETYPE/FEDIRS),
-so prefix types and qualifiers stay inside `FENAME`. Block GEOIDs are 1990-vintage and 14 *or*
-15 characters (three-digit 1990 block codes plus an optional suffix), kept unpadded rather
-than coerced to the modern four-digit `blockce20` width, because padding would conflate
-distinct blocks.
+other than `'none'` consequently return zero rows, not an error). The place-centroid tier
+carries an explicit `place.the_geom IS NOT NULL` filter for this reason: 1992 populates
+`place.name` with a NULL geometry, and without the filter city-only input returned one
+rating-100 row with `geom` NULL — a successful match by any caller's reading. The filter is a
+no-op for modern data, where the polygon comes straight off the PLACE shapefile.
+
+`pretypabrv` and `prequalabr` are always NULL — 1992 has only four name fields
+(FEDIRP/FENAME/FETYPE/FEDIRS), so prefix types and qualifiers stay inside `FENAME`.
+
+Block GEOIDs are 1990-vintage and 14 *or* 15 characters (three-digit 1990 block codes plus an
+optional suffix), kept unpadded rather than coerced to the modern four-digit `blockce20`
+width, because padding would conflate distinct blocks. `tract_geoid` is always 11 and
+`blkgrp_geoid` always 12. The tract code's own 2-char suffix *is* zero-filled, though: 1992
+RTA stores `CTBNA` as a 4-digit basic tract plus a blank-filled suffix (`'0301  '`) while the
+canonical 1990 tract code zero-fills it (`030100`), and trimming the whole field instead
+yields a 4-char tract — 16,364 of Rhode Island's 25,787 RTA records, which put 60.4% of
+`edge_containment` rows on a 12- or 13-char block GEOID that no 1990 census table can be
+joined on. Verified on real RI data after the fix: block 14×78,130 / 15×4,824, tract
+11×82,954, blkgrp 12×82,954.
 
 GDAL's native `TIGER` driver was evaluated and rejected as the parse layer. It works today —
 `ST_Read` over `/vsizip/<county>.zip/TGR<ssccc>.F51` exposes `CompleteChain`, `Polygon`,
@@ -381,7 +394,7 @@ The committed choices that drove the v0.1 port. Inline `.sql.in` and C++ comment
 | D12 | **Year handling.** `2025` default; `year` is a runtime parameter override. Per-year URL patterns and per-year schema tweaks live in a small internal config structure so year-to-year TIGER drift can be handled without a new extension release. |
 | D13 | **Parity testing.** v0.1 ships with (a) a hand-curated ~50-address corpus covering stress classes (numbered highways, `prequalabr` like `Old`, short street names, ZIP typos, cross-state ZIPs, unit suffixes, `I-635`/`I- 635` highway spacing), plus (b) ports of PG's regression tests (`geocode_regress`, `reverse_geocode_regress`, `test-geocode_intersection_spacing`). We skip `normalize_address_regress` — that parser isn't ported. |
 | D14 | **Census block/tract containment guarantees.** Precompute per-edge-per-side whether the interpolated offset point is guaranteed to land inside the adjacent face (implying block, tract, block group, county, state). Exposed at geocode time via `block_geoid`/`tract_geoid`/`blkgrp_geoid` output columns (always populated) plus a `containment_guaranteed` boolean, and a `require_containment` filter parameter. Guarantee holds at the default offset only. |
-| D15 | **1992 TIGER vintage path.** Explicit `load_tiger_1992_*` loaders (not a `year`/`vintage` parameter on the modern loader) populate the same 13 tables from 1990s TIGER/Line files — forward geocoding only, since 1992 ships no face polygons. `guaranteed_*` is a hard `false` on every row; `pretypabrv`/`prequalabr` are always NULL (only four 1992 name fields); block GEOIDs are 1990-vintage and 14-or-15 characters, kept unpadded. GDAL's native TIGER driver was evaluated and rejected: deprecated upstream, plus it types ZIP/FIPS fields as `integer` (destroying leading zeros) and unifies fields across vintages. See [§ D15](#d15-1992-tiger-vintage-path) and [docs/tiger1992.md](tiger1992.md). |
+| D15 | **1992 TIGER vintage path.** Explicit `load_tiger_1992_*` loaders (not a `year`/`vintage` parameter on the modern loader) populate the same 13 tables from 1990s TIGER/Line files — forward geocoding only, since 1992 ships no face polygons. `guaranteed_*` is a hard `false` on every row; `pretypabrv`/`prequalabr` are always NULL (only four 1992 name fields); block GEOIDs are 1990-vintage and 14-or-15 characters, kept unpadded (the tract code's blank-filled suffix *is* zero-filled, so `tract_geoid` is always 11). GDAL's native TIGER driver was evaluated and rejected: deprecated upstream, plus it types ZIP/FIPS fields as `integer` (destroying leading zeros) and unifies fields across vintages. See [§ D15](#d15-1992-tiger-vintage-path) and [docs/tiger1992.md](tiger1992.md). |
 
 ---
 

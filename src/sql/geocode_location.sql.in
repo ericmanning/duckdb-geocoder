@@ -85,6 +85,14 @@ CREATE OR REPLACE MACRO @TIGER@.geocode_location_impl(inp, restrict_geom_4269) A
         CROSS JOIN p
         WHERE p.location IS NOT NULL
           AND pl.statefp = (SELECT statefp FROM in_state)
+          -- A place row with no polygon cannot produce a centroid, and a
+          -- NULL geom delivered as a rating-100 "match" is worse than no
+          -- row at all (ST_Distance -> NULL, NOT NULL inserts fail, and
+          -- "zero rows means no match" stops holding). 1992-vintage data
+          -- populates place.name with the_geom NULL for every row, which
+          -- is what made this reachable; for modern data the polygon comes
+          -- straight off the PLACE shapefile and the filter is a no-op.
+          AND pl.the_geom IS NOT NULL
           AND soundex(pl.name) = soundex(p.location)
           AND (restrict_geom_4269 IS NULL OR ST_Intersects(pl.the_geom, restrict_geom_4269))
     )

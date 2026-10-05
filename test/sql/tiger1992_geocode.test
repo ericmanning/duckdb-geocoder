@@ -77,6 +77,48 @@ FROM tiger.geocode({'address':50,'street_name':'Fixture','street_type':'Rd',
 ----
 349990123451002	15
 
+# The 14-char case, and the whole point of fixture polygon 3.
+#
+# Real 1992 RTA records store CTBNA (cols 41-46) as a 4-digit basic tract
+# plus a BLANK-filled 2-char suffix ('0301  ', not '030100'); the canonical
+# 1990 tract code zero-fills that suffix. Polygon 3 is the only fixture
+# polygon in that shape, and it also carries a 3-digit BLK ('201 '), so it
+# is the only one that distinguishes the template's correct
+# zero-fill-the-suffix from a plain trim() of the whole field. A trim()
+# yields tract '0301' and the lengths 9 / 10 / 12 below instead of
+# 11 / 12 / 14 -- which is what shipped, on ~60% of real 1990 tracts, with
+# the 15-char assertion above green the whole time.
+#
+# Routed through tiger.geocode() rather than read off edge_containment so
+# this pins the public API: house 151 is odd and in R range 101-199
+# (hn_max 199, odd -> parity match, +0) rather than L range 100-198
+# (hn_max 198, even -> +2), so the winning a_side is 'R' and block_geoid
+# resolves to block_geoid_r, i.e. fixture polygon 3 via tlid 9002's
+# POLYIDR.
+query IIIIII
+SELECT g.tract_geoid, length(g.tract_geoid),
+       g.blkgrp_geoid, length(g.blkgrp_geoid),
+       g.block_geoid, length(g.block_geoid)
+FROM tiger.geocode({'address':151,'street_name':'Second','street_type':'Ave',
+                    'internal':NULL,'pre_dir':NULL,'post_dir':NULL,
+                    'location':NULL,'state_abbrev':'NJ','zip':'07825'}::tiger.geocode_input,
+                   1, NULL, 'none') g;
+----
+34999030100	11	349990301002	12	34999030100201	14
+
+# Every GEOID the 1992 path emits is one of the two documented widths
+# (docs/tiger1992.md § Vintage caveats, pg_parity.md D15): tract 11,
+# blkgrp 12, block 14 or 15. Nothing 9, 10, 12 or 13 wide on the block
+# column.
+query III
+SELECT count(*) FILTER (WHERE length(tract_geoid_l) <> 11 OR length(tract_geoid_r) <> 11),
+       count(*) FILTER (WHERE length(blkgrp_geoid_l) <> 12 OR length(blkgrp_geoid_r) <> 12),
+       count(*) FILTER (WHERE length(block_geoid_l) NOT IN (14, 15)
+                           OR length(block_geoid_r) NOT IN (14, 15))
+FROM tiger.edge_containment;
+----
+0	0	0
+
 # The alternate name from RT4/RT5 also matches.
 query I
 SELECT count(*) FROM tiger.geocode(
@@ -100,6 +142,34 @@ query I
 SELECT count(*) FROM tiger.reverse_geocode(ST_Point(-74.955, 40.9925), 5);
 ----
 0
+
+# Documented limitation: geocode_location's place-centroid tier returns
+# ZERO ROWS for city-only input, not a NULL-geometry row.
+#
+# 1992 populates place.name with place.the_geom NULL for every row, and
+# place_tier had no `the_geom IS NOT NULL` filter, so city-only input
+# produced one row with geom NULL and rating 100 -- a successful match by
+# every caller's reading, propagating straight out of the public
+# tiger.geocode(). That contradicted docs/tiger1992.md's capability matrix
+# and pg_parity.md D15, and is strictly worse for consumers than no row
+# (ST_Distance -> NULL, NOT NULL inserts fail, "zero rows means no match"
+# stops holding). Asserted at both layers: the macro and the public entry
+# point.
+query I
+SELECT count(*) FROM tiger.geocode_location_impl(
+  CAST({address: NULL, street_name: NULL, street_type: NULL, pre_dir: NULL,
+        post_dir: NULL, location: 'Fixture', state_abbrev: 'NJ', zip: NULL}
+       AS tiger.geocode_input), NULL);
+----
+0
+
+query II
+SELECT count(*), count(geom) FROM tiger.geocode(
+  {'address':NULL,'street_name':NULL,'street_type':NULL,'internal':NULL,
+   'pre_dir':NULL,'post_dir':NULL,'location':'Fixture','state_abbrev':'NJ',
+   'zip':NULL}::tiger.geocode_input, 5, NULL, 'none');
+----
+0	0
 
 # Unload clears every per-state table and the progress keys.
 statement ok
