@@ -1011,6 +1011,21 @@ static void UnloadTigerStateExecute(ClientContext &context, TableFunctionInput &
 		const auto &tmpl = LoaderTemplatesSql();
 		auto unload_template = ExtractSection(tmpl, "unload_state");
 		for (const auto &state : bind.states) {
+			// Vintage guard: refuse to delete 1992 data through the modern
+			// unload path. unload_state's DELETE template covers all 13
+			// tables, so running it against 1992 rows would silently erase
+			// them without ever clearing their tiger1992: progress keys —
+			// no error, no warning, no bookkeeping to recover from.
+			// Checked per-state (a multi-state CALL could mix vintages
+			// across states), after BootstrapTargetSchema (loader_progress
+			// doesn't exist in a fresh target_db before that call) and
+			// before the DELETE below.
+			if (HasVintage1992(conn, data_loc, state.fips)) {
+				throw InvalidInputException(
+				    "us_geocoder: %s holds 1992 TIGER data for %s, not modern data — use "
+				    "unload_tiger_1992_state('%s') instead of unload_tiger_state.",
+				    data_loc, state.abbrev, state.abbrev);
+			}
 			StepTimer t(state.abbrev, "unload_state");
 			auto rendered = RenderTemplate(unload_template,
 			                               {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", state.fips}});

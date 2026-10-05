@@ -13,11 +13,26 @@ statement ok
 CALL load_tiger_1992_state('NJ', source := 'test/data/tiger1992',
                            build_containment := false);
 
-# The modern loader must refuse this location for NJ.
+# The modern UNLOAD path must also refuse this location for NJ: deleting
+# these rows via unload_tiger_state would silently delete 1992 data
+# without ever clearing its tiger1992: progress keys.
+statement error
+CALL unload_tiger_state('NJ');
+----
+not modern data
+
+# The modern LOAD path must refuse this location for NJ.
+#
+# Asserting on a substring unique to the guard's own message, not "1992":
+# the fixture path itself is test/data/tiger1992, so load_tiger_state
+# pointed at it fails naturally (missing modern zips) with an error that
+# *also* contains "1992" -- that assertion would pass even with the guard
+# code deleted entirely. "cannot share a location" appears nowhere except
+# the guard's own text.
 statement error
 CALL load_tiger_state('NJ', source := 'test/data/tiger1992');
 ----
-1992
+cannot share a location
 
 # After unload, the modern loader is free again (it will fail later on the
 # missing modern files, but not on the vintage guard).
@@ -29,7 +44,8 @@ SELECT count(*) FROM tiger.loader_progress WHERE section LIKE 'tiger1992:%';
 ----
 0
 
-# Reciprocal direction: modern rows present, no tiger1992 key -> 1992 refuses.
+# Reciprocal direction: modern rows present, no tiger1992 key -> 1992 LOAD
+# refuses.
 statement ok
 INSERT INTO tiger.edges (statefp, countyfp, tlid, mtfcc) VALUES ('34','001',1,'S1400');
 
@@ -37,3 +53,12 @@ statement error
 CALL load_tiger_1992_state('NJ', source := 'test/data/tiger1992');
 ----
 target_schema
+
+# ...and the 1992 UNLOAD path refuses the same location for the same
+# reason: deleting these rows via unload_tiger_1992_state would silently
+# delete modern data with no error and no progress-key bookkeeping to
+# show for it.
+statement error
+CALL unload_tiger_1992_state('NJ');
+----
+not 1992 data

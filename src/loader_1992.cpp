@@ -809,6 +809,19 @@ static void Unload1992Execute(ClientContext &context, TableFunctionInput &data_p
 		const auto &tmpl = LoaderTemplatesSql();
 		auto unload_template = ExtractSection(tmpl, "unload_state");
 		for (const auto &state : bind.states) {
+			// Vintage guard: refuse to delete modern data through the 1992
+			// unload path. Same HasStateRows pairing as the 1992 load guard
+			// above — a pre-ledger database can hold modern rows with no
+			// progress keys, so a key-only check would wave this through
+			// and silently erase modern data with no error, no warning, and
+			// no progress-key cleanup to show for it. Checked per-state,
+			// after BootstrapTargetSchema and before the DELETE below.
+			if (!HasVintage1992(conn, data_loc, state.fips) && HasStateRows(conn, data_loc, state.fips)) {
+				throw InvalidInputException(
+				    "us_geocoder: %s holds modern TIGER data for %s, not 1992 data — use "
+				    "unload_tiger_state('%s') instead of unload_tiger_1992_state.",
+				    data_loc, state.abbrev, state.abbrev);
+			}
 			StepTimer t(state.abbrev, "unload_1992_state");
 			auto rendered = RenderTemplate(unload_template,
 			                               {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", state.fips}});
