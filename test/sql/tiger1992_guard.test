@@ -34,6 +34,42 @@ CALL load_tiger_state('NJ', source := 'test/data/tiger1992');
 ----
 cannot share a location
 
+# load_tiger_nation must refuse too. It writes modern nation-level
+# state/county/zcta5 rows, which are NOT keyed per-state, so the guard here
+# is "this location holds 1992 data for ANY state", not the per-fips
+# predicate the other four sites use. It had no guard at all: with a valid
+# source it wrote 2020-vintage zcta5 rows into a 1992 location, after which
+# ZIP-only input returned a 2020 ZCTA centroid against 1992 streets --
+# silently mixing vintages and falsifying the documented "zcta5 is not
+# populated for 1992" caveat.
+statement error
+CALL load_tiger_nation(source := 'test/data/tiger1992');
+----
+load_tiger_nation writes modern nation-level
+
+# The modern loader's REMOTE + parallel entry point refuses as well.
+#
+# The guard used to live inside DoLoadStateImpl, which on this path runs
+# only after DoLoadState has resolved a temp dir, scraped the Census
+# directory index and downloaded the whole state's zips -- so a real source
+# refused after hundreds of MB and minutes, behind two misleading
+# "parallel path failed" / "falling back to legacy /vsicurl/ path" log
+# lines. It is now hoisted to the top of DoLoadState.
+#
+# Honest about what this pins and what it doesn't: 127.0.0.1:1 refuses
+# connections instantly, and the OLD code reached the same guard via its
+# fallback call, so this assertion cannot distinguish the ordering on its
+# own -- the ordering is only observable as wasted network I/O and the two
+# stderr lines, neither of which sqllogictest can see. What it does pin is
+# that the remote+parallel entry point refuses with the GUARD's message
+# rather than a transport error, which is what breaks if the hoisted guard
+# is removed or if the catch below it starts swallowing
+# InvalidInputException again.
+statement error
+CALL load_tiger_state('NJ', source := 'http://127.0.0.1:1/nope', parallel := true);
+----
+cannot share a location
+
 # After unload, the modern loader is free again (it will fail later on the
 # missing modern files, but not on the vintage guard).
 statement ok
@@ -49,10 +85,13 @@ SELECT count(*) FROM tiger.loader_progress WHERE section LIKE 'tiger1992:%';
 statement ok
 INSERT INTO tiger.edges (statefp, countyfp, tlid, mtfcc) VALUES ('34','001',1,'S1400');
 
+# Asserting on text unique to the guard, not on "target_schema" -- that's
+# a parameter name the guard's remedy sentence happens to mention, and it
+# appears in plenty of unrelated binder errors.
 statement error
 CALL load_tiger_1992_state('NJ', source := 'test/data/tiger1992');
 ----
-target_schema
+already holds modern TIGER data
 
 # ...and the 1992 UNLOAD path refuses the same location for the same
 # reason: deleting these rows via unload_tiger_1992_state would silently

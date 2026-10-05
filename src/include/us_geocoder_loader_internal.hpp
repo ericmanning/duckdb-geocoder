@@ -1,18 +1,25 @@
 #pragma once
 
-// Shared, bind-data-free helpers extracted from loader.cpp so a second
-// ingestion module (loader_1992.cpp, for 1992-vintage TIGER/Line files) can
-// reuse the modern loader's template-rendering, INSERT-execution,
-// progress-ledger, and temp-dir orchestration helpers instead of
-// duplicating them. Pure extraction: every declaration/definition here is
-// copied verbatim (less `static`) from src/loader.cpp; no behaviour
-// changed.
+// Shared, bind-data-free loader helpers used by BOTH ingestion modules:
+// src/loader.cpp (modern TIGER) and src/loader_1992.cpp (1992-vintage
+// TIGER/Line). Template rendering, INSERT execution, the progress ledger,
+// temp-dir orchestration, the vintage-mixing guard, schema bootstrap and
+// ANALYZE all live here so the two modules share one implementation.
 //
-// Deliberately NOT moved here: LoaderBindData, ApplyTargetParams,
-// BootstrapTargetSchema, RunAnalyzeOnTigerTables. Those take
-// LoaderBindData (or a reference to it), which stays private to
-// loader.cpp — the 1992 loader defines its own bind-data struct and its
-// own narrower target-param application instead of sharing this one.
+// This started as a verbatim de-static'ing of helpers from loader.cpp, but
+// it is no longer a pure extraction — do not read it as one:
+//
+//   * BootstrapTargetSchema / RunAnalyzeOnTigerTables moved here with
+//     NARROWED signatures (plain strings instead of `const LoaderBindData
+//     &`), because LoaderBindData itself stays private to loader.cpp and
+//     the 1992 loader has its own bind-data struct.
+//   * HasVintage1992 / HasStateRows / RefuseIfVintageMismatch /
+//     RefuseIfVintage1992Present are NEW with the 1992 path; they never
+//     existed in loader.cpp.
+//
+// Still deliberately NOT here: LoaderBindData and ApplyTargetParams. Both
+// are bind-data-shaped and stay private to loader.cpp; the 1992 loader
+// defines its own struct and its own narrower target-param application.
 
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -194,19 +201,55 @@ void DeleteProgressLike(Connection &conn, const std::string &data_loc, const std
 // The 13 tiger.* tables carry no vintage column, so loading 1992 data and
 // modern data into the same location would silently interleave them (a
 // 1992 edge joining a 2025 face produces plausible-looking wrong
-// coordinates). These two predicates let each loader refuse the other
+// coordinates). The predicates below let each loader refuse the other
 // vintage's data before writing anything. Both fail OPEN on a query error
 // (loader_progress missing/unreadable => "no 1992 data"): a fresh
 // target_db has no loader_progress table until BootstrapTargetSchema
 // creates it, and failing closed there would break ordinary first loads.
+//
+// Every caller goes through RefuseIfVintageMismatch (per-state) or
+// RefuseIfVintage1992Present (nation-scope) rather than re-expressing the
+// predicate + throw shape inline. There are five guard sites across the
+// two loaders (modern load/unload, 1992 load/unload, modern nation load)
+// and the fifth was missed for exactly as long as each site spelled the
+// condition out for itself.
 // =====================================================================
 
 // True iff this location holds 1992-vintage data for `fips`, i.e. at least
 // one progress key under "tiger1992:state:<fips>:".
 bool HasVintage1992(Connection &conn, const std::string &data_loc, const std::string &fips);
 
+// True iff this location holds ANY 1992-vintage data, for any state.
+// Nation-scope callers (load_tiger_nation writes state/county/zcta5, which
+// are not per-state) need this rather than the per-fips predicate.
+bool HasAnyVintage1992(Connection &conn, const std::string &data_loc);
+
 // True iff this location holds any edges rows for `fips`.
 bool HasStateRows(Connection &conn, const std::string &data_loc, const std::string &fips);
+
+// Which vintage the calling loader deals in, and what it is about to do.
+enum class LoaderVintage { MODERN, TIGER1992 };
+enum class LoaderVintageOp { LOAD, UNLOAD };
+
+// Throw InvalidInputException if `data_loc` already holds the OTHER
+// vintage's rows for `fips`. Call after BootstrapTargetSchema (a fresh
+// target_db has no loader_progress before it) and before any row write,
+// DELETE, filesystem read or network fetch.
+//
+// MODERN callers trip on a "tiger1992:state:<fips>:" progress key.
+// TIGER1992 callers trip on "edges rows present AND no tiger1992 key" —
+// the data-presence half matters because a database loaded before the
+// progress ledger existed holds modern rows with no keys at all, which a
+// key-only check would wave straight through.
+void RefuseIfVintageMismatch(Connection &conn, const std::string &data_loc, const std::string &fips,
+                             const std::string &abbrev, LoaderVintage caller, LoaderVintageOp op);
+
+// Nation-scope variant: throw if `data_loc` holds 1992 data for ANY state.
+// load_tiger_nation writes modern nation-level state/county/zcta5 rows,
+// which are not keyed per-state, so any 1992 state in this location is a
+// mismatch. Without it, a modern 2020-vintage zcta5 row lands next to 1992
+// streets and ZIP-only input silently returns a 2020 ZCTA centroid.
+void RefuseIfVintage1992Present(Connection &conn, const std::string &data_loc);
 
 // =====================================================================
 // Bind-data-free bootstrap/analyze helpers

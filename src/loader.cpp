@@ -401,12 +401,67 @@ bool HasVintage1992(Connection &conn, const std::string &data_loc, const std::st
 	return r->GetValue(0, 0).GetValue<int64_t>() > 0;
 }
 
-bool HasStateRows(Connection &conn, const std::string &data_loc, const std::string &fips) {
-	auto r = conn.Query("SELECT count(*) FROM " + data_loc + ".edges WHERE statefp = '" + fips + "' LIMIT 1");
+bool HasAnyVintage1992(Connection &conn, const std::string &data_loc) {
+	auto r = conn.Query("SELECT count(*) FROM " + data_loc + ".loader_progress WHERE section LIKE 'tiger1992:%'");
 	if (r->HasError() || r->RowCount() == 0) {
 		return false;
 	}
 	return r->GetValue(0, 0).GetValue<int64_t>() > 0;
+}
+
+// Existence check, not a count: `SELECT 1 ... LIMIT 1` stops at the first
+// matching row. The previous `SELECT count(*) ... LIMIT 1` full-counted the
+// state's edges (the LIMIT is a no-op on an aggregate) only to compare the
+// total against zero, which load_tiger_1992_all_states paid 51 times over.
+bool HasStateRows(Connection &conn, const std::string &data_loc, const std::string &fips) {
+	auto r = conn.Query("SELECT 1 FROM " + data_loc + ".edges WHERE statefp = '" + fips + "' LIMIT 1");
+	if (r->HasError()) {
+		return false;
+	}
+	return r->RowCount() > 0;
+}
+
+void RefuseIfVintageMismatch(Connection &conn, const std::string &data_loc, const std::string &fips,
+                             const std::string &abbrev, LoaderVintage caller, LoaderVintageOp op) {
+	if (caller == LoaderVintage::MODERN) {
+		if (!HasVintage1992(conn, data_loc, fips)) {
+			return;
+		}
+		if (op == LoaderVintageOp::LOAD) {
+			throw InvalidInputException(
+			    "us_geocoder: %s already holds 1992 TIGER data for %s. 1992 and modern vintages cannot share a "
+			    "location — use a separate catalog or schema, or run unload_tiger_1992_state('%s') first.",
+			    data_loc, abbrev, abbrev);
+		}
+		throw InvalidInputException("us_geocoder: %s holds 1992 TIGER data for %s, not modern data — use "
+		                            "unload_tiger_1992_state('%s') instead of unload_tiger_state.",
+		                            data_loc, abbrev, abbrev);
+	}
+	// TIGER1992 caller: modern rows present with no 1992 progress key.
+	if (HasVintage1992(conn, data_loc, fips) || !HasStateRows(conn, data_loc, fips)) {
+		return;
+	}
+	if (op == LoaderVintageOp::LOAD) {
+		throw InvalidInputException(
+		    "us_geocoder: %s already holds modern TIGER data for %s. 1992 and modern vintages cannot share a "
+		    "location — load 1992 into a separate catalog or schema (target_db := / target_schema :=), or run "
+		    "unload_tiger_state('%s') first.",
+		    data_loc, abbrev, abbrev);
+	}
+	throw InvalidInputException("us_geocoder: %s holds modern TIGER data for %s, not 1992 data — use "
+	                            "unload_tiger_state('%s') instead of unload_tiger_1992_state.",
+	                            data_loc, abbrev, abbrev);
+}
+
+void RefuseIfVintage1992Present(Connection &conn, const std::string &data_loc) {
+	if (!HasAnyVintage1992(conn, data_loc)) {
+		return;
+	}
+	throw InvalidInputException(
+	    "us_geocoder: %s already holds 1992 TIGER data. load_tiger_nation writes modern nation-level "
+	    "state/county/zcta5 rows, and 1992 and modern vintages cannot share a location — use a separate catalog "
+	    "or schema (target_db := / target_schema :=), or unload the 1992 states first.",
+	    data_loc);
 }
 
 // One-shot backfill. If loader_progress is empty but the data tables already
@@ -714,6 +769,19 @@ static std::vector<DownloadTarget> BuildNationDownloadTargets(FileSystem &fs, co
 static void DoLoadNation(ClientContext &context, const LoaderBindData &bind, std::vector<LoaderResult> &out) {
 	const bool source_is_http = bind.source.rfind("http://", 0) == 0 || bind.source.rfind("https://", 0) == 0;
 
+	// Vintage guard, nation scope. load_tiger_nation writes modern
+	// state/county/zcta5 rows, none of which are keyed per-state, so any
+	// 1992 state in this location is a mismatch. Omitting this let modern
+	// 2020-vintage zcta5 rows land next to 1992 streets, after which
+	// ZIP-only input silently returned a 2020 ZCTA centroid against 1992
+	// geometry. Same placement rationale as DoLoadState's guard: before the
+	// parallel prelude's download, not inside DoLoadNationImpl.
+	{
+		Connection guard_conn(*context.db);
+		BootstrapTargetSchema(guard_conn, bind.data_location, bind.func_schema);
+		RefuseIfVintage1992Present(guard_conn, bind.data_location);
+	}
+
 	if (!bind.parallel || !source_is_http) {
 		DoLoadNationImpl(context, bind, out);
 		return;
@@ -767,6 +835,10 @@ static void DoLoadNation(ClientContext &context, const LoaderBindData &bind, std
 		local_bind.temp_dir = bind.temp_dir;
 		local_bind.parallel_workers = bind.parallel_workers;
 		DoLoadNationImpl(context, local_bind, out);
+	} catch (InvalidInputException &) {
+		// See DoLoadState's catch: a configuration refusal is not a
+		// transport failure, so it propagates instead of retrying.
+		throw;
 	} catch (std::exception &ex) {
 		fprintf(stderr, "[us_geocoder nation] parallel path failed: %s\n", ex.what());
 		fprintf(stderr, "[us_geocoder nation] falling back to legacy /vsicurl/ path\n");
@@ -1020,12 +1092,8 @@ static void UnloadTigerStateExecute(ClientContext &context, TableFunctionInput &
 			// across states), after BootstrapTargetSchema (loader_progress
 			// doesn't exist in a fresh target_db before that call) and
 			// before the DELETE below.
-			if (HasVintage1992(conn, data_loc, state.fips)) {
-				throw InvalidInputException(
-				    "us_geocoder: %s holds 1992 TIGER data for %s, not modern data — use "
-				    "unload_tiger_1992_state('%s') instead of unload_tiger_state.",
-				    data_loc, state.abbrev, state.abbrev);
-			}
+			RefuseIfVintageMismatch(conn, data_loc, state.fips, state.abbrev, LoaderVintage::MODERN,
+			                        LoaderVintageOp::UNLOAD);
 			StepTimer t(state.abbrev, "unload_state");
 			auto rendered = RenderTemplate(unload_template,
 			                               {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", state.fips}});
@@ -1112,6 +1180,23 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, cons
                         std::vector<LoaderResult> &out) {
 	const bool source_is_http = bind.source.rfind("http://", 0) == 0 || bind.source.rfind("https://", 0) == 0;
 
+	// Vintage guard, hoisted to the TOP of the entry point (it used to live
+	// in DoLoadStateImpl). On the default remote+parallel path, everything
+	// between here and DoLoadStateImpl resolves a temp dir, scrapes the
+	// Census index and downloads the whole state's zips — so a guard inside
+	// the Impl refused only after hundreds of MB and minutes of work, and
+	// the catch below then logged "parallel path failed" + "falling back"
+	// before the error finally escaped from the second Impl call. Guarding
+	// here is the only placement that refuses before any network touch.
+	// (The alternative — re-throwing InvalidInputException from the catch —
+	// stops the misleading logs but still pays for the download.)
+	{
+		Connection guard_conn(*context.db);
+		BootstrapTargetSchema(guard_conn, bind.data_location, bind.func_schema);
+		RefuseIfVintageMismatch(guard_conn, bind.data_location, state.fips, state.abbrev, LoaderVintage::MODERN,
+		                        LoaderVintageOp::LOAD);
+	}
+
 	// Serial fallback: same as the legacy path.
 	if (!bind.parallel || !source_is_http) {
 		DoLoadStateImpl(context, bind, state, out);
@@ -1169,6 +1254,11 @@ static void DoLoadState(ClientContext &context, const LoaderBindData &bind, cons
 		DoLoadStateImpl(context, local_bind, state, out);
 
 		// Successful ingest — let the RAII destructor clean up the temp dir.
+	} catch (InvalidInputException &) {
+		// A configuration refusal (vintage mismatch, bad parameter) is not
+		// a transport failure — retrying on the legacy /vsicurl/ path would
+		// fail identically, after two misleading log lines. Propagate.
+		throw;
 	} catch (std::exception &ex) {
 		fprintf(stderr, "[us_geocoder %s] parallel path failed: %s\n", state.abbrev.c_str(), ex.what());
 		fprintf(stderr, "[us_geocoder %s] falling back to legacy /vsicurl/ path\n", state.abbrev.c_str());
@@ -1183,17 +1273,10 @@ static void DoLoadStateImpl(ClientContext &context, const LoaderBindData &bind, 
 	Connection conn(*context.db);
 	BootstrapTargetSchema(conn, bind.data_location, bind.func_schema);
 
-	// Vintage guard: refuse to write modern data into a location that
-	// already holds 1992 TIGER data for this state. Must sit after
-	// BootstrapTargetSchema (loader_progress doesn't exist in a fresh
-	// target_db until that call creates it) and before anything else
-	// below writes rows or touches the network.
-	if (HasVintage1992(conn, bind.data_location, state.fips)) {
-		throw InvalidInputException(
-		    "us_geocoder: %s already holds 1992 TIGER data for %s. 1992 and modern vintages cannot share a "
-		    "location — use a separate catalog or schema, or run unload_tiger_1992_state('%s') first.",
-		    bind.data_location, state.abbrev, state.abbrev);
-	}
+	// The vintage guard for this state ran in DoLoadState, before the
+	// parallel prelude's temp-dir + scrape + download. Deliberately NOT
+	// repeated here: DoLoadState is the only caller, and re-checking would
+	// re-assert a condition that cannot have changed within one call.
 
 	const auto &data_loc = bind.data_location;
 	const auto &func_loc = bind.func_schema;

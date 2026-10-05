@@ -457,13 +457,7 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 	// doesn't exist in a fresh target_db until that call creates it) and
 	// before ListCounties1992 below, which is the first filesystem/network
 	// touch in this function.
-	if (!HasVintage1992(conn, data_loc, fips) && HasStateRows(conn, data_loc, fips)) {
-		throw InvalidInputException(
-		    "us_geocoder: %s already holds modern TIGER data for %s. 1992 and modern vintages cannot share a "
-		    "location — load 1992 into a separate catalog or schema (target_db := / target_schema :=), or run "
-		    "unload_tiger_state('%s') first.",
-		    data_loc, state.abbrev, state.abbrev);
-	}
+	RefuseIfVintageMismatch(conn, data_loc, fips, state.abbrev, LoaderVintage::TIGER1992, LoaderVintageOp::LOAD);
 
 	std::vector<std::string> countyfps = ListCounties1992(context, fs, bind, fips);
 
@@ -621,7 +615,14 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 			const std::string nam_dir = ResolveStateOtherDir(context, fs, bind, fips, work_dir);
 			nam = fs.JoinPath(nam_dir, "TGR92S" + fips + ".NAM");
 		}
-		conn.Query("DELETE FROM " + data_loc + "." + s.table + " WHERE statefp = '" + fips + "'");
+		// Connection::Query returns errors in the result rather than
+		// throwing, and state_place/state_cousub carry no SQL-level
+		// idempotency guard — a silently-failed DELETE here duplicates
+		// every row the INSERT below adds.
+		auto del = conn.Query("DELETE FROM " + data_loc + "." + s.table + " WHERE statefp = '" + fips + "'");
+		if (del->HasError()) {
+			throw IOException("us_geocoder 1992 %s (DELETE %s): %s", s.section, s.table, del->GetError());
+		}
 		auto sql = RenderTemplate(ExtractSection(tmpl, s.section), {{"@TIGER@", data_loc},
 		                                                            {"@FUNC@", func_loc},
 		                                                            {"@STATEFP@", fips},
@@ -666,7 +667,10 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 		// Absent progress entry means either a fresh load or a partial
 		// restart that just filled in counties; DELETE first so a rebuild
 		// cannot duplicate.
-		conn.Query("DELETE FROM " + data_loc + "." + d.table + " WHERE statefp = '" + fips + "'");
+		auto del = conn.Query("DELETE FROM " + data_loc + "." + d.table + " WHERE statefp = '" + fips + "'");
+		if (del->HasError()) {
+			throw IOException("us_geocoder 1992 %s (DELETE %s): %s", d.section, d.table, del->GetError());
+		}
 		auto section = ExtractSection(d.from_1992_templates ? tmpl : modern_tmpl, d.section);
 		auto sql = RenderTemplate(section, {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", fips}});
 		int64_t rows = ExecuteInsert(conn, sql, d.section);
@@ -816,12 +820,8 @@ static void Unload1992Execute(ClientContext &context, TableFunctionInput &data_p
 			// and silently erase modern data with no error, no warning, and
 			// no progress-key cleanup to show for it. Checked per-state,
 			// after BootstrapTargetSchema and before the DELETE below.
-			if (!HasVintage1992(conn, data_loc, state.fips) && HasStateRows(conn, data_loc, state.fips)) {
-				throw InvalidInputException(
-				    "us_geocoder: %s holds modern TIGER data for %s, not 1992 data — use "
-				    "unload_tiger_state('%s') instead of unload_tiger_1992_state.",
-				    data_loc, state.abbrev, state.abbrev);
-			}
+			RefuseIfVintageMismatch(conn, data_loc, state.fips, state.abbrev, LoaderVintage::TIGER1992,
+			                        LoaderVintageOp::UNLOAD);
 			StepTimer t(state.abbrev, "unload_1992_state");
 			auto rendered = RenderTemplate(unload_template,
 			                               {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", state.fips}});

@@ -69,6 +69,16 @@ both loader families refuse to write into (or unload from) a location already ho
 other vintage's rows for a given state, naming the state and the remedy. Side-by-side use of
 both vintages stays available via `target_db`/`target_schema` plus `set_tiger_reference`.
 
+There are **five** guard sites and they all go through `RefuseIfVintageMismatch` /
+`RefuseIfVintage1992Present` in `us_geocoder_loader_internal.hpp` — don't re-express the
+predicate inline, which is how `load_tiger_nation` ended up with no guard at all for a while
+(it writes nation-level `state`/`county`/`zcta5`, so its predicate is "any 1992 state in this
+location", not the per-`fips` one the other four use). Each guard must also sit at the **entry
+point**, before the parallel prelude's temp dir / index scrape / download — a guard inside
+`DoLoadStateImpl` refuses only after the whole state has been fetched, and the fallback
+`catch` then logs a misleading "parallel path failed" before the error escapes. Both
+fallback `catch` blocks re-throw `InvalidInputException` for the same reason.
+
 Shared orchestration helpers (`LoaderResult`, `StepTimer`, `ExtractSection`, `RenderTemplate`,
 `ScrapeCensusIndex`, progress-ledger helpers, etc.) were de-statics'd out of `loader.cpp` into
 `src/include/us_geocoder_loader_internal.hpp` for reuse — that extraction landed as its own
