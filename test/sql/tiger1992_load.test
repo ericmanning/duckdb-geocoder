@@ -9,20 +9,19 @@ require-env TIGER_TEST_EXTENSIONS
 statement ok
 LOAD spatial;
 
-# Use NJ (34) and point at a clean fixture tree whose only county is 999.
+# Use NJ (34) and point at test/data/tiger1992, whose only county is 999.
 #
-# Deviation from the task brief's literal `source := 'test/data/tiger1992'`:
-# that directory's state-34 folder also holds `34998.zip` (a committed
-# fixture from the zip-extraction task, tiger1992_zip.test) which is
-# shaped exactly like a real per-county 1992 zip ("<ss><ccc>.zip") and so
-# is legitimately picked up by ListCounties1992's directory scan as a
-# second county. It only contains TGR34998.F51 + .F5I (no .F5A), so
-# loading it throws on the county_faces step. `main92/` is a byte-exact
-# `cp` of the committed county-999 fixture (verified via `cmp`), nested
-# under test/data/tiger1992/ so it inherits that tree's .gitattributes
-# (`* -text`) automatically; no existing committed file was changed.
+# test/data/tiger1992/34/ must hold nothing else that ListCounties1992's
+# local directory scan would read as a county: the scan accepts any
+# "<ss><ccc>.zip" file or "<ss><ccc>/" directory. The zip-extraction
+# fixture `34998.zip` (test/sql/tiger1992_zip.test) is shaped exactly like
+# a real per-county 1992 zip, so it used to be picked up here as a second
+# county — and since it only contains TGR34998.F51 + .F5I (no .F5A), the
+# load threw on county_faces. It now lives in test/data/tiger1992/zips/,
+# outside any state directory, which keeps one 34/34999/ tree for all
+# three 1992 test files instead of a duplicated byte-exact copy per test.
 statement ok
-CALL load_tiger_1992_state('NJ', source := 'test/data/tiger1992/main92',
+CALL load_tiger_1992_state('NJ', source := 'test/data/tiger1992',
                            build_containment := false);
 
 query II
@@ -132,14 +131,25 @@ SELECT cosbidfp, name FROM tiger.cousub;
 
 # Review Focus 4: an unknown state abbreviation errors clearly.
 statement error
-CALL load_tiger_1992_state('ZZ', source := 'test/data/tiger1992/main92');
+CALL load_tiger_1992_state('ZZ', source := 'test/data/tiger1992');
 ----
 ZZ
 
 # Re-running is a no-op: per-county progress is already marked done.
-statement ok
-CALL load_tiger_1992_state('NJ', source := 'test/data/tiger1992/main92',
-                           build_containment := false);
+#
+# Every ingest step must report ":skipped" — nothing re-reads the fixture
+# tree. This also pins the "no pending work" path: the state's temp dir,
+# the OtherFiles.zip/.NAM resolution and (for a remote source) the whole
+# download are all now deferred until a step is actually pending, so that
+# a restart against the Census CDN does not re-fetch a state it has
+# already ingested. `begin:`/`done:`/`analyze` are per-call bookkeeping.
+query I
+SELECT count(*) FROM load_tiger_1992_state('NJ', source := 'test/data/tiger1992',
+                                           build_containment := false)
+WHERE step NOT LIKE '%:skipped' AND step NOT LIKE 'begin:%'
+  AND step NOT LIKE 'done:%' AND step <> 'analyze';
+----
+0
 
 query I
 SELECT count(*) FROM tiger.edges;

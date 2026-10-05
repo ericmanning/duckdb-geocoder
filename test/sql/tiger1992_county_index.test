@@ -1,0 +1,91 @@
+# name: test/sql/tiger1992_county_index.test
+# description: remote 1992 county discovery — directory-index pattern regression
+# group: [sql]
+
+require us_geocoder
+
+# Regression: the per-county index pattern must be UNANCHORED.
+#
+# ScrapeCensusIndex applies the pattern with std::sregex_iterator over the
+# whole fetched index document. C++11 std::regex has no multiline flag, so
+# `^` and `$` bind to the start and end of the entire subject string: the
+# original `^<ss>[0-9]{3}\.zip$` could only match if the whole HTML body
+# were the literal text "34999.zip". It matched zero times against every
+# real index, so `CALL load_tiger_1992_state('NJ')` with no `source`
+# argument — i.e. against the default Census source — could never succeed,
+# and nothing covered remote mode at the time.
+#
+# us_geocoder_1992_county_index is a test hook (see the comment above
+# CountyIndex1992Bind in src/loader_1992.cpp): it runs the same pattern
+# match and group-0 extraction ListCounties1992's remote branch performs,
+# minus the HTTP fetch, which this harness cannot serve. It is deliberately
+# fed a document, not a bare filename, since that is the bug.
+
+# Apache-style index. Note 34001/34003 each appear twice (anchor href and
+# visible text) and must collapse to one county; `./34999.zip` must still
+# match, and OtherFiles.zip must not.
+query I
+SELECT countyfp FROM us_geocoder_1992_county_index(
+'<html><head><title>Index of /geo/tiger/TIGER1992/34</title></head><body>
+<h1>Index of /geo/tiger/TIGER1992/34</h1>
+<table><tr><td><a href="/geo/tiger/TIGER1992/">Parent Directory</a></td></tr>
+<tr><td><a href="34001.zip">34001.zip</a></td><td>12M</td></tr>
+<tr><td><a href="34003.zip">34003.zip</a></td><td>9.1M</td></tr>
+<tr><td><a href="./34999.zip">./34999.zip</a></td><td>1.0M</td></tr>
+<tr><td><a href="OtherFiles.zip">OtherFiles.zip</a></td><td>2.0M</td></tr>
+</table></body></html>', '34') ORDER BY countyfp;
+----
+001
+003
+999
+
+# A plain newline-delimited listing (nginx autoindex / mirror manifest)
+# works too — nothing in the pattern assumes HTML markup.
+query I
+SELECT countyfp FROM us_geocoder_1992_county_index(
+'34001.zip
+34999.zip
+OtherFiles.zip
+', '34') ORDER BY countyfp;
+----
+001
+999
+
+# 1992's short "<ssccc>.zip" names are far more collision-prone than the
+# modern "tl_<year>_<fips>_<type>.zip" form, so dropping the anchors must
+# not let a bare substring match through. Each of these four is a
+# near-miss that a naive unanchored pattern accepts:
+#   34998.zip.decoy -> trailing extension (the over-match the reviewer hit)
+#   134997.zip      -> digit immediately before the state FIPS
+#   x34996.zip      -> letter immediately before the state FIPS
+#   34995.zipx      -> trailing character on the extension
+query I
+SELECT count(*) FROM us_geocoder_1992_county_index(
+'<tr><td><a href="34998.zip.decoy">34998.zip.decoy</a></td></tr>
+<tr><td><a href="134997.zip">134997.zip</a></td></tr>
+<tr><td><a href="x34996.zip">x34996.zip</a></td></tr>
+<tr><td><a href="34995.zipx">34995.zipx</a></td></tr>', '34');
+----
+0
+
+# A neighbouring state's zips in the same document are not this state's
+# counties (35001 is NM, not NJ 34).
+query I
+SELECT count(*) FROM us_geocoder_1992_county_index(
+'<tr><td><a href="35001.zip">35001.zip</a></td></tr>
+<tr><td><a href="35003.zip">35003.zip</a></td></tr>', '34');
+----
+0
+
+# An index with no matching entries yields nothing rather than erroring
+# here; ListCounties1992 is what turns that into the "yielded no county
+# zips" IOException.
+query I
+SELECT count(*) FROM us_geocoder_1992_county_index('<html><body>404</body></html>', '34');
+----
+0
+
+statement error
+SELECT * FROM us_geocoder_1992_county_index(NULL, '34');
+----
+us_geocoder_1992_county_index

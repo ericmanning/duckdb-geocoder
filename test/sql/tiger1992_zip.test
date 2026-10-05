@@ -7,7 +7,7 @@ require us_geocoder
 # Extract every entry of the committed fixture zip into a temp dir.
 query II
 SELECT entry, bytes
-FROM us_geocoder_unzip('test/data/tiger1992/34/34998.zip', '__TEST_DIR__/unzip92')
+FROM us_geocoder_unzip('test/data/tiger1992/zips/34998.zip', '__TEST_DIR__/unzip92')
 ORDER BY entry;
 ----
 TGR34998.F51	460
@@ -22,7 +22,7 @@ SELECT count(*) FROM read_csv('__TEST_DIR__/unzip92/TGR34998.F51',
 
 # A missing zip errors clearly rather than crashing.
 statement error
-SELECT * FROM us_geocoder_unzip('test/data/tiger1992/nope.zip', '__TEST_DIR__/unzip92');
+SELECT * FROM us_geocoder_unzip('test/data/tiger1992/zips/nope.zip', '__TEST_DIR__/unzip92');
 ----
 us_geocoder_unzip
 
@@ -30,7 +30,7 @@ us_geocoder_unzip
 # overwrite cleanly rather than throwing on an already-existing file.
 query II
 SELECT entry, bytes
-FROM us_geocoder_unzip('test/data/tiger1992/34/34998.zip', '__TEST_DIR__/unzip92')
+FROM us_geocoder_unzip('test/data/tiger1992/zips/34998.zip', '__TEST_DIR__/unzip92')
 ORDER BY entry;
 ----
 TGR34998.F51	460
@@ -50,12 +50,12 @@ TGR34998.F5I	108
 # single-level mkdir -- no bootstrapping needed. Its contents (the same
 # two entries, one level deeper) are irrelevant scaffolding.
 statement ok
-SELECT * FROM us_geocoder_unzip('test/data/tiger1992/34/34998.zip', '__TEST_DIR__/TGR34998.F51');
+SELECT * FROM us_geocoder_unzip('test/data/tiger1992/zips/34998.zip', '__TEST_DIR__/TGR34998.F51');
 
 # Step B: re-extracting straight into __TEST_DIR__ now tries to open
 # __TEST_DIR__/TGR34998.F51 -- a directory, from step A -- for writing,
 # and must throw cleanly rather than leak or crash.
 statement error
-SELECT * FROM us_geocoder_unzip('test/data/tiger1992/34/34998.zip', '__TEST_DIR__');
+SELECT * FROM us_geocoder_unzip('test/data/tiger1992/zips/34998.zip', '__TEST_DIR__');
 ----
 Cannot open file

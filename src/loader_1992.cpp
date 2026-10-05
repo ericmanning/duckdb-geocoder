@@ -42,10 +42,19 @@ struct Loader1992BindData : public FunctionData {
 	std::vector<StatePlan> states;
 	bool unload = false;
 
-	// "tiger" locally, or "<db>.<schema>" when target_db is set.
+	// "tiger" locally, or "<db>.<schema>" when target_db is set. The local
+	// form is deliberately NOT quoted: it has to compare equal to FuncLoc()
+	// so BootstrapTargetSchema's `data_location == func_schema` early return
+	// fires in the default case, exactly as the modern loader's
+	// ApplyTargetParams arranges (loader.cpp: bind.data_location =
+	// bind.target_schema). Quoting it here made every 1992 state re-render
+	// and re-execute the whole TigerSchemaSql() DDL — harmless while every
+	// statement is IF NOT EXISTS, but 51 redundant passes under
+	// load_tiger_1992_all_states(), and the ALTER TABLE ... ADD COLUMN
+	// statements would error against a set_tiger_reference view setup.
 	std::string DataLoc() const {
 		if (target_db.empty()) {
-			return QuoteIdent(target_schema);
+			return target_schema;
 		}
 		return QuoteIdent(target_db) + "." + QuoteIdent(target_schema);
 	}
@@ -127,6 +136,88 @@ static std::string PathOrEmpty(FileSystem &fs, const std::string &dir, const std
 	return stub;
 }
 
+// Regex matching a state's per-county zip filenames inside a Census HTML
+// directory index.
+//
+// ScrapeCensusIndex applies this with std::sregex_iterator over the WHOLE
+// index document. C++11 std::regex has no multiline flag, so `^` and `$`
+// anchor to the start and end of the entire subject string — an anchored
+// pattern can only match when the whole HTML body IS the bare filename,
+// i.e. never against a real index. The pattern must therefore be
+// unanchored, like the modern loader's equivalent in
+// BuildStateDownloadTargets.
+//
+// Unanchored matching on 1992's short "<ssccc>.zip" names is more
+// collision-prone than the modern "tl_<year>_<fips>_<type>.zip" form, so
+// both ends get a boundary:
+//   * leading — start-of-subject, or a *consumed* non-alphanumeric
+//     character. std::regex has no lookbehind and ScrapeCensusIndex returns
+//     group 0, so the delimiter lands inside the match and
+//     CountyFpFrom1992IndexName strips it (which is why that helper counts
+//     back from the end of the match, not forward from the start — the
+//     `^` arm of the alternation consumes nothing). Excluding only
+//     [0-9A-Za-z] (not '.' or '/') keeps hrefs such as "./34999.zip"
+//     matching while rejecting "134999.zip" and "x34999.zip". `^` here is
+//     start-of-*subject*, not start-of-line, which is exactly what a bare
+//     newline-delimited listing whose first line is a county zip needs;
+//     std::sregex_iterator sets match_prev_avail on later iterations so it
+//     cannot fire again mid-document.
+//   * trailing — a negative lookahead, so "34998.zip.decoy" does not yield
+//     a bogus county 998.
+static std::string CountyZipPattern1992(const std::string &fips) {
+	return "(?:^|[^0-9A-Za-z])" + fips + "[0-9]{3}\\.zip(?![0-9A-Za-z._-])";
+}
+
+// One CountyZipPattern1992 match -> the 3-digit county FIPS. A match is
+// "<ss><ccc>.zip" optionally preceded by one consumed delimiter, so the
+// name is always the trailing len(fips)+3+len(".zip") characters.
+static bool CountyFpFrom1992IndexName(const std::string &match, const std::string &fips, std::string &out) {
+	const size_t name_len = fips.size() + 3 + 4; // <ss><ccc>.zip
+	if (match.size() < name_len) {
+		return false;
+	}
+	const size_t start = match.size() - name_len;
+	if (match.compare(start, fips.size(), fips) != 0) {
+		return false;
+	}
+	out = match.substr(start + fips.size(), 3);
+	return true;
+}
+
+// Apply CountyZipPattern1992 to an index document and return the raw group-0
+// matches, exactly as ScrapeCensusIndex would (same std::sregex_iterator
+// walk over the whole body, same group 0). Factored out so the
+// us_geocoder_1992_county_index test hook exercises the real matching
+// without needing an HTTP server. Keep in step with ScrapeCensusIndex.
+static std::vector<std::string> MatchCountyZips1992(const std::string &index_html, const std::string &fips) {
+	std::regex pat(CountyZipPattern1992(fips));
+	std::vector<std::string> out;
+	auto begin = std::sregex_iterator(index_html.begin(), index_html.end(), pat);
+	auto end = std::sregex_iterator();
+	for (auto it = begin; it != end; ++it) {
+		out.push_back(it->str(0));
+	}
+	return out;
+}
+
+// Index matches -> sorted, deduped county FIPS codes. Dedup is required
+// rather than cosmetic: an Apache index lists each file twice (anchor href
+// and visible text) and the two matches carry different leading delimiters,
+// so ScrapeCensusIndex's own string-level dedup cannot collapse them.
+static std::vector<std::string> CountyFpsFrom1992IndexNames(const std::vector<std::string> &names,
+                                                            const std::string &fips) {
+	std::vector<std::string> out;
+	for (size_t i = 0; i < names.size(); ++i) {
+		std::string cfp;
+		if (CountyFpFrom1992IndexName(names[i], fips, cfp)) {
+			out.push_back(cfp);
+		}
+	}
+	std::sort(out.begin(), out.end());
+	out.erase(std::unique(out.begin(), out.end()), out.end());
+	return out;
+}
+
 // County FIPS list for a state. Remote: scrape <source>/<ss>/ for
 // <ssccc>.zip. Local: list <source>/<ss>/ for either <ssccc>.zip files or
 // <ssccc>/ directories, so both local layouts work.
@@ -143,16 +234,13 @@ static std::vector<std::string> ListCounties1992(ClientContext &context, FileSys
 		opts.workers = 1; // one GET for the directory index
 		opts.max_attempts = 3;
 		opts.log_prefix = fips;
-		const std::string pattern_str = "^" + fips + "[0-9]{3}\\.zip$";
+		const std::string pattern_str = CountyZipPattern1992(fips);
 		std::regex pat(pattern_str);
 		auto names = ScrapeCensusIndex(context, base + "/" + fips + "/", pat, opts);
-		if (names.empty()) {
+		out = CountyFpsFrom1992IndexNames(names, fips);
+		if (out.empty()) {
 			throw IOException("us_geocoder 1992: index %s/%s/ yielded no county zips (pattern %s)", base, fips,
 			                  pattern_str);
-		}
-		for (size_t i = 0; i < names.size(); ++i) {
-			// "<ssccc>.zip" -> "ccc"
-			out.push_back(names[i].substr(2, 3));
 		}
 	} else {
 		const std::string state_dir = fs.JoinPath(bind.source, fips);
@@ -364,24 +452,79 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 
 	std::vector<std::string> countyfps = ListCounties1992(context, fs, bind, fips);
 
+	struct StateStep {
+		const char *section;
+		const char *progress;
+	};
+	const StateStep state_steps[] = {
+	    {"state_state", "state"}, {"state_county", "county"}, {"state_place", "place"}, {"state_cousub", "cousub"}};
+	struct CountyStep {
+		const char *section;
+		const char *progress_table;
+	};
+	const CountyStep county_steps[] = {{"county_edges", "edges"},
+	                                   {"county_faces", "faces"},
+	                                   {"county_featnames", "featnames"},
+	                                   {"county_addr", "addr"}};
+
+	// Consult the progress ledger BEFORE touching the network. Re-running
+	// against a remote source used to re-download the whole state and then
+	// report every step ":skipped"; now only the counties with pending work
+	// are fetched, and a fully-loaded state does no HTTP at all beyond the
+	// one directory-index GET that ListCounties1992 needs to enumerate
+	// counties in the first place.
+	bool state_steps_pending = false;
+	for (const auto &s : state_steps) {
+		if (!IsProgressDone(conn, data_loc, state_pfx + s.progress)) {
+			state_steps_pending = true;
+			break;
+		}
+	}
+	std::vector<std::string> pending_counties;
+	for (size_t ci = 0; ci < countyfps.size(); ++ci) {
+		for (const auto &t : county_steps) {
+			if (!IsProgressDone(conn, data_loc, state_pfx + "county:" + countyfps[ci] + ":" + t.progress_table)) {
+				pending_counties.push_back(countyfps[ci]);
+				break;
+			}
+		}
+	}
+	const bool have_work = state_steps_pending || !pending_counties.empty();
+
 	// work_dir: scratch for extraction (always) and downloads (remote only).
 	// Reuse the modern loader's helpers so temp_dir resolution and the
-	// per-state directory naming stay identical across both paths.
-	const std::string temp_base = ResolveTempBase(context, bind.temp_dir);
-	const std::string work_dir = MakeStateTempDir(context, temp_base, state.abbrev, 1992);
+	// per-state directory naming stay identical across both paths. Left empty
+	// when there is nothing to do, in which case StateDirCleanup is a no-op
+	// and no step below ever consults it (both the .NAM and the per-county
+	// directory are resolved lazily, only for a pending step).
+	std::string work_dir;
+	if (have_work) {
+		const std::string temp_base = ResolveTempBase(context, bind.temp_dir);
+		work_dir = MakeStateTempDir(context, temp_base, state.abbrev, 1992);
+	}
+	// Always-armed, like the modern loader (loader.cpp's DoLoadState /
+	// DoLoadNation preludes). Deliberately no Disarm() on failure: the
+	// directory name embeds the pid and a steady_clock timestamp, so nothing
+	// ever looks for a retained one — the next run makes a fresh dir and
+	// re-downloads regardless, leaving the old one to leak disk forever.
+	// Not re-downloading already-ingested counties (above) is what actually
+	// makes a restart cheap. Resumable downloads would need a deterministic
+	// directory name plus a lock or completion marker; out of scope here.
 	StateDirCleanup cleanup(fs, work_dir);
 
-	if (remote) {
+	if (remote && have_work) {
 		std::string src = bind.source;
 		if (!src.empty() && src.back() == '/') {
 			src.pop_back();
 		}
 		std::vector<DownloadTarget> targets;
-		for (size_t i = 0; i < countyfps.size(); ++i) {
-			const std::string ssccc = fips + countyfps[i];
+		for (size_t i = 0; i < pending_counties.size(); ++i) {
+			const std::string ssccc = fips + pending_counties[i];
 			targets.push_back({src + "/" + fips + "/" + ssccc + ".zip", fs.JoinPath(work_dir, ssccc + ".zip")});
 		}
-		targets.push_back({src + "/" + fips + "/OtherFiles.zip", fs.JoinPath(work_dir, "OtherFiles.zip")});
+		if (state_steps_pending) {
+			targets.push_back({src + "/" + fips + "/OtherFiles.zip", fs.JoinPath(work_dir, "OtherFiles.zip")});
+		}
 		ParallelDownloadOptions opts;
 		opts.workers = bind.parallel ? bind.parallel_workers : 1;
 		opts.log_prefix = state.abbrev;
@@ -389,80 +532,60 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 		(void)dl;
 	}
 
-	// Keep the temp dir on failure so a retry reuses the downloads instead of
-	// re-fetching a whole state. StateDirCleanup removes it on success only.
-	try {
-		// Per-state names first — the county sections do not depend on them.
-		const std::string stusps = state.abbrev;
-		const std::string nam_dir = ResolveStateOtherDir(context, fs, bind, fips, work_dir);
-		const std::string nam = fs.JoinPath(nam_dir, "TGR92S" + fips + ".NAM");
-		struct StateStep {
-			const char *section;
-			const char *progress;
-		};
-		const StateStep state_steps[] = {{"state_state", "state"},
-		                                 {"state_county", "county"},
-		                                 {"state_place", "place"},
-		                                 {"state_cousub", "cousub"}};
-		for (const auto &s : state_steps) {
-			const std::string key = state_pfx + s.progress;
+	// Per-state names first — the county sections do not depend on them.
+	const std::string stusps = state.abbrev;
+	std::string nam; // resolved lazily, only if some state step is pending
+	for (const auto &s : state_steps) {
+		const std::string key = state_pfx + s.progress;
+		if (IsProgressDone(conn, data_loc, key)) {
+			out.push_back({std::string(s.section) + ":skipped", 0});
+			continue;
+		}
+		if (nam.empty()) {
+			const std::string nam_dir = ResolveStateOtherDir(context, fs, bind, fips, work_dir);
+			nam = fs.JoinPath(nam_dir, "TGR92S" + fips + ".NAM");
+		}
+		auto sql = RenderTemplate(ExtractSection(tmpl, s.section), {{"@TIGER@", data_loc},
+		                                                            {"@FUNC@", func_loc},
+		                                                            {"@STATEFP@", fips},
+		                                                            {"@STUSPS@", stusps},
+		                                                            {"@NAM@", nam}});
+		int64_t rows = ExecuteInsert(conn, sql, s.section);
+		out.push_back({s.section, rows});
+		MarkProgressDone(conn, data_loc, key);
+	}
+
+	// Per-county.
+	for (size_t ci = 0; ci < countyfps.size(); ++ci) {
+		const auto &cfp = countyfps[ci];
+		const std::string ssccc = fips + cfp;
+		std::string dir; // resolved lazily, only if some step is pending
+		for (const auto &t : county_steps) {
+			const std::string key = state_pfx + "county:" + cfp + ":" + t.progress_table;
 			if (IsProgressDone(conn, data_loc, key)) {
-				out.push_back({std::string(s.section) + ":skipped", 0});
+				out.push_back({std::string(t.section) + ":" + cfp + ":skipped", 0});
 				continue;
 			}
-			auto sql = RenderTemplate(ExtractSection(tmpl, s.section), {{"@TIGER@", data_loc},
-			                                                            {"@FUNC@", func_loc},
-			                                                            {"@STATEFP@", fips},
-			                                                            {"@STUSPS@", stusps},
-			                                                            {"@NAM@", nam}});
-			int64_t rows = ExecuteInsert(conn, sql, s.section);
-			out.push_back({s.section, rows});
+			if (dir.empty()) {
+				dir = ResolveCountyDir(context, fs, bind, fips, cfp, work_dir);
+			}
+			auto sql =
+			    RenderTemplate(ExtractSection(tmpl, t.section),
+			                   {{"@TIGER@", data_loc},
+			                    {"@FUNC@", func_loc},
+			                    {"@STATEFP@", fips},
+			                    {"@COUNTYFP@", cfp},
+			                    {"@F51@", fs.JoinPath(dir, "TGR" + ssccc + ".F51")},
+			                    {"@F52@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F52", work_dir)},
+			                    {"@F54@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F54", work_dir)},
+			                    {"@F55@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F55", work_dir)},
+			                    {"@F56@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F56", work_dir)},
+			                    {"@F5A@", fs.JoinPath(dir, "TGR" + ssccc + ".F5A")},
+			                    {"@F5I@", fs.JoinPath(dir, "TGR" + ssccc + ".F5I")}});
+			int64_t rows = ExecuteInsert(conn, sql, std::string(t.section) + ":" + cfp);
+			out.push_back({std::string(t.section) + ":" + cfp, rows});
 			MarkProgressDone(conn, data_loc, key);
 		}
-
-		// Per-county.
-		struct CountyStep {
-			const char *section;
-			const char *progress_table;
-		};
-		const CountyStep county_steps[] = {{"county_edges", "edges"},
-		                                   {"county_faces", "faces"},
-		                                   {"county_featnames", "featnames"},
-		                                   {"county_addr", "addr"}};
-		for (size_t ci = 0; ci < countyfps.size(); ++ci) {
-			const auto &cfp = countyfps[ci];
-			const std::string ssccc = fips + cfp;
-			std::string dir; // resolved lazily, only if some step is pending
-			for (const auto &t : county_steps) {
-				const std::string key = state_pfx + "county:" + cfp + ":" + t.progress_table;
-				if (IsProgressDone(conn, data_loc, key)) {
-					out.push_back({std::string(t.section) + ":" + cfp + ":skipped", 0});
-					continue;
-				}
-				if (dir.empty()) {
-					dir = ResolveCountyDir(context, fs, bind, fips, cfp, work_dir);
-				}
-				auto sql = RenderTemplate(
-				    ExtractSection(tmpl, t.section),
-				    {{"@TIGER@", data_loc},
-				     {"@FUNC@", func_loc},
-				     {"@STATEFP@", fips},
-				     {"@COUNTYFP@", cfp},
-				     {"@F51@", fs.JoinPath(dir, "TGR" + ssccc + ".F51")},
-				     {"@F52@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F52", work_dir)},
-				     {"@F54@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F54", work_dir)},
-				     {"@F55@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F55", work_dir)},
-				     {"@F56@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F56", work_dir)},
-				     {"@F5A@", fs.JoinPath(dir, "TGR" + ssccc + ".F5A")},
-				     {"@F5I@", fs.JoinPath(dir, "TGR" + ssccc + ".F5I")}});
-				int64_t rows = ExecuteInsert(conn, sql, std::string(t.section) + ":" + cfp);
-				out.push_back({std::string(t.section) + ":" + cfp, rows});
-				MarkProgressDone(conn, data_loc, key);
-			}
-		}
-	} catch (...) {
-		cleanup.Disarm();
-		throw;
 	}
 }
 
@@ -629,6 +752,64 @@ static void Unload1992Execute(ClientContext &context, TableFunctionInput &data_p
 }
 
 // =====================================================================
+// us_geocoder_1992_county_index(index_html, statefp) -> TABLE(countyfp)
+// =====================================================================
+//
+// Test hook, not documented API. A pure function over an index document:
+// it runs exactly the pattern match + group-0 extraction that
+// ListCounties1992's remote branch performs on a scraped Census directory
+// index, with the HTTP fetch removed. It exists because the sqllogictest
+// harness cannot stand up an HTTP server, and remote county discovery had
+// no coverage at all — the anchored pattern this replaced could never
+// match a real index, so `CALL load_tiger_1992_state('NJ')` against the
+// default source was unconditionally broken and no test noticed. Same
+// spirit as us_geocoder_unzip, which exposes the loader's zip-extraction
+// internals for test/sql/tiger1992_zip.test.
+
+struct CountyIndex1992BindData : public FunctionData {
+	std::vector<std::string> countyfps;
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<CountyIndex1992BindData>(*this);
+	}
+	bool Equals(const FunctionData &other) const override {
+		return countyfps == other.Cast<CountyIndex1992BindData>().countyfps;
+	}
+};
+
+struct CountyIndex1992GlobalState : public GlobalTableFunctionState {
+	idx_t offset = 0;
+	static unique_ptr<GlobalTableFunctionState> Init(ClientContext &, TableFunctionInitInput &) {
+		return make_uniq<CountyIndex1992GlobalState>();
+	}
+};
+
+static unique_ptr<FunctionData> CountyIndex1992Bind(ClientContext &, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	return_types.push_back(LogicalType::VARCHAR);
+	names.emplace_back("countyfp");
+	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+		throw BinderException("us_geocoder_1992_county_index: index_html and statefp are both required");
+	}
+	auto result = make_uniq<CountyIndex1992BindData>();
+	const auto html = StringValue::Get(input.inputs[0]);
+	const auto fips = StringValue::Get(input.inputs[1]);
+	result->countyfps = CountyFpsFrom1992IndexNames(MatchCountyZips1992(html, fips), fips);
+	return std::move(result);
+}
+
+static void CountyIndex1992Execute(ClientContext &, TableFunctionInput &data_p, DataChunk &output) {
+	auto &bind = data_p.bind_data->Cast<CountyIndex1992BindData>();
+	auto &gstate = data_p.global_state->Cast<CountyIndex1992GlobalState>();
+	idx_t count = 0;
+	while (gstate.offset < bind.countyfps.size() && count < STANDARD_VECTOR_SIZE) {
+		output.SetValue(0, count, Value(bind.countyfps[gstate.offset]));
+		++gstate.offset;
+		++count;
+	}
+	output.SetCardinality(count);
+}
+
+// =====================================================================
 // Registration
 // =====================================================================
 
@@ -686,6 +867,11 @@ void RegisterLoader1992Functions(ExtensionLoader &loader, const std::string &) {
 	ul2.named_parameters["target_db"] = LogicalType::VARCHAR;
 	ul2.named_parameters["target_schema"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(ul2);
+
+	// Test hook — see the comment above CountyIndex1992Bind.
+	TableFunction cidx("us_geocoder_1992_county_index", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                   CountyIndex1992Execute, CountyIndex1992Bind, CountyIndex1992GlobalState::Init);
+	loader.RegisterFunction(cidx);
 }
 
 } // namespace us_geocoder
