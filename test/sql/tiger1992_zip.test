@@ -20,6 +20,32 @@ SELECT count(*) FROM read_csv('__TEST_DIR__/unzip92/TGR34998.F51',
 ----
 2
 
+# NULL arguments are rejected at bind time with a BinderException. Without
+# the check, StringValue::Get raised `INTERNAL Error: Calling
+# StringValue::Get on a NULL value` plus a 25-frame stack trace and an
+# invitation to file a DuckDB bug. Both positions, since either can be NULL.
+statement error
+SELECT * FROM us_geocoder_unzip(NULL, '__TEST_DIR__/unzip92');
+----
+zip_path and dest_dir are both required
+
+statement error
+SELECT * FROM us_geocoder_unzip('test/data/tiger1992/zips/34998.zip', NULL);
+----
+zip_path and dest_dir are both required
+
+# dest_dir is created recursively, not single-level: api.md promises
+# "creating dest_dir if needed", and a two-level missing path (the shape a
+# pre-extracted `<mirror>/<ss>/<ssccc>` local mirror needs) used to fail
+# with "IO Error: Failed to create directory".
+query II
+SELECT entry, bytes
+FROM us_geocoder_unzip('test/data/tiger1992/zips/34998.zip', '__TEST_DIR__/deep92/34/34998')
+ORDER BY entry;
+----
+TGR34998.F51	460
+TGR34998.F5I	108
+
 # A missing zip errors clearly rather than crashing.
 statement error
 SELECT * FROM us_geocoder_unzip('test/data/tiger1992/zips/nope.zip', '__TEST_DIR__/unzip92');

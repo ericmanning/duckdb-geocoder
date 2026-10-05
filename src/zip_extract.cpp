@@ -130,7 +130,12 @@ std::vector<ZipEntry> ExtractZipEntries(FileSystem &fs, const std::string &zip_p
 		wanted_lower.push_back(ToLowerAscii(wanted[i]));
 	}
 
-	fs.CreateDirectory(dest_dir);
+	// Recursive: fs.CreateDirectory is single-level, so a two-level missing
+	// dest_dir (e.g. a fresh "<mirror>/34/34041") failed with "IO Error:
+	// Failed to create directory" — not what api.md's "creating dest_dir if
+	// needed" promises, and exactly the shape a pre-extracted local mirror
+	// needs.
+	fs.CreateDirectoriesRecursive(dest_dir);
 
 	std::vector<ZipEntry> written;
 	const mz_uint n = mz_zip_reader_get_num_files(zip);
@@ -213,6 +218,12 @@ struct UnzipGlobalState : public GlobalTableFunctionState {
 
 static unique_ptr<FunctionData> UnzipBind(ClientContext &, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, vector<string> &names) {
+	// StringValue::Get on a NULL Value raises an INTERNAL Error with a
+	// 25-frame stack trace telling the user to file a DuckDB bug. Reject at
+	// bind time instead, as us_geocoder_1992_county_index does.
+	if (input.inputs[0].IsNull() || input.inputs[1].IsNull()) {
+		throw BinderException("us_geocoder_unzip: zip_path and dest_dir are both required");
+	}
 	auto result = make_uniq<UnzipBindData>();
 	result->zip_path = StringValue::Get(input.inputs[0]);
 	result->dest_dir = StringValue::Get(input.inputs[1]);
