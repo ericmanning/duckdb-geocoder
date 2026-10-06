@@ -63,3 +63,7 @@ __pycache__/
 
 # vcpkg artifacts
 /vcpkg_installed/
+
+# Loader output databases (scripts/build_1992_db.sh et al)
+*.duckdb
+*.duckdb.wal
