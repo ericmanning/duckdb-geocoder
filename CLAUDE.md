@@ -5,7 +5,7 @@ DuckDB community extension `us_geocoder`: a pure-DuckDB port of PostGIS's `postg
 - **PG comparison + design decisions D1–D15:** [docs/pg_parity.md](docs/pg_parity.md). The locked design ledger + per-test divergence audit + condensed PG cascade reference all live here.
 - **Public docs:** [README.md](README.md) (overview + quickstart pointer), [docs/quickstart.md](docs/quickstart.md), [docs/api.md](docs/api.md) (function reference), [docs/pg_parity.md](docs/pg_parity.md), [docs/tiger1992.md](docs/tiger1992.md) (1992 TIGER vintage loader).
 - **License:** GPLv2 (matches upstream).
-- **DuckDB pin:** 1.5.3 (submodule `duckdb/`).
+- **DuckDB pin:** 1.5.6 (submodule `duckdb/`).
 
 ## Layout
 
