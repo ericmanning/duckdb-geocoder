@@ -19,8 +19,7 @@ struct ZipEntry {
 // All I/O goes through `fs` so Windows paths and permissions behave the
 // same as the rest of the loader. Throws IOException on a malformed or
 // unreadable archive.
-std::vector<ZipEntry> ExtractZipEntries(FileSystem &fs, const std::string &zip_path,
-                                        const std::string &dest_dir,
+std::vector<ZipEntry> ExtractZipEntries(FileSystem &fs, const std::string &zip_path, const std::string &dest_dir,
                                         const std::vector<std::string> &wanted);
 
 // Registers us_geocoder_unzip(zip_path, dest_dir) -> TABLE(entry, bytes).

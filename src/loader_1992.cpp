@@ -33,7 +33,7 @@ struct Loader1992BindData : public FunctionData {
 		std::string fips;
 	};
 	std::string source = kDefaultSource1992;
-	std::string target_db;                  // empty => current catalog
+	std::string target_db; // empty => current catalog
 	std::string target_schema = "tiger";
 	bool build_containment = true;
 	bool parallel = true;
@@ -93,9 +93,8 @@ struct Loader1992GlobalState : public GlobalTableFunctionState {
 static std::string ResolveCountyDir(ClientContext &context, FileSystem &fs, const Loader1992BindData &bind,
                                     const std::string &fips, const std::string &cfp, const std::string &work_dir) {
 	const std::string ssccc = fips + cfp;
-	const std::vector<std::string> wanted = {"TGR" + ssccc + ".F51", "TGR" + ssccc + ".F52",
-	                                         "TGR" + ssccc + ".F54", "TGR" + ssccc + ".F55",
-	                                         "TGR" + ssccc + ".F56", "TGR" + ssccc + ".F5A",
+	const std::vector<std::string> wanted = {"TGR" + ssccc + ".F51", "TGR" + ssccc + ".F52", "TGR" + ssccc + ".F54",
+	                                         "TGR" + ssccc + ".F55", "TGR" + ssccc + ".F56", "TGR" + ssccc + ".F5A",
 	                                         "TGR" + ssccc + ".F5I"};
 	const bool remote = bind.source.rfind("http://", 0) == 0 || bind.source.rfind("https://", 0) == 0;
 	if (remote) {
@@ -221,8 +220,8 @@ static std::vector<std::string> CountyFpsFrom1992IndexNames(const std::vector<st
 // County FIPS list for a state. Remote: scrape <source>/<ss>/ for
 // <ssccc>.zip. Local: list <source>/<ss>/ for either <ssccc>.zip files or
 // <ssccc>/ directories, so both local layouts work.
-static std::vector<std::string> ListCounties1992(ClientContext &context, FileSystem &fs,
-                                                 const Loader1992BindData &bind, const std::string &fips) {
+static std::vector<std::string> ListCounties1992(ClientContext &context, FileSystem &fs, const Loader1992BindData &bind,
+                                                 const std::string &fips) {
 	std::vector<std::string> out;
 	const bool remote = bind.source.rfind("http://", 0) == 0 || bind.source.rfind("https://", 0) == 0;
 	if (remote) {
@@ -252,8 +251,7 @@ static std::vector<std::string> ListCounties1992(ClientContext &context, FileSys
 				if (name.size() == 5 && name.compare(0, 2, fips) == 0) {
 					out.push_back(name.substr(2, 3));
 				}
-			} else if (name.size() == 9 && name.compare(0, 2, fips) == 0 &&
-			           name.compare(5, 4, ".zip") == 0) {
+			} else if (name.size() == 9 && name.compare(0, 2, fips) == 0 && name.compare(5, 4, ".zip") == 0) {
 				out.push_back(name.substr(2, 3));
 			}
 		});
@@ -378,8 +376,7 @@ static void Apply1992Params(Loader1992BindData &bind, const TableFunctionBindInp
 	ApplyTargetParams1992(bind, input);
 	bool found_source = false;
 	if (source_input_index >= 0 && static_cast<int>(input.inputs.size()) > source_input_index &&
-	    !input.inputs[source_input_index].IsNull() &&
-	    !StringValue::Get(input.inputs[source_input_index]).empty()) {
+	    !input.inputs[source_input_index].IsNull() && !StringValue::Get(input.inputs[source_input_index]).empty()) {
 		bind.source = StringValue::Get(input.inputs[source_input_index]);
 		found_source = true;
 	}
@@ -466,11 +463,10 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 		const char *progress;
 		const char *table;
 	};
-	const StateStep state_steps[] = {
-	    {"state_state", "state", "state"},
-	    {"state_county", "county", "county"},
-	    {"state_place", "place", "place"},
-	    {"state_cousub", "cousub", "cousub"}};
+	const StateStep state_steps[] = {{"state_state", "state", "state"},
+	                                 {"state_county", "county", "county"},
+	                                 {"state_place", "place", "place"},
+	                                 {"state_cousub", "cousub", "cousub"}};
 	struct CountyStep {
 		const char *section;
 		const char *progress_table;
@@ -570,19 +566,18 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 			if (dir.empty()) {
 				dir = ResolveCountyDir(context, fs, bind, fips, cfp, work_dir);
 			}
-			auto sql =
-			    RenderTemplate(ExtractSection(tmpl, t.section),
-			                   {{"@TIGER@", data_loc},
-			                    {"@FUNC@", func_loc},
-			                    {"@STATEFP@", fips},
-			                    {"@COUNTYFP@", cfp},
-			                    {"@F51@", fs.JoinPath(dir, "TGR" + ssccc + ".F51")},
-			                    {"@F52@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F52", work_dir)},
-			                    {"@F54@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F54", work_dir)},
-			                    {"@F55@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F55", work_dir)},
-			                    {"@F56@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F56", work_dir)},
-			                    {"@F5A@", fs.JoinPath(dir, "TGR" + ssccc + ".F5A")},
-			                    {"@F5I@", fs.JoinPath(dir, "TGR" + ssccc + ".F5I")}});
+			auto sql = RenderTemplate(ExtractSection(tmpl, t.section),
+			                          {{"@TIGER@", data_loc},
+			                           {"@FUNC@", func_loc},
+			                           {"@STATEFP@", fips},
+			                           {"@COUNTYFP@", cfp},
+			                           {"@F51@", fs.JoinPath(dir, "TGR" + ssccc + ".F51")},
+			                           {"@F52@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F52", work_dir)},
+			                           {"@F54@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F54", work_dir)},
+			                           {"@F55@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F55", work_dir)},
+			                           {"@F56@", PathOrEmpty(fs, dir, "TGR" + ssccc + ".F56", work_dir)},
+			                           {"@F5A@", fs.JoinPath(dir, "TGR" + ssccc + ".F5A")},
+			                           {"@F5I@", fs.JoinPath(dir, "TGR" + ssccc + ".F5I")}});
 			int64_t rows = ExecuteInsert(conn, sql, std::string(t.section) + ":" + cfp);
 			out.push_back({std::string(t.section) + ":" + cfp, rows});
 			MarkProgressDone(conn, data_loc, key);
@@ -623,11 +618,9 @@ static void DoLoadState1992(ClientContext &context, const Loader1992BindData &bi
 		if (del->HasError()) {
 			throw IOException("us_geocoder 1992 %s (DELETE %s): %s", s.section, s.table, del->GetError());
 		}
-		auto sql = RenderTemplate(ExtractSection(tmpl, s.section), {{"@TIGER@", data_loc},
-		                                                            {"@FUNC@", func_loc},
-		                                                            {"@STATEFP@", fips},
-		                                                            {"@STUSPS@", stusps},
-		                                                            {"@NAM@", nam}});
+		auto sql = RenderTemplate(
+		    ExtractSection(tmpl, s.section),
+		    {{"@TIGER@", data_loc}, {"@FUNC@", func_loc}, {"@STATEFP@", fips}, {"@STUSPS@", stusps}, {"@NAM@", nam}});
 		int64_t rows = ExecuteInsert(conn, sql, s.section);
 		out.push_back({s.section, rows});
 		MarkProgressDone(conn, data_loc, key);
@@ -710,7 +703,7 @@ static void Load1992Execute(ClientContext &context, TableFunctionInput &data_p, 
 // =====================================================================
 
 static unique_ptr<FunctionData> Load1992StateBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("step");
 	return_types.emplace_back(LogicalType::BIGINT);
@@ -728,7 +721,7 @@ static unique_ptr<FunctionData> Load1992StateBind(ClientContext &context, TableF
 }
 
 static unique_ptr<FunctionData> Load1992StatesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("step");
 	return_types.emplace_back(LogicalType::BIGINT);
@@ -746,7 +739,7 @@ static unique_ptr<FunctionData> Load1992StatesBind(ClientContext &context, Table
 }
 
 static unique_ptr<FunctionData> Load1992AllStatesBind(ClientContext &context, TableFunctionBindInput &input,
-                                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                                      vector<LogicalType> &return_types, vector<string> &names) {
 	return_types.emplace_back(LogicalType::VARCHAR);
 	names.emplace_back("step");
 	return_types.emplace_back(LogicalType::BIGINT);
@@ -835,8 +828,7 @@ static void Unload1992Execute(ClientContext &context, TableFunctionInput &data_p
 			// two extra per-state deletes here.
 			auto del_county = conn.Query("DELETE FROM " + data_loc + ".county WHERE statefp = '" + state.fips + "'");
 			if (del_county->HasError()) {
-				throw IOException("us_geocoder unload_tiger_1992_state(%s): %s", state.abbrev,
-				                  del_county->GetError());
+				throw IOException("us_geocoder unload_tiger_1992_state(%s): %s", state.abbrev, del_county->GetError());
 			}
 			auto del_state = conn.Query("DELETE FROM " + data_loc + ".state WHERE statefp = '" + state.fips + "'");
 			if (del_state->HasError()) {
@@ -940,8 +932,8 @@ void RegisterLoader1992Functions(ExtensionLoader &loader, const std::string &) {
 	Add1992NamedParams(sts1);
 	loader.RegisterFunction(sts1);
 
-	TableFunction sts2("load_tiger_1992_states", {list_vc, LogicalType::VARCHAR}, Load1992Execute,
-	                   Load1992StatesBind, Loader1992GlobalState::Init);
+	TableFunction sts2("load_tiger_1992_states", {list_vc, LogicalType::VARCHAR}, Load1992Execute, Load1992StatesBind,
+	                   Loader1992GlobalState::Init);
 	Add1992NamedParams(sts2);
 	loader.RegisterFunction(sts2);
 
@@ -950,8 +942,8 @@ void RegisterLoader1992Functions(ExtensionLoader &loader, const std::string &) {
 	Add1992NamedParams(all0);
 	loader.RegisterFunction(all0);
 
-	TableFunction all1("load_tiger_1992_all_states", {LogicalType::VARCHAR}, Load1992Execute,
-	                   Load1992AllStatesBind, Loader1992GlobalState::Init);
+	TableFunction all1("load_tiger_1992_all_states", {LogicalType::VARCHAR}, Load1992Execute, Load1992AllStatesBind,
+	                   Loader1992GlobalState::Init);
 	Add1992NamedParams(all1);
 	loader.RegisterFunction(all1);
 

@@ -95,8 +95,7 @@ private:
 
 } // namespace
 
-std::vector<ZipEntry> ExtractZipEntries(FileSystem &fs, const std::string &zip_path,
-                                        const std::string &dest_dir,
+std::vector<ZipEntry> ExtractZipEntries(FileSystem &fs, const std::string &zip_path, const std::string &dest_dir,
                                         const std::vector<std::string> &wanted) {
 	// Read the whole archive into memory. County zips are ~1 MB; the largest
 	// 1992 state's OtherFiles.zip is a few MB. MINIZ_NO_STDIO is defined in

@@ -1,12 +1,12 @@
 # name: test/sql/tiger1992_incremental.test
-# description: Restart semantics for the 1992 loader's state-level and
-#              derived steps: a county added since the last call must
-#              refresh them with correct *content* (not just re-run and
-#              produce the same row counts), even though their own
-#              progress key says "done". Also: clearing a single derived
-#              progress key must rebuild only that one table without
-#              duplicating it.
+# description: 1992 loader restart semantics — an added county refreshes state-level and derived tables
 # group: [sql]
+
+# A county added since the last call must refresh the state-level and
+# derived steps with correct *content* — not merely re-run and produce the
+# same row counts — even though their own progress key says "done". And
+# clearing a single derived progress key must rebuild only that one table,
+# without duplicating it.
 #
 # Regression coverage for a review finding on the Task 5 derived-table work:
 # `IsProgressDone` alone gated the state-level (state/county/place/cousub)

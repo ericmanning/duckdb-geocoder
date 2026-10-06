@@ -65,8 +65,7 @@ std::string ExtractSection(const std::string &all, const std::string &name) {
 	return all.substr(body_start, next - body_start);
 }
 
-std::string RenderTemplate(const std::string &section,
-                           const std::vector<std::pair<std::string, std::string>> &subs) {
+std::string RenderTemplate(const std::string &section, const std::vector<std::pair<std::string, std::string>> &subs) {
 	return ApplySubstitutions(section, subs);
 }
 
@@ -393,8 +392,8 @@ void DeleteProgressLike(Connection &conn, const std::string &data_loc, const std
 // (BackfillProgressIfNeeded above is exactly the pre-ledger scenario that
 // makes a key-only check insufficient).
 bool HasVintage1992(Connection &conn, const std::string &data_loc, const std::string &fips) {
-	auto r = conn.Query("SELECT count(*) FROM " + data_loc + ".loader_progress WHERE section LIKE 'tiger1992:state:" +
-	                    fips + ":%'");
+	auto r = conn.Query("SELECT count(*) FROM " + data_loc +
+	                    ".loader_progress WHERE section LIKE 'tiger1992:state:" + fips + ":%'");
 	if (r->HasError() || r->RowCount() == 0) {
 		return false;
 	}
@@ -680,8 +679,7 @@ std::string LookupStateFips(Connection &conn, const std::string &schema, const s
 // De-static'd + narrowed to a plain string: declared in
 // us_geocoder_loader_internal.hpp so loader_1992.cpp can call it without
 // depending on LoaderBindData (private to this file).
-void RunAnalyzeOnTigerTables(ClientContext &context, const std::string &data_location,
-                             std::vector<LoaderResult> &out) {
+void RunAnalyzeOnTigerTables(ClientContext &context, const std::string &data_location, std::vector<LoaderResult> &out) {
 	static const char *const kAnalyzeTables[] = {
 	    "state",           "county", "place", "cousub",    "zcta5", "zip_state",        "zip_state_loc",
 	    "zip_lookup_base", "edges",  "faces", "featnames", "addr",  "edge_containment",

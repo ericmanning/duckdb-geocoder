@@ -196,7 +196,25 @@ static bool DownloadOneFile(ClientContext &context, FileSystem &fs, const std::s
 
 		out_handle->Close();
 
-		if (resp && resp->Success() && bytes_this_attempt > 0) {
+		// A connection that closes mid-transfer still yields Success() and a
+		// positive byte count, so "we got some bytes" is not evidence of a
+		// complete file. Compare against Content-Length when the server sent
+		// one: the Census CDN always does, and short reads there are common
+		// enough that a 3,100-county run hits several. Treating a short read
+		// as retriable is what makes the existing backoff loop useful —
+		// without this the truncated file is accepted, and the failure
+		// surfaces much later as an unreadable zip or a bad shapefile.
+		int64_t expected = -1;
+		if (resp && resp->headers.HasHeader("Content-Length")) {
+			try {
+				expected = std::stoll(resp->headers.GetHeaderValue("Content-Length"));
+			} catch (...) {
+				expected = -1; // unparseable — fall back to the old check
+			}
+		}
+		const bool short_read = expected >= 0 && bytes_this_attempt != expected;
+
+		if (resp && resp->Success() && bytes_this_attempt > 0 && !short_read) {
 			// Atomic rename. Throws on failure (e.g. cross-volume rename on Windows).
 			try {
 				fs.MoveFile(tmp_path, dest_path);
@@ -214,7 +232,12 @@ static bool DownloadOneFile(ClientContext &context, FileSystem &fs, const std::s
 		if (resp) {
 			err_out = resp->HasRequestError() ? resp->GetRequestError() : resp->GetError();
 			if (err_out.empty()) {
-				err_out = bytes_this_attempt > 0 ? "truncated response" : "empty response body";
+				if (short_read) {
+					err_out = "short read: got " + std::to_string(bytes_this_attempt) + " of " +
+					          std::to_string(expected) + " bytes";
+				} else {
+					err_out = bytes_this_attempt > 0 ? "truncated response" : "empty response body";
+				}
 			}
 		}
 

@@ -130,8 +130,7 @@ void EmitLoaderResults(State &gstate, DataChunk &output) {
 // next "-- @SECTION:" marker (or EOF). Throws if the section is missing.
 std::string ExtractSection(const std::string &all, const std::string &name);
 
-std::string RenderTemplate(const std::string &section,
-                           const std::vector<std::pair<std::string, std::string>> &subs);
+std::string RenderTemplate(const std::string &section, const std::vector<std::pair<std::string, std::string>> &subs);
 
 // Run one INSERT statement against a Connection, return the number of rows
 // inserted (or 0 if the statement didn't produce a row count). Throws on SQL error.
@@ -269,8 +268,7 @@ void BootstrapTargetSchema(Connection &conn, const std::string &data_location, c
 // tables is cheap and shaves wall-clock off geocode queries once stats are
 // populated. De-static'd + signature narrowed to a plain string (was
 // `const LoaderBindData &`) so loader_1992.cpp can call it too.
-void RunAnalyzeOnTigerTables(ClientContext &context, const std::string &data_location,
-                             std::vector<LoaderResult> &out);
+void RunAnalyzeOnTigerTables(ClientContext &context, const std::string &data_location, std::vector<LoaderResult> &out);
 
 // =====================================================================
 // Misc helpers
@@ -328,8 +326,7 @@ private:
 // `temp_dir`/`explicit_temp_dir` empty => OS temp. MakeStateTempDir's
 // `year` is 1992 for the vintage path.
 std::string ResolveTempBase(ClientContext &context, const std::string &explicit_temp_dir);
-std::string MakeStateTempDir(ClientContext &context, const std::string &base, const std::string &state_label,
-                             int year);
+std::string MakeStateTempDir(ClientContext &context, const std::string &base, const std::string &state_label, int year);
 std::vector<std::string> ScrapeCensusIndex(ClientContext &context, const std::string &index_url,
                                            const std::regex &name_pattern, const ParallelDownloadOptions &opts);
 

@@ -17,7 +17,10 @@ DUCKDB="${2:-./build/release/duckdb}"
 
 echo "building $OUT_DB (50 states + DC; hours, and tens of GB — resumable)" >&2
 
-"$DUCKDB" -init /dev/null "$OUT_DB" <<'SQL'
+# -bail: without it the CLI prints the error, carries on to CHECKPOINT and
+# the summary, and exits 0 — so a state that failed mid-run looks like a
+# clean finish. A truncated download from the Census CDN is the common case.
+"$DUCKDB" -bail -init /dev/null "$OUT_DB" <<'SQL'
 LOAD spatial;
 CALL load_tiger_1992_all_states();
 -- Mandatory: without it the writes stay in the WAL and the file will not
@@ -32,3 +35,5 @@ ORDER BY 1;
 SQL
 
 echo "done: $OUT_DB ($(du -h "$OUT_DB" | cut -f1))" >&2
+echo "if a state failed on 'not a readable zip archive', just re-run — that is a" >&2
+echo "truncated CDN download, and completed counties are skipped." >&2
