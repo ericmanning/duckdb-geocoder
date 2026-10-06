@@ -19,16 +19,47 @@ equivalent is needed first — unlike the modern loader, 1992 has no nation-leve
 `state` and `county` rows are populated per-state as part of this call.
 
 ```sql
-SELECT g.rating, (g.adr).street_name, ST_AsText(g.geom), g.block_geoid
+SELECT g.rating, (g.adr).street_name, (g.adr).location, g.block_geoid,
+       ST_AsText(g.geom)
 FROM tiger.geocode(
-    {'address': 50, 'street_name': 'Fixture', 'street_type': 'Rd',
+    {'address': 25, 'street_name': 'Belvidere', 'street_type': 'Ave',
      'pre_dir': NULL, 'post_dir': NULL, 'internal': NULL,
-     'location': NULL, 'state_abbrev': 'NJ', 'zip': '07825'}::tiger.geocode_input,
+     'location': NULL, 'state_abbrev': 'NJ', 'zip': '07863'}::tiger.geocode_input,
     1, NULL, 'none'
 ) g;
 ```
 
-`require_containment` must stay `'none'` for 1992 data — see [Vintage caveats](#vintage-caveats).
+```
+rating  street_name  location  block_geoid     geom
+5       Belvidere    Oxford    34041031602205  POINT (-75.00423824756858 40.80506692406217)
+```
+
+A real Warren County address, as 1992 TIGER recorded it. Note the block GEOID is **14**
+characters, not the 15 you would get from modern TIGER — that is the 1990 block code, and
+it is the headline vintage caveat (see [Vintage caveats](#vintage-caveats)).
+
+`require_containment` must stay `'none'` for 1992 data.
+
+## Persistence: checkpoint before you close
+
+If you load into a **file-backed** database rather than `:memory:`, run `CHECKPOINT` before
+disconnecting:
+
+```sql
+CALL load_tiger_1992_state('NJ');
+CHECKPOINT;
+```
+
+Without it, the loader's writes sit in the write-ahead log, and reopening the file fails:
+
+```
+Catalog Error: Failure while replaying WAL file "…": Schema with name tiger does not exist!
+```
+
+The WAL references `tiger.*`, but replay happens before the extension has had a chance to
+create that schema, so the database will not open. This is not specific to the 1992 path —
+a bare `INSERT INTO tiger.edges` reproduces it — but the load-once-then-query-later workflow
+is exactly where it bites, so it is worth knowing up front.
 
 ## Capability matrix
 
